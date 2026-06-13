@@ -69,6 +69,7 @@ MASTER_SQL = """
 CREATE TABLE IF NOT EXISTS pseudo_freee_payees (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     payee_name TEXT NOT NULL UNIQUE,
+    search_key TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -76,6 +77,7 @@ CREATE TABLE IF NOT EXISTS pseudo_freee_account_items (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     account_item_name TEXT NOT NULL UNIQUE,
     default_tax_category TEXT NOT NULL DEFAULT '課税仕入 10%',
+    search_key TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -226,13 +228,21 @@ def migrate_deals_schema(conn: sqlite3.Connection) -> None:
 
 
 def ensure_master_schema(conn: sqlite3.Connection) -> None:
-    if not table_exists(conn, "pseudo_freee_account_items"):
-        return
-    columns = {row["name"] for row in conn.execute("PRAGMA table_info(pseudo_freee_account_items)").fetchall()}
-    if "default_tax_category" not in columns:
-        conn.execute(
-            "ALTER TABLE pseudo_freee_account_items ADD COLUMN default_tax_category TEXT NOT NULL DEFAULT '課税仕入 10%'"
-        )
+    if table_exists(conn, "pseudo_freee_payees"):
+        payee_columns = {row["name"] for row in conn.execute("PRAGMA table_info(pseudo_freee_payees)").fetchall()}
+        if "search_key" not in payee_columns:
+            conn.execute("ALTER TABLE pseudo_freee_payees ADD COLUMN search_key TEXT NOT NULL DEFAULT ''")
+
+    if table_exists(conn, "pseudo_freee_account_items"):
+        account_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(pseudo_freee_account_items)").fetchall()
+        }
+        if "default_tax_category" not in account_columns:
+            conn.execute(
+                "ALTER TABLE pseudo_freee_account_items ADD COLUMN default_tax_category TEXT NOT NULL DEFAULT '課税仕入 10%'"
+            )
+        if "search_key" not in account_columns:
+            conn.execute("ALTER TABLE pseudo_freee_account_items ADD COLUMN search_key TEXT NOT NULL DEFAULT ''")
 
 
 def default_tax_for_account_item(account_item_name: str) -> str:
@@ -363,13 +373,17 @@ def remember_expense_masters(
 
 
 def list_expense_masters(conn: sqlite3.Connection) -> dict[str, Any]:
-    payees = [
-        row["payee_name"]
-        for row in conn.execute("SELECT payee_name FROM pseudo_freee_payees ORDER BY payee_name").fetchall()
-    ]
+    payee_rows = conn.execute(
+        """
+        SELECT payee_name, search_key
+        FROM pseudo_freee_payees
+        ORDER BY payee_name
+        """
+    ).fetchall()
+    payees = [row["payee_name"] for row in payee_rows]
     account_item_rows = conn.execute(
         """
-        SELECT account_item_name, default_tax_category
+        SELECT account_item_name, default_tax_category, search_key
         FROM pseudo_freee_account_items
         ORDER BY account_item_name
         """
@@ -383,6 +397,7 @@ def list_expense_masters(conn: sqlite3.Connection) -> dict[str, Any]:
     ]
     return {
         "payees": payees,
+        "payee_settings": [row_to_dict(row) for row in payee_rows],
         "account_items": account_items,
         "account_item_settings": [row_to_dict(row) for row in account_item_rows],
         "tax_categories": tax_categories,
@@ -392,18 +407,28 @@ def list_expense_masters(conn: sqlite3.Connection) -> dict[str, Any]:
 def create_expense_master(conn: sqlite3.Connection, data: dict[str, Any]) -> dict[str, Any]:
     master_type = str(data.get("master_type", "") or "").strip()
     name = required_text(data.get("name"), "name")
+    search_key = str(data.get("search_key", "") or "").strip()
     if master_type == "payee":
-        conn.execute("INSERT OR IGNORE INTO pseudo_freee_payees (payee_name) VALUES (?)", (name,))
+        conn.execute(
+            """
+            INSERT INTO pseudo_freee_payees (payee_name, search_key)
+            VALUES (?, ?)
+            ON CONFLICT(payee_name) DO UPDATE SET
+                search_key = excluded.search_key
+            """,
+            (name, search_key),
+        )
     elif master_type == "account_item":
         default_tax_category = str(data.get("default_tax_category", "課税仕入 10%") or "課税仕入 10%")
         conn.execute(
             """
-            INSERT INTO pseudo_freee_account_items (account_item_name, default_tax_category)
-            VALUES (?, ?)
+            INSERT INTO pseudo_freee_account_items (account_item_name, default_tax_category, search_key)
+            VALUES (?, ?, ?)
             ON CONFLICT(account_item_name) DO UPDATE SET
-                default_tax_category = excluded.default_tax_category
+                default_tax_category = excluded.default_tax_category,
+                search_key = excluded.search_key
             """,
-            (name, default_tax_category),
+            (name, default_tax_category, search_key),
         )
         conn.execute(
             "INSERT OR IGNORE INTO pseudo_freee_tax_categories (tax_category) VALUES (?)",
@@ -413,7 +438,7 @@ def create_expense_master(conn: sqlite3.Connection, data: dict[str, Any]) -> dic
         conn.execute("INSERT OR IGNORE INTO pseudo_freee_tax_categories (tax_category) VALUES (?)", (name,))
     else:
         raise ValueError("master_type must be payee, account_item, or tax_category")
-    return {"ok": True, "master_type": master_type, "name": name}
+    return {"ok": True, "master_type": master_type, "name": name, "search_key": search_key}
 
 
 def normalize_deal_request(data: dict[str, Any]) -> dict[str, Any]:
@@ -861,6 +886,15 @@ def render_page(title: str, body: str) -> bytes:
       color: var(--text);
       font: inherit;
     }}
+    label.is-disabled {{
+      color: #9ca3af;
+    }}
+    label.is-disabled select {{
+      background: #f3f4f6;
+      color: #9ca3af;
+      cursor: not-allowed;
+      opacity: 1;
+    }}
     input::placeholder {{ color: #7a8798; opacity: 1; }}
     input.no-spinner::-webkit-outer-spin-button,
     input.no-spinner::-webkit-inner-spin-button {{
@@ -938,7 +972,7 @@ def render_page(title: str, body: str) -> bytes:
     }}
     .master-grid {{
       display: grid;
-      grid-template-columns: 170px minmax(180px, 1fr) 180px 120px;
+      grid-template-columns: 170px minmax(180px, 1fr) 260px 180px 120px;
       gap: 10px;
       align-items: end;
     }}
@@ -957,7 +991,27 @@ def render_page(title: str, body: str) -> bytes:
       max-height: 140px;
       overflow: auto;
     }}
-    .master-list li {{ padding: 3px 0; }}
+    .master-list li {{ padding: 2px 0; }}
+    .master-option {{
+      width: 100%;
+      border: 0;
+      border-radius: 4px;
+      padding: 4px 6px;
+      background: transparent;
+      color: var(--muted);
+      cursor: pointer;
+      font: inherit;
+      font-weight: 400;
+      text-align: left;
+    }}
+    .master-option:hover {{
+      background: #f0f5ff;
+      color: var(--text);
+    }}
+    .master-search-key {{
+      color: #7a8798;
+      font-size: 12px;
+    }}
     .label {{ color: var(--muted); font-size: 13px; }}
     .value {{ font-size: 24px; font-weight: 700; margin-top: 4px; }}
     .toolbar {{
@@ -1061,6 +1115,16 @@ def selected(current: str, value: str) -> str:
     return " selected" if current == value else ""
 
 
+def combo_option(value: str, search_key: str = "") -> str:
+    search_text = " ".join(part for part in [value, search_key] if part)
+    return (
+        f'<button type="button" class="combo-option" '
+        f'data-value="{html.escape(value, quote=True)}" '
+        f'data-search="{html.escape(search_text, quote=True)}">'
+        f"{html.escape(value)}</button>"
+    )
+
+
 def deal_type_label(deal_type: str) -> str:
     return "収入" if deal_type == "income" else "支出"
 
@@ -1118,12 +1182,10 @@ def render_index(filters: dict[str, str] | None = None) -> bytes:
         </tr>"""
 
     payee_options = "".join(
-        f'<button type="button" class="combo-option" data-value="{html.escape(value, quote=True)}">{html.escape(value)}</button>'
-        for value in masters["payees"]
+        combo_option(row["payee_name"], row["search_key"]) for row in masters["payee_settings"]
     )
     account_item_options = "".join(
-        f'<button type="button" class="combo-option" data-value="{html.escape(value, quote=True)}">{html.escape(value)}</button>'
-        for value in masters["account_items"]
+        combo_option(row["account_item_name"], row["search_key"]) for row in masters["account_item_settings"]
     )
     account_default_tax = {
         row["account_item_name"]: row["default_tax_category"]
@@ -1138,9 +1200,29 @@ def render_index(filters: dict[str, str] | None = None) -> bytes:
         f'<option value="{html.escape(value, quote=True)}">{html.escape(value)}</option>'
         for value in masters["tax_categories"]
     )
-    payee_list = "".join(f"<li>{html.escape(value)}</li>" for value in masters["payees"])
+    partner_filter_options = "".join(
+        f'<option value="{html.escape(value, quote=True)}"{selected(filters.get("partner_query", ""), value)}>{html.escape(value)}</option>'
+        for value in masters["payees"]
+    )
+    payee_list = "".join(
+        f"""
+        <li><button type="button" class="master-option" data-master-option
+          data-master-type="payee"
+          data-name="{html.escape(row['payee_name'], quote=True)}"
+          data-search-key="{html.escape(row['search_key'], quote=True)}">
+          {html.escape(row['payee_name'])}{f' <span class="master-search-key">/ {html.escape(row["search_key"])}</span>' if row["search_key"] else ''}
+        </button></li>"""
+        for row in masters["payee_settings"]
+    )
     account_item_list = "".join(
-        f"<li>{html.escape(row['account_item_name'])} / {html.escape(row['default_tax_category'])}</li>"
+        f"""
+        <li><button type="button" class="master-option" data-master-option
+          data-master-type="account_item"
+          data-name="{html.escape(row['account_item_name'], quote=True)}"
+          data-search-key="{html.escape(row['search_key'], quote=True)}"
+          data-default-tax-category="{html.escape(row['default_tax_category'], quote=True)}">
+          {html.escape(row['account_item_name'])} / {html.escape(row['default_tax_category'])}{f' <span class="master-search-key">/ {html.escape(row["search_key"])}</span>' if row["search_key"] else ''}
+        </button></li>"""
         for row in masters["account_item_settings"]
     )
     tax_category_list = "".join(f"<li>{html.escape(value)}</li>" for value in masters["tax_categories"])
@@ -1186,10 +1268,10 @@ def render_index(filters: dict[str, str] | None = None) -> bytes:
             <div class="form-grid">
               <label>発生日<input type="date" name="issue_date" value="{datetime.now().strftime("%Y-%m-%d")}" required></label>
               <label>支払予定日<input type="date" name="due_date" value="{datetime.now().strftime("%Y-%m-%d")}"></label>
-              <label>支払先
+              <label>取引先
                 <div class="combo" data-combo>
                   <input class="combo-input" name="partner_name" autocomplete="off" placeholder="検索して選択" required>
-                  <button type="button" class="combo-toggle" aria-label="支払先候補を開閉" aria-expanded="false">▼</button>
+                  <button type="button" class="combo-toggle" aria-label="取引先候補を開閉" aria-expanded="false">▼</button>
                   <div class="combo-menu" hidden>{payee_options}<div class="combo-empty" hidden>候補がありません</div></div>
                 </div>
               </label>
@@ -1205,7 +1287,7 @@ def render_index(filters: dict[str, str] | None = None) -> bytes:
             </div>
             <label>摘要<input name="description" placeholder="例: 梱包資材"></label>
             <label>メモ<textarea name="memo"></textarea></label>
-            <div class="label">新しい支払先・勘定科目・税区分は下のマスタ設定で追加してください。</div>
+            <div class="label">新しい取引先・勘定科目・税区分は下のマスタ設定で追加してください。</div>
             <button type="submit">経費を登録</button>
           </form>
         </div>
@@ -1220,26 +1302,26 @@ def render_index(filters: dict[str, str] | None = None) -> bytes:
       <section class="card">
         <div class="toolbar">
           <h2>マスタ設定</h2>
-          <span class="label">候補数: 支払先 {len(masters["payees"])} / 勘定科目 {len(masters["account_items"])} / 税区分 {len(masters["tax_categories"])}</span>
+          <span class="label">候補数: 取引先 {len(masters["payees"])} / 勘定科目 {len(masters["account_items"])} / 税区分 {len(masters["tax_categories"])}</span>
         </div>
         <form method="post" action="/expense-masters">
           <div class="master-grid">
             <label>種類
               <select name="master_type">
-                <option value="payee">支払先</option>
+                <option value="payee">取引先</option>
                 <option value="account_item">勘定科目</option>
-                <option value="tax_category">税区分</option>
               </select>
             </label>
             <label>名称<input name="name" required></label>
-            <label>標準税区分<select name="default_tax_category">{tax_category_master_options}</select></label>
-            <button type="submit">追加</button>
+            <label>検索キー<input name="search_key" placeholder="例: shi / s / しいれ"></label>
+            <label data-master-tax-field>標準税区分<select name="default_tax_category" disabled>{tax_category_master_options}</select></label>
+            <button type="submit" data-master-submit>追加</button>
           </div>
         </form>
         <div class="master-lists">
-          <div><strong>支払先</strong><ul class="master-list">{payee_list}</ul></div>
+          <div><strong>取引先</strong><ul class="master-list">{payee_list}</ul></div>
           <div><strong>勘定科目 / 標準税区分</strong><ul class="master-list">{account_item_list}</ul></div>
-          <div><strong>税区分</strong><ul class="master-list">{tax_category_list}</ul></div>
+          <div><strong>税区分（固定候補）</strong><ul class="master-list">{tax_category_list}</ul></div>
         </div>
       </section>
       <section>
@@ -1264,7 +1346,12 @@ def render_index(filters: dict[str, str] | None = None) -> bytes:
                 <option value="manual_expense"{selected(filters.get("source_type", ""), "manual_expense")}>手入力経費</option>
               </select>
             </label>
-            <label>取引先<input name="partner_query" value="{html.escape(filters.get("partner_query", ""), quote=True)}"></label>
+            <label>取引先
+              <select name="partner_query">
+                <option value="">すべて</option>
+                {partner_filter_options}
+              </select>
+            </label>
             <label>開始日<input type="date" name="date_from" value="{html.escape(filters.get("date_from", ""), quote=True)}"></label>
             <label>終了日<input type="date" name="date_to" value="{html.escape(filters.get("date_to", ""), quote=True)}"></label>
             <button type="submit">検索</button>
@@ -1285,7 +1372,8 @@ def render_index(filters: dict[str, str] | None = None) -> bytes:
             const query = input.value.trim().toLowerCase();
             let visibleCount = 0;
             for (const option of options) {{
-              const visible = option.dataset.value.toLowerCase().includes(query);
+              const searchText = (option.dataset.search || option.dataset.value).toLowerCase();
+              const visible = searchText.includes(query);
               option.hidden = !visible;
               if (visible) visibleCount += 1;
             }}
@@ -1331,6 +1419,42 @@ def render_index(filters: dict[str, str] | None = None) -> bytes:
         }}
 
         for (const combo of document.querySelectorAll("[data-combo]")) setupCombo(combo);
+
+        const masterTypeSelect = document.querySelector("select[name='master_type']");
+        const masterNameInput = document.querySelector("input[name='name']");
+        const masterSearchKeyInput = document.querySelector("input[name='search_key']");
+        const masterTaxField = document.querySelector("[data-master-tax-field]");
+        const masterTaxSelect = masterTaxField ? masterTaxField.querySelector("select") : null;
+        const masterSubmitButton = document.querySelector("[data-master-submit]");
+        function setMasterMode(mode) {{
+          if (masterSubmitButton) masterSubmitButton.textContent = mode === "update" ? "更新" : "追加";
+        }}
+        function syncMasterFields() {{
+          if (masterTypeSelect && masterTaxField && masterTaxSelect) {{
+            const enabled = masterTypeSelect.value === "account_item";
+            masterTaxSelect.disabled = !enabled;
+            masterTaxField.classList.toggle("is-disabled", !enabled);
+          }}
+        }}
+        if (masterTypeSelect) {{
+          masterTypeSelect.addEventListener("change", syncMasterFields);
+          syncMasterFields();
+        }}
+        if (masterTypeSelect) masterTypeSelect.addEventListener("change", () => setMasterMode("add"));
+        if (masterNameInput) masterNameInput.addEventListener("input", () => setMasterMode("add"));
+        for (const option of document.querySelectorAll("[data-master-option]")) {{
+          option.addEventListener("click", () => {{
+            if (masterTypeSelect) masterTypeSelect.value = option.dataset.masterType;
+            if (masterNameInput) masterNameInput.value = option.dataset.name || "";
+            if (masterSearchKeyInput) masterSearchKeyInput.value = option.dataset.searchKey || "";
+            if (masterTaxSelect && option.dataset.defaultTaxCategory) {{
+              masterTaxSelect.value = option.dataset.defaultTaxCategory;
+            }}
+            syncMasterFields();
+            setMasterMode("update");
+            if (masterSearchKeyInput) masterSearchKeyInput.focus();
+          }});
+        }}
 
         const accountDefaultTax = JSON.parse(`{account_default_tax_json}`);
         const accountInput = document.querySelector("input[name='account_item_name']");

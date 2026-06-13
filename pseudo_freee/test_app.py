@@ -133,6 +133,7 @@ class PseudoFreeeAppTest(unittest.TestCase):
                     "master_type": "account_item",
                     "name": "研修費",
                     "default_tax_category": "課税仕入 10%",
+                    "search_key": "kenshu",
                 },
             )
             masters = app.list_expense_masters(conn)
@@ -141,6 +142,58 @@ class PseudoFreeeAppTest(unittest.TestCase):
         self.assertIn("研修費", masters["account_items"])
         setting = next(row for row in masters["account_item_settings"] if row["account_item_name"] == "研修費")
         self.assertEqual(setting["default_tax_category"], "課税仕入 10%")
+        self.assertEqual(setting["search_key"], "kenshu")
+
+    def test_create_expense_master_updates_payee_search_key(self) -> None:
+        with app.db_connection() as conn:
+            app.create_expense_master(
+                conn,
+                {
+                    "master_type": "payee",
+                    "name": "日本橋文具",
+                    "search_key": "nb",
+                },
+            )
+            masters = app.list_expense_masters(conn)
+
+        setting = next(row for row in masters["payee_settings"] if row["payee_name"] == "日本橋文具")
+        self.assertEqual(setting["search_key"], "nb")
+
+    def test_master_form_disables_tax_field_and_omits_tax_category_type(self) -> None:
+        html = app.render_index().decode("utf-8")
+
+        self.assertIn('<option value="payee">取引先</option>', html)
+        self.assertIn('<option value="account_item">勘定科目</option>', html)
+        self.assertNotIn('<option value="tax_category">税区分</option>', html)
+        self.assertIn('input name="search_key"', html)
+        self.assertIn("<label data-master-tax-field>標準税区分", html)
+        self.assertIn('select name="default_tax_category" disabled', html)
+        self.assertIn('data-master-submit>追加</button>', html)
+        self.assertIn("<strong>取引先</strong>", html)
+        self.assertIn("候補数: 取引先", html)
+        self.assertIn('<select name="partner_query">', html)
+
+    def test_render_index_uses_master_search_key_for_combo_search_and_selection(self) -> None:
+        with app.db_connection() as conn:
+            app.create_expense_master(conn, {"master_type": "payee", "name": "検索キー支払先", "search_key": "ks"})
+            app.create_expense_master(
+                conn,
+                {
+                    "master_type": "account_item",
+                    "name": "検索キー勘定",
+                    "search_key": "kk",
+                    "default_tax_category": "対象外",
+                },
+            )
+
+        html = app.render_index().decode("utf-8")
+
+        self.assertIn('data-value="検索キー支払先" data-search="検索キー支払先 ks"', html)
+        self.assertIn('data-value="検索キー勘定" data-search="検索キー勘定 kk"', html)
+        self.assertIn('data-master-type="payee"', html)
+        self.assertIn('data-name="検索キー支払先"', html)
+        self.assertIn('data-search-key="ks"', html)
+        self.assertIn('data-default-tax-category="対象外"', html)
 
     def test_list_deals_filters_by_partner_and_deal_type(self) -> None:
         with app.db_connection() as conn:
