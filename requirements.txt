@@ -1,0 +1,43 @@
+# =============================================================================
+# inventory-freee-portfolio / Plan A 依存定義（EVOLUTION_PLAN.md 準拠）
+# =============================================================================
+# 現状（stdlib 版）の実行には外部依存は不要:
+#   http.server + sqlite3 + unittest だけで動く。
+# 下記は Plan A の各フェーズで導入する依存。フェーズ開始時に該当行を有効化し
+#   pip install -r requirements.txt
+# を実行 → 動作確認後 `pip freeze > requirements.lock.txt` でバージョン固定する。
+# 実値・秘密情報はここに書かない（.env / .env.example を参照）。
+
+# --- A-1: FastAPI 化（Web フレームワーク） -----------------------------------
+fastapi>=0.110
+uvicorn[standard]>=0.29
+pydantic>=2.6
+python-multipart>=0.0.9      # 証憑画像など multipart/form-data 受信
+python-dotenv>=1.0           # .env 読み込み
+httpx>=0.27                  # テスト用クライアント / 外部API呼び出し
+
+# --- A-2: Neon (Postgres) 移行 ----------------------------------------------
+psycopg[binary]>=3.1         # Postgres ドライバ（psycopg3）
+# SQLAlchemy>=2.0            # DBアクセス層に採用する場合のみ（任意）
+
+# --- A-3: 認証（Clerk JWT 検証） --------------------------------------------
+PyJWT[crypto]>=2.8           # Clerk JWT を JWKS で検証
+cryptography>=42.0
+
+# --- 開発・テスト -----------------------------------------------------------
+pytest>=8.0                  # 既存テストは unittest だが pytest からも実行可
+
+# --- A-4: 予測レベル2（重量級・このフェーズで導入） -------------------------
+#   ↓ 開始時にコメント解除（依存が重いので前倒し導入しない）
+# numpy>=1.26
+# pandas>=2.2
+# scikit-learn>=1.4
+# prophet>=1.1
+# lightgbm>=4.3
+
+# --- A-5: 経費キャプチャ（AI証憑入力） --------------------------------------
+# anthropic>=0.25            # Claude API（画像 → 構造化JSON）
+# Pillow>=10.3               # 画像前処理
+
+# --- 証憑画像ストレージ（S3互換 / Cloudflare R2 / Supabase Storage） --------
+# boto3>=1.34
