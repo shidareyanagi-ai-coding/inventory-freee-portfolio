@@ -1,5 +1,7 @@
 # freee連携・疑似freeeデモ 実装計画
 
+> 📌 **発展方針の正本は [`EVOLUTION_PLAN.md`](EVOLUTION_PLAN.md) です。** 本書は freee 連携の機能詳細です。全体の進め方・採用スタックは正本を優先してください。
+
 ## 目的
 
 現在の在庫管理ダッシュボードは、仕入・売上登録時にfreee送信用の中間データを `freee_sync_queue` に保存しています。

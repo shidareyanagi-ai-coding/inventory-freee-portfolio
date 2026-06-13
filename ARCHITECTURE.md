@@ -1,5 +1,7 @@
 # Architecture Draft
 
+> 📌 **発展方針の正本は [`docs/EVOLUTION_PLAN.md`](docs/EVOLUTION_PLAN.md) です。** 本書は2アプリ連携の設計メモ（旧MVP）です。全体の進め方・採用スタックは正本を優先してください。
+
 ## 全体像
 
 このポートフォリオは、2つの独立した業務アプリを連携させる構成です。

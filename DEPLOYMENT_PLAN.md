@@ -1,5 +1,7 @@
 # Deployment Plan Draft
 
+> 📌 **発展方針の正本は [`docs/EVOLUTION_PLAN.md`](docs/EVOLUTION_PLAN.md) です。** 本書はデプロイ検討メモです。全体の進め方・採用スタックは正本を優先してください。
+
 ## 目的
 
 このポートフォリオは、GitHub公開とクラウドデプロイを前提に整理します。

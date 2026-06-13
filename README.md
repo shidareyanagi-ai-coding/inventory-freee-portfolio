@@ -1,5 +1,9 @@
 # Inventory × Pseudo freee Portfolio
 
+> 📌 **現在の方針（発展計画）の正本は [`docs/EVOLUTION_PLAN.md`](docs/EVOLUTION_PLAN.md) です。**
+> 全体の進め方・採用スタックは必ずこちらを参照してください（本READMEや各要件定義より優先）。
+> 方針: **Plan A（FastAPI＋Neon＋Clerk＋Python予測＝シンプル版）を先に完成 → 余力で Plan B（Next.js を上乗せ＝ハイブリッド）**。
+
 ## 概要
 
 このポートフォリオは、在庫管理ダッシュボードと疑似freee会計ダッシュボードを連携させる業務アプリ群です。

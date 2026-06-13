@@ -1,5 +1,7 @@
 # Development Handoff Draft
 
+> 📌 **これは歴史的資料（pseudo_freee 作成時の引き継ぎメモ）です。** 最新の発展方針は正本 [`docs/EVOLUTION_PLAN.md`](docs/EVOLUTION_PLAN.md) を参照してください。
+
 ## 新しいチャット/AIへの依頼文
 
 以下を新しいCodexチャットに渡してください。
