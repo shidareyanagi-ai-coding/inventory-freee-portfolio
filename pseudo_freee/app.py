@@ -141,6 +141,36 @@ DEFAULT_TAX_CATEGORIES = [
     "不課税",
 ]
 
+DEFAULT_MASTER_SEARCH_KEYS = {
+    "Amazonビジネス": "amazon",
+    "Google": "google",
+    "Microsoft": "microsoft",
+    "ヤマト運輸": "yamato",
+    "佐川急便": "sagawa",
+    "新宿デザイン事務所": "shinjuku",
+    "日本橋文具": "nihonbashi",
+    "日本郵便": "yubin",
+    "東京サプライ": "tokyo",
+    "関東OA商事": "kanto",
+    "青山ECストア": "aoyama",
+    "仕入高": "shi",
+    "会議費": "kai",
+    "修繕費": "shu",
+    "地代家賃": "chi",
+    "売上高": "uri",
+    "広告宣伝費": "kou",
+    "接待交際費": "set",
+    "支払手数料": "shiha",
+    "新聞図書費": "shin",
+    "旅費交通費": "ryo",
+    "水道光熱費": "sui",
+    "消耗品費": "sho",
+    "研修費": "ken",
+    "荷造運賃": "nizu",
+    "通信費": "tsu",
+    "雑費": "zatsu",
+}
+
 
 @contextmanager
 def db_connection() -> Any:
@@ -252,6 +282,10 @@ def default_tax_for_account_item(account_item_name: str) -> str:
     return "課税仕入 10%"
 
 
+def default_search_key_for_master(name: str) -> str:
+    return DEFAULT_MASTER_SEARCH_KEYS.get(name, "")
+
+
 def seed_master_data(conn: sqlite3.Connection) -> None:
     conn.executemany(
         "INSERT OR IGNORE INTO pseudo_freee_payees (payee_name) VALUES (?)",
@@ -271,6 +305,22 @@ def seed_master_data(conn: sqlite3.Connection) -> None:
         WHERE account_item_name = ? AND default_tax_category = ''
         """,
         [(default_tax_for_account_item(name), name) for name in DEFAULT_ACCOUNT_ITEMS],
+    )
+    conn.executemany(
+        """
+        UPDATE pseudo_freee_payees
+        SET search_key = ?
+        WHERE payee_name = ? AND search_key = ''
+        """,
+        [(default_search_key_for_master(name), name) for name in DEFAULT_MASTER_SEARCH_KEYS],
+    )
+    conn.executemany(
+        """
+        UPDATE pseudo_freee_account_items
+        SET search_key = ?
+        WHERE account_item_name = ? AND search_key = ''
+        """,
+        [(default_search_key_for_master(name), name) for name in DEFAULT_MASTER_SEARCH_KEYS],
     )
     conn.executemany(
         "INSERT OR IGNORE INTO pseudo_freee_tax_categories (tax_category) VALUES (?)",
@@ -299,6 +349,22 @@ def seed_master_data(conn: sqlite3.Connection) -> None:
         FROM pseudo_freee_deals
         WHERE tax_category != ''
         """
+    )
+    conn.executemany(
+        """
+        UPDATE pseudo_freee_payees
+        SET search_key = ?
+        WHERE payee_name = ? AND search_key = ''
+        """,
+        [(default_search_key_for_master(name), name) for name in DEFAULT_MASTER_SEARCH_KEYS],
+    )
+    conn.executemany(
+        """
+        UPDATE pseudo_freee_account_items
+        SET search_key = ?
+        WHERE account_item_name = ? AND search_key = ''
+        """,
+        [(default_search_key_for_master(name), name) for name in DEFAULT_MASTER_SEARCH_KEYS],
     )
 
 

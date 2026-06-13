@@ -159,6 +159,22 @@ class PseudoFreeeAppTest(unittest.TestCase):
         setting = next(row for row in masters["payee_settings"] if row["payee_name"] == "日本橋文具")
         self.assertEqual(setting["search_key"], "nb")
 
+    def test_seed_master_data_sets_default_search_keys_without_overwriting_existing_values(self) -> None:
+        with app.db_connection() as conn:
+            masters = app.list_expense_masters(conn)
+            payee = next(row for row in masters["payee_settings"] if row["payee_name"] == "東京サプライ")
+            account_item = next(row for row in masters["account_item_settings"] if row["account_item_name"] == "会議費")
+            app.create_expense_master(conn, {"master_type": "account_item", "name": "会議費", "search_key": "meeting"})
+            app.seed_master_data(conn)
+            updated = app.list_expense_masters(conn)
+
+        self.assertEqual(payee["search_key"], "tokyo")
+        self.assertEqual(account_item["search_key"], "kai")
+        updated_account_item = next(
+            row for row in updated["account_item_settings"] if row["account_item_name"] == "会議費"
+        )
+        self.assertEqual(updated_account_item["search_key"], "meeting")
+
     def test_master_form_disables_tax_field_and_omits_tax_category_type(self) -> None:
         html = app.render_index().decode("utf-8")
 
