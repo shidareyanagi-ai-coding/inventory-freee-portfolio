@@ -125,6 +125,23 @@ class PseudoFreeeAppTest(unittest.TestCase):
         self.assertIn("新規テスト勘定", after["account_items"])
         self.assertIn("対象外", after["tax_categories"])
 
+    def test_create_expense_master_adds_account_item_with_default_tax(self) -> None:
+        with app.db_connection() as conn:
+            result = app.create_expense_master(
+                conn,
+                {
+                    "master_type": "account_item",
+                    "name": "研修費",
+                    "default_tax_category": "課税仕入 10%",
+                },
+            )
+            masters = app.list_expense_masters(conn)
+
+        self.assertTrue(result["ok"])
+        self.assertIn("研修費", masters["account_items"])
+        setting = next(row for row in masters["account_item_settings"] if row["account_item_name"] == "研修費")
+        self.assertEqual(setting["default_tax_category"], "課税仕入 10%")
+
     def test_list_deals_filters_by_partner_and_deal_type(self) -> None:
         with app.db_connection() as conn:
             app.create_deal(conn, sample_deal())

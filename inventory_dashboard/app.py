@@ -19,7 +19,7 @@ from urllib.parse import parse_qs, urlparse
 APP_DIR = Path(__file__).resolve().parent
 DB_PATH = APP_DIR / "inventory.db"
 HOST = "127.0.0.1"
-PORT = 8000
+PORT = int(os.environ.get("INVENTORY_DASHBOARD_PORT", "8000"))
 DEMO_HISTORY_MONTHS = 24
 PSEUDO_FREEE_API_URL = os.environ.get("PSEUDO_FREEE_API_URL", "http://127.0.0.1:8010").rstrip("/")
 
@@ -1415,6 +1415,9 @@ INDEX_HTML = r"""
     let currentLedgerData = null;
     let ledgerExpanded = false;
     let currentPartners = { suppliers: [], customers: [] };
+    let currentQueueRows = [];
+    let currentPreviewKey = null;
+    const defaultPreviewText = "キューの「確認」を押すと、freee送信用の中間データを表示します。";
     for (const input of document.querySelectorAll('input[type="date"][required]')) input.value = today;
 
     async function api(path, options = {}) {
@@ -1570,6 +1573,7 @@ INDEX_HTML = r"""
     }
 
     function renderQueue(rows) {
+      currentQueueRows = rows;
       document.getElementById("queue").innerHTML = table(["ID", "元データ", "区分", "状態", "操作"],
         rows.map(q => [
           q.id,
@@ -1581,7 +1585,8 @@ INDEX_HTML = r"""
     }
 
     function queueActions(q) {
-      const previewButton = `<button onclick="preview('${q.source_type}', ${q.source_id})">確認</button>`;
+      const isPreviewOpen = currentPreviewKey === queuePreviewKey(q.source_type, q.source_id);
+      const previewButton = `<button type="button" class="${isPreviewOpen ? "secondary" : ""}" aria-pressed="${isPreviewOpen}" onclick="togglePreview('${q.source_type}', ${q.source_id})">${isPreviewOpen ? "閉じる" : "確認"}</button>`;
       if (q.status === "sent") {
         return `${previewButton} <span class="match">送信済み ${q.external_accounting_id || ""}</span>`;
       }
@@ -1709,7 +1714,24 @@ INDEX_HTML = r"""
       await loadLedger(productId);
     }
 
-    async function preview(sourceType, sourceId) {
+    function queuePreviewKey(sourceType, sourceId) {
+      return `${sourceType}:${sourceId}`;
+    }
+
+    function closePreview() {
+      currentPreviewKey = null;
+      document.getElementById("preview").textContent = defaultPreviewText;
+      renderQueue(currentQueueRows);
+    }
+
+    async function togglePreview(sourceType, sourceId) {
+      const key = queuePreviewKey(sourceType, sourceId);
+      if (currentPreviewKey === key) {
+        closePreview();
+        return;
+      }
+      currentPreviewKey = key;
+      renderQueue(currentQueueRows);
       const data = await api(`/api/freee-preview?source_type=${sourceType}&source_id=${sourceId}`);
       document.getElementById("preview").textContent = JSON.stringify(data, null, 2);
     }
