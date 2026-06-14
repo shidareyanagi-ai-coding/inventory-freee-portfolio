@@ -16,9 +16,9 @@ python-multipart>=0.0.9      # 証憑画像など multipart/form-data 受信
 python-dotenv>=1.0           # .env 読み込み
 httpx>=0.27                  # テスト用クライアント / 外部API呼び出し
 
-# --- A-2: Neon (Postgres) 移行（フェーズ開始時に該当行を有効化）-------------
-# psycopg[binary]>=3.1       # Postgres ドライバ（psycopg3）
-# SQLAlchemy>=2.0            # DBアクセス層に採用する場合のみ（任意）
+# --- A-2: Neon (Postgres) 移行 ----------------------------------------------
+psycopg[binary]>=3.1         # Postgres ドライバ（psycopg3）。DATABASE_URL で切替
+# SQLAlchemy は不採用: db.py の薄い手書きアダプタで方言差を吸収する（説明しやすさ優先）。
 
 # --- A-3: 認証（Clerk JWT 検証）（フェーズ開始時に該当行を有効化）-----------
 # PyJWT[crypto]>=2.8         # Clerk JWT を JWKS で検証

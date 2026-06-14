@@ -24,6 +24,8 @@ class FakeResponse:
 
 class InventoryAppTest(unittest.TestCase):
     def setUp(self):
+        # DATABASE_URL が設定された環境でも、このテストは必ずローカル SQLite を使う。
+        self._original_database_url = os.environ.pop("DATABASE_URL", None)
         self.tmp = tempfile.TemporaryDirectory()
         self.original_db_path = app.DB_PATH
         app.DB_PATH = os.path.join(self.tmp.name, "test_inventory.db")
@@ -32,6 +34,8 @@ class InventoryAppTest(unittest.TestCase):
     def tearDown(self):
         app.DB_PATH = self.original_db_path
         self.tmp.cleanup()
+        if self._original_database_url is not None:
+            os.environ["DATABASE_URL"] = self._original_database_url
 
     def test_purchase_increases_stock_and_creates_freee_queue(self):
         with app.get_conn() as conn:

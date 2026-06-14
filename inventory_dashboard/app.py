@@ -3,11 +3,10 @@ from __future__ import annotations
 import json
 import math
 import os
-import sqlite3
 import urllib.error
 import urllib.request
 from calendar import monthrange
-from contextlib import asynccontextmanager, contextmanager
+from contextlib import asynccontextmanager
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
@@ -16,7 +15,15 @@ from fastapi import Body, Depends, FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+import db
 from index_html import INDEX_HTML
+
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv()  # .env があれば DATABASE_URL などを読み込む（無ければ何もしない）
+except Exception:
+    pass
 
 
 APP_DIR = Path(__file__).resolve().parent
@@ -27,131 +34,21 @@ DEMO_HISTORY_MONTHS = 24
 PSEUDO_FREEE_API_URL = os.environ.get("PSEUDO_FREEE_API_URL", "http://127.0.0.1:8010").rstrip("/")
 
 
-SCHEMA_SQL = """
-PRAGMA foreign_keys = ON;
-
-CREATE TABLE IF NOT EXISTS products (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    sku TEXT NOT NULL UNIQUE,
-    product_name TEXT NOT NULL,
-    category TEXT NOT NULL DEFAULT '',
-    supplier_name TEXT NOT NULL DEFAULT '',
-    purchase_unit_price REAL NOT NULL DEFAULT 0,
-    sales_unit_price REAL NOT NULL DEFAULT 0,
-    tax_rate REAL NOT NULL DEFAULT 10,
-    tax_category TEXT NOT NULL DEFAULT '課税仕入/課税売上 10%',
-    lead_time_days INTEGER NOT NULL DEFAULT 7,
-    safety_stock INTEGER NOT NULL DEFAULT 0,
-    reorder_point INTEGER NOT NULL DEFAULT 0,
-    min_order_quantity INTEGER NOT NULL DEFAULT 1,
-    is_active INTEGER NOT NULL DEFAULT 1,
-    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE TABLE IF NOT EXISTS business_partners (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    partner_type TEXT NOT NULL CHECK (partner_type IN ('supplier', 'customer')),
-    partner_name TEXT NOT NULL,
-    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE(partner_type, partner_name)
-);
-
-CREATE TABLE IF NOT EXISTS purchases (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    product_id INTEGER NOT NULL REFERENCES products(id),
-    partner_name TEXT NOT NULL,
-    invoice_no TEXT NOT NULL,
-    transaction_date TEXT NOT NULL,
-    received_date TEXT NOT NULL,
-    quantity INTEGER NOT NULL CHECK (quantity > 0),
-    unit_price REAL NOT NULL CHECK (unit_price >= 0),
-    tax_rate REAL NOT NULL DEFAULT 10,
-    tax_category TEXT NOT NULL DEFAULT '',
-    due_date TEXT NOT NULL DEFAULT '',
-    external_accounting_status TEXT NOT NULL DEFAULT 'pending',
-    external_accounting_id TEXT NOT NULL DEFAULT '',
-    sync_error_message TEXT NOT NULL DEFAULT '',
-    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE TABLE IF NOT EXISTS sales (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    product_id INTEGER NOT NULL REFERENCES products(id),
-    partner_name TEXT NOT NULL,
-    invoice_no TEXT NOT NULL,
-    transaction_date TEXT NOT NULL,
-    quantity INTEGER NOT NULL CHECK (quantity > 0),
-    unit_price REAL NOT NULL CHECK (unit_price >= 0),
-    tax_rate REAL NOT NULL DEFAULT 10,
-    tax_category TEXT NOT NULL DEFAULT '',
-    due_date TEXT NOT NULL DEFAULT '',
-    external_accounting_status TEXT NOT NULL DEFAULT 'pending',
-    external_accounting_id TEXT NOT NULL DEFAULT '',
-    sync_error_message TEXT NOT NULL DEFAULT '',
-    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE TABLE IF NOT EXISTS inventory_movements (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    product_id INTEGER NOT NULL REFERENCES products(id),
-    movement_type TEXT NOT NULL,
-    source_type TEXT NOT NULL,
-    source_id INTEGER NOT NULL,
-    movement_date TEXT NOT NULL,
-    quantity_delta INTEGER NOT NULL,
-    unit_price REAL NOT NULL DEFAULT 0,
-    note TEXT NOT NULL DEFAULT '',
-    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE TABLE IF NOT EXISTS freee_sync_queue (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    source_type TEXT NOT NULL,
-    source_id INTEGER NOT NULL,
-    direction TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'pending',
-    payload_json TEXT NOT NULL,
-    external_accounting_id TEXT NOT NULL DEFAULT '',
-    sync_error_message TEXT NOT NULL DEFAULT '',
-    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE(source_type, source_id)
-);
-
-CREATE TABLE IF NOT EXISTS inventory_corrections (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    original_movement_id INTEGER NOT NULL REFERENCES inventory_movements(id),
-    correction_movement_id INTEGER NOT NULL REFERENCES inventory_movements(id),
-    reason TEXT NOT NULL,
-    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE(original_movement_id)
-);
-"""
+# スキーマ DDL・接続・SQL方言差の吸収は db.py（DBアクセス層, A-2）が所有する。
+# ここ(app.py)は業務ロジックに徹し、常に '?' プレースホルダで SQL を書く。
 
 
-def dict_factory(cursor: sqlite3.Cursor, row: sqlite3.Row) -> dict[str, Any]:
-    return {col[0]: row[idx] for idx, col in enumerate(cursor.description)}
-
-
-@contextmanager
 def get_conn() -> Any:
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = dict_factory
-    conn.execute("PRAGMA foreign_keys = ON")
-    try:
-        yield conn
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
+    """DB アクセス層(db.py)へ委譲。DATABASE_URL で SQLite/Postgres を切替える。
+
+    SQLite のパスは呼び出し時の DB_PATH を渡す（テストはこの DB_PATH を差し替える）。
+    """
+    return db.get_conn(DB_PATH)
 
 
 def init_db() -> None:
     with get_conn() as conn:
-        conn.executescript(SCHEMA_SQL)
+        db.create_schema(conn)
         count = conn.execute("SELECT COUNT(*) AS count FROM products").fetchone()["count"]
         if count == 0:
             seed_products(conn)
@@ -161,7 +58,7 @@ def init_db() -> None:
         sync_partner_master(conn)
 
 
-def seed_products(conn: sqlite3.Connection) -> None:
+def seed_products(conn: db.Connection) -> None:
     products = [
         ("SKU-USB-C-001", "USB-Cケーブル 1m", "ケーブル", "東京サプライ", 480, 980, 10, 5, 20, 30, 10),
         ("SKU-MOUSE-001", "ワイヤレスマウス", "周辺機器", "関東OA商事", 1200, 2480, 10, 7, 10, 18, 5),
@@ -197,7 +94,7 @@ def initial_stock_date() -> str:
     return add_months(date.today().replace(day=1), -DEMO_HISTORY_MONTHS).isoformat()
 
 
-def normalize_initial_stock_dates(conn: sqlite3.Connection) -> None:
+def normalize_initial_stock_dates(conn: db.Connection) -> None:
     stock_date = initial_stock_date()
     conn.execute(
         """
@@ -211,7 +108,7 @@ def normalize_initial_stock_dates(conn: sqlite3.Connection) -> None:
     )
 
 
-def ensure_sample_transactions(conn: sqlite3.Connection) -> None:
+def ensure_sample_transactions(conn: db.Connection) -> None:
     purchase_count = conn.execute("SELECT COUNT(*) AS count FROM purchases").fetchone()["count"]
     sale_count = conn.execute("SELECT COUNT(*) AS count FROM sales").fetchone()["count"]
     if purchase_count or sale_count:
@@ -246,7 +143,7 @@ def ensure_sample_transactions(conn: sqlite3.Connection) -> None:
             create_sale(conn, data)
 
 
-def ensure_demo_history(conn: sqlite3.Connection) -> None:
+def ensure_demo_history(conn: db.Connection) -> None:
     exists = conn.execute(
         "SELECT id FROM sales WHERE invoice_no LIKE 'DEMO-HIST-S-%' LIMIT 1"
     ).fetchone()
@@ -301,10 +198,11 @@ def demo_monthly_sales_quantity(base: int, season_strength: float, month_date: d
     return max(int(round(base * season * trend * wave)), 1)
 
 
-def insert_demo_purchase(conn: sqlite3.Connection, product: dict[str, Any], purchase_date: date, quantity: int) -> None:
+def insert_demo_purchase(conn: db.Connection, product: dict[str, Any], purchase_date: date, quantity: int) -> None:
     invoice_no = f"DEMO-HIST-P-{product['sku']}-{purchase_date:%Y%m}"
     created_at = purchase_date.isoformat()
-    cursor = conn.execute(
+    purchase_id = db.insert_returning_id(
+        conn,
         """
         INSERT INTO purchases (
             product_id, partner_name, invoice_no, transaction_date, received_date,
@@ -327,7 +225,6 @@ def insert_demo_purchase(conn: sqlite3.Connection, product: dict[str, Any], purc
             created_at,
         ),
     )
-    purchase_id = int(cursor.lastrowid)
     conn.execute(
         """
         INSERT INTO inventory_movements (
@@ -341,7 +238,7 @@ def insert_demo_purchase(conn: sqlite3.Connection, product: dict[str, Any], purc
 
 
 def insert_demo_sale(
-    conn: sqlite3.Connection,
+    conn: db.Connection,
     product: dict[str, Any],
     partner_name: str,
     sale_date: date,
@@ -350,7 +247,8 @@ def insert_demo_sale(
 ) -> None:
     invoice_no = f"DEMO-HIST-S-{product['sku']}-{sale_date:%Y%m}-{suffix}"
     created_at = sale_date.isoformat()
-    cursor = conn.execute(
+    sale_id = db.insert_returning_id(
+        conn,
         """
         INSERT INTO sales (
             product_id, partner_name, invoice_no, transaction_date,
@@ -372,7 +270,6 @@ def insert_demo_sale(
             created_at,
         ),
     )
-    sale_id = int(cursor.lastrowid)
     conn.execute(
         """
         INSERT INTO inventory_movements (
@@ -385,7 +282,7 @@ def insert_demo_sale(
     )
 
 
-def stock_by_product(conn: sqlite3.Connection) -> dict[int, int]:
+def stock_by_product(conn: db.Connection) -> dict[int, int]:
     rows = conn.execute(
         """
         SELECT product_id, COALESCE(SUM(quantity_delta), 0) AS stock_quantity
@@ -396,7 +293,7 @@ def stock_by_product(conn: sqlite3.Connection) -> dict[int, int]:
     return {row["product_id"]: int(row["stock_quantity"]) for row in rows}
 
 
-def list_products(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+def list_products(conn: db.Connection) -> list[dict[str, Any]]:
     stocks = stock_by_product(conn)
     products = conn.execute("SELECT * FROM products ORDER BY id").fetchall()
     for product in products:
@@ -409,7 +306,7 @@ def list_products(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     return products
 
 
-def sync_partner_master(conn: sqlite3.Connection) -> None:
+def sync_partner_master(conn: db.Connection) -> None:
     supplier_names = [
         row["partner_name"]
         for row in conn.execute(
@@ -430,20 +327,23 @@ def sync_partner_master(conn: sqlite3.Connection) -> None:
         add_business_partner(conn, "customer", name)
 
 
-def add_business_partner(conn: sqlite3.Connection, partner_type: str, partner_name: str) -> None:
+def add_business_partner(conn: db.Connection, partner_type: str, partner_name: str) -> None:
     if partner_type not in {"supplier", "customer"}:
         raise ValueError("invalid partner_type")
     name = required_text(partner_name, "partner_name")
+    # INSERT OR IGNORE は SQLite 方言。両対応の "ON CONFLICT DO NOTHING" に統一する
+    # （UNIQUE(partner_type, partner_name) 衝突時は黙って無視）。
     conn.execute(
         """
-        INSERT OR IGNORE INTO business_partners (partner_type, partner_name)
+        INSERT INTO business_partners (partner_type, partner_name)
         VALUES (?, ?)
+        ON CONFLICT DO NOTHING
         """,
         (partner_type, name),
     )
 
 
-def list_business_partners(conn: sqlite3.Connection) -> dict[str, list[str]]:
+def list_business_partners(conn: db.Connection) -> dict[str, list[str]]:
     rows = conn.execute(
         """
         SELECT partner_type, partner_name
@@ -458,7 +358,7 @@ def list_business_partners(conn: sqlite3.Connection) -> dict[str, list[str]]:
     return partners
 
 
-def create_business_partner(conn: sqlite3.Connection, data: dict[str, Any]) -> dict[str, Any]:
+def create_business_partner(conn: db.Connection, data: dict[str, Any]) -> dict[str, Any]:
     partner_type = data.get("partner_type", "")
     partner_name = required_text(data.get("partner_name"), "partner_name")
     add_business_partner(conn, partner_type, partner_name)
@@ -479,7 +379,7 @@ def recommended_order_quantity(product: dict[str, Any], stock: int) -> int:
     return max(int(product["reorder_point"]) + int(product["safety_stock"]) - stock, 0)
 
 
-def create_product(conn: sqlite3.Connection, data: dict[str, Any]) -> dict[str, Any]:
+def create_product(conn: db.Connection, data: dict[str, Any]) -> dict[str, Any]:
     required = ["sku", "product_name"]
     for key in required:
         if not str(data.get(key, "")).strip():
@@ -514,7 +414,7 @@ def create_product(conn: sqlite3.Connection, data: dict[str, Any]) -> dict[str, 
     return {"ok": True}
 
 
-def create_purchase(conn: sqlite3.Connection, data: dict[str, Any]) -> dict[str, Any]:
+def create_purchase(conn: db.Connection, data: dict[str, Any]) -> dict[str, Any]:
     product = get_product(conn, to_int(data.get("product_id")))
     quantity = positive_int(data.get("quantity"), "quantity")
     unit_price = to_float(data.get("unit_price", product["purchase_unit_price"]))
@@ -526,7 +426,8 @@ def create_purchase(conn: sqlite3.Connection, data: dict[str, Any]) -> dict[str,
     invoice_no = required_text(data.get("invoice_no"), "invoice_no")
     due_date = data.get("due_date") or ""
 
-    cursor = conn.execute(
+    purchase_id = db.insert_returning_id(
+        conn,
         """
         INSERT INTO purchases (
             product_id, partner_name, invoice_no, transaction_date, received_date,
@@ -536,7 +437,6 @@ def create_purchase(conn: sqlite3.Connection, data: dict[str, Any]) -> dict[str,
         """,
         (product["id"], partner_name, invoice_no, transaction_date, received_date, quantity, unit_price, tax_rate, tax_category, due_date),
     )
-    purchase_id = int(cursor.lastrowid)
     conn.execute(
         """
         INSERT INTO inventory_movements (
@@ -552,7 +452,7 @@ def create_purchase(conn: sqlite3.Connection, data: dict[str, Any]) -> dict[str,
     return {"ok": True, "purchase_id": purchase_id}
 
 
-def create_sale(conn: sqlite3.Connection, data: dict[str, Any]) -> dict[str, Any]:
+def create_sale(conn: db.Connection, data: dict[str, Any]) -> dict[str, Any]:
     product = get_product(conn, to_int(data.get("product_id")))
     quantity = positive_int(data.get("quantity"), "quantity")
     current_stock = stock_by_product(conn).get(product["id"], 0)
@@ -566,7 +466,8 @@ def create_sale(conn: sqlite3.Connection, data: dict[str, Any]) -> dict[str, Any
     invoice_no = required_text(data.get("invoice_no"), "invoice_no")
     due_date = data.get("due_date") or ""
 
-    cursor = conn.execute(
+    sale_id = db.insert_returning_id(
+        conn,
         """
         INSERT INTO sales (
             product_id, partner_name, invoice_no, transaction_date,
@@ -576,7 +477,6 @@ def create_sale(conn: sqlite3.Connection, data: dict[str, Any]) -> dict[str, Any
         """,
         (product["id"], partner_name, invoice_no, transaction_date, quantity, unit_price, tax_rate, tax_category, due_date),
     )
-    sale_id = int(cursor.lastrowid)
     conn.execute(
         """
         INSERT INTO inventory_movements (
@@ -592,7 +492,7 @@ def create_sale(conn: sqlite3.Connection, data: dict[str, Any]) -> dict[str, Any
     return {"ok": True, "sale_id": sale_id}
 
 
-def enqueue_freee_payload(conn: sqlite3.Connection, source_type: str, source_id: int) -> None:
+def enqueue_freee_payload(conn: db.Connection, source_type: str, source_id: int) -> None:
     payload = build_freee_payload(conn, source_type, source_id)
     direction = "expense" if source_type == "purchase" else "income"
     conn.execute(
@@ -607,7 +507,7 @@ def enqueue_freee_payload(conn: sqlite3.Connection, source_type: str, source_id:
     )
 
 
-def build_freee_payload(conn: sqlite3.Connection, source_type: str, source_id: int) -> dict[str, Any]:
+def build_freee_payload(conn: db.Connection, source_type: str, source_id: int) -> dict[str, Any]:
     if source_type == "purchase":
         row = conn.execute(
             """
@@ -677,14 +577,14 @@ def build_freee_payload(conn: sqlite3.Connection, source_type: str, source_id: i
     raise ValueError("invalid source_type")
 
 
-def get_product(conn: sqlite3.Connection, product_id: int) -> dict[str, Any]:
+def get_product(conn: db.Connection, product_id: int) -> dict[str, Any]:
     product = conn.execute("SELECT * FROM products WHERE id = ?", (product_id,)).fetchone()
     if not product:
         raise ValueError("product not found")
     return product
 
 
-def dashboard(conn: sqlite3.Connection) -> dict[str, Any]:
+def dashboard(conn: db.Connection) -> dict[str, Any]:
     products = list_products(conn)
     total_stock_value = sum(product["stock_value"] for product in products)
     recent_movements = conn.execute(
@@ -776,7 +676,7 @@ def dashboard(conn: sqlite3.Connection) -> dict[str, Any]:
     }
 
 
-def forecast_simulation(conn: sqlite3.Connection, horizon_days: int = 30) -> dict[str, Any]:
+def forecast_simulation(conn: db.Connection, horizon_days: int = 30) -> dict[str, Any]:
     if horizon_days not in {30, 60, 90}:
         horizon_days = 30
 
@@ -849,7 +749,7 @@ def forecast_simulation(conn: sqlite3.Connection, horizon_days: int = 30) -> dic
     }
 
 
-def active_sales_quantity(conn: sqlite3.Connection, product_id: int, start_date: str, end_date: str) -> int:
+def active_sales_quantity(conn: db.Connection, product_id: int, start_date: str, end_date: str) -> int:
     row = conn.execute(
         """
         SELECT COALESCE(SUM(s.quantity), 0) AS quantity
@@ -865,17 +765,19 @@ def active_sales_quantity(conn: sqlite3.Connection, product_id: int, start_date:
     return int(row["quantity"] or 0)
 
 
-def monthly_seasonal_factor(conn: sqlite3.Connection, product_id: int, target_month: int) -> float:
+def monthly_seasonal_factor(conn: db.Connection, product_id: int, target_month: int) -> float:
+    # 月の抽出は方言差があるため db.month_expr で吸収（strftime ⇄ EXTRACT）。
+    month_sql = db.month_expr(conn, "s.transaction_date")
     rows = conn.execute(
-        """
-        SELECT CAST(strftime('%m', s.transaction_date) AS INTEGER) AS month,
+        f"""
+        SELECT {month_sql} AS month,
                SUM(s.quantity) AS quantity
         FROM sales s
         JOIN inventory_movements im ON im.source_type = 'sale' AND im.source_id = s.id
         LEFT JOIN inventory_corrections c ON c.original_movement_id = im.id
         WHERE s.product_id = ?
           AND c.id IS NULL
-        GROUP BY CAST(strftime('%m', s.transaction_date) AS INTEGER)
+        GROUP BY {month_sql}
         """,
         (product_id,),
     ).fetchall()
@@ -889,7 +791,7 @@ def monthly_seasonal_factor(conn: sqlite3.Connection, product_id: int, target_mo
     return min(max(target / average, 0.75), 1.4)
 
 
-def product_ledger(conn: sqlite3.Connection, product_id: int) -> dict[str, Any]:
+def product_ledger(conn: db.Connection, product_id: int) -> dict[str, Any]:
     product = get_product(conn, product_id)
     rows = conn.execute(
         """
@@ -938,7 +840,7 @@ def product_ledger(conn: sqlite3.Connection, product_id: int) -> dict[str, Any]:
     return {"product": product, "ledger": rows, "count": len(rows)}
 
 
-def cancel_inventory_movement(conn: sqlite3.Connection, data: dict[str, Any]) -> dict[str, Any]:
+def cancel_inventory_movement(conn: db.Connection, data: dict[str, Any]) -> dict[str, Any]:
     movement_id = to_int(data.get("movement_id"))
     reason = required_text(data.get("reason") or "入力ミスのため取消", "reason")
     original = conn.execute("SELECT * FROM inventory_movements WHERE id = ?", (movement_id,)).fetchone()
@@ -960,7 +862,8 @@ def cancel_inventory_movement(conn: sqlite3.Connection, data: dict[str, Any]) ->
             raise ValueError("取消すると在庫がマイナスになるため、先に関連する売上や調整を確認してください。")
 
     movement_type = "purchase_cancel" if original["source_type"] == "purchase" else "sale_cancel"
-    cursor = conn.execute(
+    correction_movement_id = db.insert_returning_id(
+        conn,
         """
         INSERT INTO inventory_movements (
             product_id, movement_type, source_type, source_id, movement_date,
@@ -978,7 +881,6 @@ def cancel_inventory_movement(conn: sqlite3.Connection, data: dict[str, Any]) ->
             f"取消: {original['note']} / 理由: {reason}",
         ),
     )
-    correction_movement_id = int(cursor.lastrowid)
     conn.execute(
         """
         INSERT INTO inventory_corrections (original_movement_id, correction_movement_id, reason)
@@ -999,7 +901,7 @@ def cancel_inventory_movement(conn: sqlite3.Connection, data: dict[str, Any]) ->
     return {"ok": True, "correction_movement_id": correction_movement_id}
 
 
-def list_queue(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+def list_queue(conn: db.Connection) -> list[dict[str, Any]]:
     rows = conn.execute(
         """
         SELECT q.*
@@ -1012,7 +914,7 @@ def list_queue(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     return rows
 
 
-def mark_queue_status(conn: sqlite3.Connection, data: dict[str, Any]) -> dict[str, Any]:
+def mark_queue_status(conn: db.Connection, data: dict[str, Any]) -> dict[str, Any]:
     queue_id = to_int(data.get("id"))
     status = data.get("status", "")
     if status not in {"pending", "sent", "failed", "retry"}:
@@ -1028,7 +930,7 @@ def mark_queue_status(conn: sqlite3.Connection, data: dict[str, Any]) -> dict[st
     return {"ok": True}
 
 
-def fail_queue_send(conn: sqlite3.Connection, queue_id: int, message: str) -> None:
+def fail_queue_send(conn: db.Connection, queue_id: int, message: str) -> None:
     conn.execute(
         """
         UPDATE freee_sync_queue
@@ -1041,7 +943,7 @@ def fail_queue_send(conn: sqlite3.Connection, queue_id: int, message: str) -> No
     )
 
 
-def send_queue_to_pseudo_freee(conn: sqlite3.Connection, data: dict[str, Any]) -> dict[str, Any]:
+def send_queue_to_pseudo_freee(conn: db.Connection, data: dict[str, Any]) -> dict[str, Any]:
     queue_id = to_int(data.get("id"))
     queue = conn.execute("SELECT * FROM freee_sync_queue WHERE id = ?", (queue_id,)).fetchone()
     if not queue:
@@ -1168,9 +1070,14 @@ async def handle_value_error(request: Request, exc: ValueError) -> JSONResponse:
     return JSONResponse(status_code=400, content={"error": str(exc)})
 
 
-@app.exception_handler(sqlite3.IntegrityError)
-async def handle_integrity_error(request: Request, exc: sqlite3.IntegrityError) -> JSONResponse:
+async def handle_integrity_error(request: Request, exc: Exception) -> JSONResponse:
     return JSONResponse(status_code=400, content={"error": f"database integrity error: {exc}"})
+
+
+# IntegrityError は使用中のバックエンドで型が異なる（sqlite3 / psycopg）。
+# db.INTEGRITY_ERROR_TYPES の各型に同じハンドラを登録する。
+for _integrity_error_type in db.INTEGRITY_ERROR_TYPES:
+    app.add_exception_handler(_integrity_error_type, handle_integrity_error)
 
 
 @app.exception_handler(StarletteHTTPException)
