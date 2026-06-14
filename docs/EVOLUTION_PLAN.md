@@ -148,7 +148,7 @@
 |---|---|
 | **A-0. 環境整備** ✅ | プロジェクトを **OneDrive外・英数字パス**（例 `C:\Users\masah\dev\`）へ移設。`.venv`・依存定義・`.env.example` |
 | **A-1. FastAPI化** ✅ | `InventoryHandler`(stdlib) を撤去し FastAPI ルータへ。業務ロジック関数は**温存して再利用**。既存テスト移植 |
-| **A-2. Neon移行** 🟡 | **コード完了・ローカル検証済 / 実Neon接続が未了（=未完了）**。済: DBアクセス層を `db.py` に分離、`DATABASE_URL` で SQLite⇄Postgres 切替、SQLite→Postgres DDL、seed再現、Postgresスモークテスト（`test_postgres.py`／使い捨てDocker Postgresで検証）。ORMは不採用（薄い手書きアダプタ）。**残（ユーザー作業含む）**: Neon作成→接続文字列取得→`.env`設定→実Neonでスキーマ＆seed＆pytest確認。`inventory_dashboard` が対象（`pseudo_freee` のPostgres化はA-3以降の検討事項） |
+| **A-2. Neon移行** ✅ | **完了（実Neon接続・検証済み）**。DBアクセス層を `db.py` に分離、`DATABASE_URL` で SQLite⇄Postgres 切替、SQLite→Postgres DDL、seed再現。ORMは不採用（薄い手書きアダプタ）。検証: 実Neon（PostgreSQL 16.14 / Singapore）へ接続→スキーマ作成＋seed投入→全テスト 41 passed（SQLite 28＋Neon上 Postgres 13 / `test_postgres.py`）→ダッシュボードが実Neonデータを正しく表示。`inventory_dashboard` が対象（`pseudo_freee` のPostgres化はA-3以降の検討事項） |
 | **A-3. 認証＋テナント＋RBAC** | Clerk導入・JWT検証、全テーブル `organization_id`、軽量RBAC、IDOR封鎖、監査ログ、初回 org seed |
 | **A-4. 予測レベル2** | 合成データを“より現実的”に作り直す→baseline→Prophet→LightGBM(補助金/カレンダー特徴量)→任意DL、MAE/MAPE＋バックテスト、予測線表示 |
 | **A-5. 経費キャプチャ** | `POST /api/expense-capture`、画像アップ/カメラ→AI解析→**下書き反映（登録は人）**、`vouchers`表、低信頼度表示 |
