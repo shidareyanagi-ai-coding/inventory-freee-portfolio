@@ -129,6 +129,18 @@
 
 ---
 
+## 完了の定義（Definition of Done）
+
+> 📌 **各フェーズは「私(Claude)の作業」と「ユーザーの作業」の両方が終わり、検証できて初めて「完了」とする。**
+
+- 各フェーズ着手時に、チェックリストを **「私の作業」** と **「ユーザーの作業（外部サービスの契約・課金・接続文字列の取得など、Claudeが代行できないもの）」** に分けて明示する。
+- 外部サービス／ユーザー操作が必要な項目は **ハードゲート**。ローカルの代替（例: 使い捨てDocker Postgres）で済ませて先に進めない。必要なら一度止めて知らせる。
+- 途中段階は「**コード完了**」「**ローカル検証済**」など、**「完了」とは別の語**で報告する。
+- 完了報告の直前に「次フェーズが前提とするものは実在するか」を1つ確認する。
+- （経緯: A-2 で、実装＋ローカルPostgres検証が済んだ時点で「完了」と報告したが、計画に明記された**実Neon接続が未了**だった反省から、このルールを明文化した。）
+
+---
+
 ## 実装フェーズ
 
 ### Plan A（先に完成させる芯）
@@ -136,7 +148,7 @@
 |---|---|
 | **A-0. 環境整備** ✅ | プロジェクトを **OneDrive外・英数字パス**（例 `C:\Users\masah\dev\`）へ移設。`.venv`・依存定義・`.env.example` |
 | **A-1. FastAPI化** ✅ | `InventoryHandler`(stdlib) を撤去し FastAPI ルータへ。業務ロジック関数は**温存して再利用**。既存テスト移植 |
-| **A-2. Neon移行** ✅ | DBアクセス層を `db.py` に分離、`DATABASE_URL` で SQLite⇄Postgres 切替、SQLite→Postgres DDL、seed再現。Postgresスモークテスト（`test_postgres.py`）で検証済み。ORMは不採用（薄い手書きアダプタ）。`inventory_dashboard` が対象（`pseudo_freee` のPostgres化はA-3以降の検討事項） |
+| **A-2. Neon移行** 🟡 | **コード完了・ローカル検証済 / 実Neon接続が未了（=未完了）**。済: DBアクセス層を `db.py` に分離、`DATABASE_URL` で SQLite⇄Postgres 切替、SQLite→Postgres DDL、seed再現、Postgresスモークテスト（`test_postgres.py`／使い捨てDocker Postgresで検証）。ORMは不採用（薄い手書きアダプタ）。**残（ユーザー作業含む）**: Neon作成→接続文字列取得→`.env`設定→実Neonでスキーマ＆seed＆pytest確認。`inventory_dashboard` が対象（`pseudo_freee` のPostgres化はA-3以降の検討事項） |
 | **A-3. 認証＋テナント＋RBAC** | Clerk導入・JWT検証、全テーブル `organization_id`、軽量RBAC、IDOR封鎖、監査ログ、初回 org seed |
 | **A-4. 予測レベル2** | 合成データを“より現実的”に作り直す→baseline→Prophet→LightGBM(補助金/カレンダー特徴量)→任意DL、MAE/MAPE＋バックテスト、予測線表示 |
 | **A-5. 経費キャプチャ** | `POST /api/expense-capture`、画像アップ/カメラ→AI解析→**下書き反映（登録は人）**、`vouchers`表、低信頼度表示 |
