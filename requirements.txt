@@ -16,13 +16,13 @@ python-multipart>=0.0.9      # 証憑画像など multipart/form-data 受信
 python-dotenv>=1.0           # .env 読み込み
 httpx>=0.27                  # テスト用クライアント / 外部API呼び出し
 
-# --- A-2: Neon (Postgres) 移行 ----------------------------------------------
-psycopg[binary]>=3.1         # Postgres ドライバ（psycopg3）
+# --- A-2: Neon (Postgres) 移行（フェーズ開始時に該当行を有効化）-------------
+# psycopg[binary]>=3.1       # Postgres ドライバ（psycopg3）
 # SQLAlchemy>=2.0            # DBアクセス層に採用する場合のみ（任意）
 
-# --- A-3: 認証（Clerk JWT 検証） --------------------------------------------
-PyJWT[crypto]>=2.8           # Clerk JWT を JWKS で検証
-cryptography>=42.0
+# --- A-3: 認証（Clerk JWT 検証）（フェーズ開始時に該当行を有効化）-----------
+# PyJWT[crypto]>=2.8         # Clerk JWT を JWKS で検証
+# cryptography>=42.0
 
 # --- 開発・テスト -----------------------------------------------------------
 pytest>=8.0                  # 既存テストは unittest だが pytest からも実行可
