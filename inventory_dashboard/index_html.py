@@ -1,7 +1,14 @@
 # 在庫管理ダッシュボードのフロント (単一HTMLページ)。
 # app.py(FastAPI) から読み込み、GET / で配信する。Plan A では既存HTMLをそのまま使う。
+#
+# A-3: Clerk のサインインゲートとトークン付与を追加。
+#   - render_index() がサーバ側の値（公開キー・設定有無・dev フラグ）を埋め込む。
+#   - api() は毎回 getAuthToken() で Bearer を付け、認可は常に FastAPI 側が判定する。
+#   - 公開キー(pk_...)はブラウザに出してよい。秘密キー(CLERK_SECRET_KEY)は埋め込まない。
 
-INDEX_HTML = r"""
+import json
+
+_INDEX_TEMPLATE = r"""
 <!doctype html>
 <html lang="ja">
 <head>
@@ -58,6 +65,14 @@ INDEX_HTML = r"""
     th, td { padding: 9px 10px; border-bottom: 1px solid var(--line); text-align: left; font-size: 13px; }
     th { background: #eef1f4; color: #38424d; }
     tr:last-child td { border-bottom: 0; }
+    /* A-3: サインインゲート（Clerk 設定時のみ表示） */
+    #signInGate { position: fixed; inset: 0; background: #24313d; display: none; align-items: center; justify-content: center; z-index: 50; }
+    #signInGate.show { display: flex; }
+    #signInGate .gate-card { background: white; border-radius: 12px; padding: 28px; min-width: 320px; box-shadow: 0 12px 40px rgba(0,0,0,.3); }
+    #signInGate h2 { margin: 0 0 12px; }
+    body.gated main { filter: blur(3px); pointer-events: none; user-select: none; }
+    .user-area { display: flex; align-items: center; gap: 12px; }
+    .user-area .role-badge { font-size: 12px; background: rgba(255,255,255,.18); padding: 3px 8px; border-radius: 999px; }
     .status { display: inline-flex; align-items: center; min-height: 22px; padding: 3px 8px; border-radius: 999px; font-size: 12px; line-height: 1; white-space: nowrap; background: #e8eef1; }
     .status.ok { color: var(--ok); }
     .status.warn { color: var(--warn); }
@@ -85,11 +100,25 @@ INDEX_HTML = r"""
       table { display: block; overflow-x: auto; }
     }
   </style>
+  <script>
+    // サーバが埋め込む認証設定（公開キーは出して良い／秘密キーは出さない）。
+    window.__APP_CONFIG__ = __APP_CONFIG_JSON__;
+  </script>
 </head>
 <body>
+  <div id="signInGate">
+    <div class="gate-card">
+      <h2>サインイン</h2>
+      <div id="clerk-signin"></div>
+    </div>
+  </div>
   <header>
     <h1>在庫管理ダッシュボード</h1>
-    <button class="secondary" onclick="loadAll()">更新</button>
+    <div class="user-area">
+      <span class="role-badge" id="roleBadge" hidden></span>
+      <button class="secondary" onclick="loadAll()">更新</button>
+      <div id="clerk-user"></div>
+    </div>
   </header>
   <main>
     <section class="metrics" id="metrics"></section>
@@ -201,8 +230,22 @@ INDEX_HTML = r"""
     const defaultPreviewText = "キューの「確認」を押すと、freee送信用の中間データを表示します。";
     for (const input of document.querySelectorAll('input[type="date"][required]')) input.value = today;
 
+    // A-3: Clerk セッションがあれば Bearer トークンを取得する（dev モードでは null）。
+    async function getAuthToken() {
+      try {
+        if (window.Clerk && window.Clerk.session) {
+          return await window.Clerk.session.getToken();
+        }
+      } catch (e) { /* 取得失敗時はトークン無しで投げ、サーバが 401 を返す */ }
+      return null;
+    }
+
     async function api(path, options = {}) {
-      const res = await fetch(path, options);
+      const token = await getAuthToken();
+      const headers = Object.assign({}, options.headers);
+      if (token) headers["Authorization"] = "Bearer " + token;
+      const res = await fetch(path, Object.assign({}, options, { headers }));
+      if (res.status === 401) throw new Error("認証が必要です。サインインしてください。");
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "request failed");
       return data;
@@ -535,8 +578,82 @@ INDEX_HTML = r"""
       event.preventDefault();
       try { await submitForm(event.target, "/api/sales"); } catch (error) { document.getElementById("message").textContent = error.message; }
     });
-    loadAll().catch(error => document.getElementById("message").textContent = error.message);
+    // --- A-3: 認証ブートストラップ ------------------------------------------
+    // Clerk 設定時はサインインを必須化し、未サインインならゲートを表示してアプリを止める。
+    // dev モード（Clerk 未設定）のときはトークン無しでそのまま起動する。
+    const APP_CONFIG = window.__APP_CONFIG__ || {};
+
+    function clerkFrontendApi(publishableKey) {
+      // 公開キー（pk_test_xxx / pk_live_xxx）の3つ目以降は frontend-api ホストの base64。
+      const encoded = publishableKey.split("_").slice(2).join("_");
+      try { return atob(encoded).replace(/\$$/, ""); } catch (e) { return ""; }
+    }
+
+    function loadClerkScript(publishableKey) {
+      return new Promise((resolve, reject) => {
+        const host = clerkFrontendApi(publishableKey);
+        if (!host) { reject(new Error("Clerk 公開キーの形式が不正です")); return; }
+        const script = document.createElement("script");
+        script.async = true;
+        script.crossOrigin = "anonymous";
+        script.setAttribute("data-clerk-publishable-key", publishableKey);
+        script.src = `https://${host}/npm/@clerk/clerk-js@5/dist/clerk.browser.js`;
+        script.onload = resolve;
+        script.onerror = () => reject(new Error("Clerk スクリプトの読み込みに失敗しました"));
+        document.head.appendChild(script);
+      });
+    }
+
+    async function startApp() {
+      document.body.classList.remove("gated");
+      document.getElementById("signInGate").classList.remove("show");
+      await loadAll();
+    }
+
+    async function bootstrapAuth() {
+      if (!APP_CONFIG.clerkConfigured) {
+        // dev モード: 認証なしでそのまま起動（サーバ側 AUTH_DEV_MODE が許可）。
+        await startApp();
+        return;
+      }
+      await loadClerkScript(APP_CONFIG.clerkPublishableKey);
+      await window.Clerk.load();
+      const renderAuthState = async () => {
+        if (window.Clerk.user) {
+          const badge = document.getElementById("roleBadge");
+          badge.hidden = false; badge.textContent = "サインイン中";
+          window.Clerk.mountUserButton(document.getElementById("clerk-user"));
+          await startApp();
+        } else {
+          document.body.classList.add("gated");
+          document.getElementById("signInGate").classList.add("show");
+          window.Clerk.mountSignIn(document.getElementById("clerk-signin"));
+        }
+      };
+      window.Clerk.addListener(renderAuthState);
+      await renderAuthState();
+    }
+
+    bootstrapAuth().catch(error => {
+      document.getElementById("message").textContent = error.message;
+    });
   </script>
 </body>
 </html>
 """
+
+
+def render_index(publishable_key: str = "", clerk_configured: bool = False, dev_mode: bool = False) -> str:
+    """サーバ側の認証設定を埋め込んで HTML を返す。
+
+    publishable_key はブラウザに出してよい公開キー。秘密キーは絶対に渡さない。
+    clerk_configured=False かつ dev_mode=True のときは、トークン無しでそのまま起動する。
+    """
+    config = {
+        "clerkPublishableKey": publishable_key,
+        "clerkConfigured": bool(clerk_configured),
+        "devMode": bool(dev_mode),
+    }
+    # </script> でテンプレートが壊れないよう、JSON 内の "/" をエスケープして埋め込む。
+    config_json = json.dumps(config, ensure_ascii=False).replace("</", "<\\/")
+    return _INDEX_TEMPLATE.replace("__APP_CONFIG_JSON__", config_json)

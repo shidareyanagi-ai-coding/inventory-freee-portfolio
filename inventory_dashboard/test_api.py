@@ -18,6 +18,11 @@ class InventoryApiTest(unittest.TestCase):
     def setUp(self):
         # DATABASE_URL が設定された環境でも、このテストは必ずローカル SQLite を使う。
         self._original_database_url = os.environ.pop("DATABASE_URL", None)
+        # A-3: 全 API は認証必須。ルーティング契約の確認に集中するため dev モードで動かす
+        # （トークン無しは既定の dev ユーザ＝1組織として扱われ、初回アクセスでデモ seed が入る）。
+        self._saved_auth = {k: os.environ.get(k) for k in ("AUTH_DEV_MODE", "APP_ENV")}
+        os.environ["AUTH_DEV_MODE"] = "true"
+        os.environ["APP_ENV"] = "development"
         self.tmp = tempfile.TemporaryDirectory()
         self.original_db_path = app.DB_PATH
         app.DB_PATH = os.path.join(self.tmp.name, "test_inventory.db")
@@ -31,6 +36,11 @@ class InventoryApiTest(unittest.TestCase):
         self.tmp.cleanup()
         if self._original_database_url is not None:
             os.environ["DATABASE_URL"] = self._original_database_url
+        for key, value in self._saved_auth.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
     def test_index_serves_html_page(self):
         res = self.client.get("/")

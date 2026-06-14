@@ -30,6 +30,10 @@ class InventoryAppTest(unittest.TestCase):
         self.original_db_path = app.DB_PATH
         app.DB_PATH = os.path.join(self.tmp.name, "test_inventory.db")
         app.init_db()
+        # A-3: 業務ロジックは organization_id 必須。テスト用の自組織を作りデモ seed を入れる。
+        with app.get_conn() as conn:
+            self.org_id = app.create_organization(conn, "テスト組織")
+            app.seed_organization(conn, self.org_id)
 
     def tearDown(self):
         app.DB_PATH = self.original_db_path
@@ -37,11 +41,17 @@ class InventoryAppTest(unittest.TestCase):
         if self._original_database_url is not None:
             os.environ["DATABASE_URL"] = self._original_database_url
 
+    def _first_product(self, conn):
+        return conn.execute(
+            "SELECT * FROM products WHERE organization_id = ? ORDER BY id LIMIT 1",
+            (self.org_id,),
+        ).fetchone()
+
     def test_purchase_increases_stock_and_creates_freee_queue(self):
         with app.get_conn() as conn:
-            product = conn.execute("SELECT * FROM products ORDER BY id LIMIT 1").fetchone()
-            before = app.stock_by_product(conn)[product["id"]]
-            result = app.create_purchase(conn, {
+            product = self._first_product(conn)
+            before = app.stock_by_product(conn, self.org_id)[product["id"]]
+            result = app.create_purchase(conn, self.org_id, {
                 "product_id": product["id"],
                 "partner_name": "テスト仕入先",
                 "invoice_no": "INV-P-001",
@@ -53,7 +63,7 @@ class InventoryAppTest(unittest.TestCase):
                 "tax_category": "課税仕入 10%",
                 "due_date": "2026-06-30",
             })
-            after = app.stock_by_product(conn)[product["id"]]
+            after = app.stock_by_product(conn, self.org_id)[product["id"]]
             queue = conn.execute("SELECT * FROM freee_sync_queue WHERE source_type = 'purchase' AND source_id = ?", (result["purchase_id"],)).fetchone()
 
         self.assertEqual(after, before + 3)
@@ -63,9 +73,9 @@ class InventoryAppTest(unittest.TestCase):
 
     def test_sale_decreases_stock_and_creates_freee_queue(self):
         with app.get_conn() as conn:
-            product = conn.execute("SELECT * FROM products ORDER BY id LIMIT 1").fetchone()
-            before = app.stock_by_product(conn)[product["id"]]
-            result = app.create_sale(conn, {
+            product = self._first_product(conn)
+            before = app.stock_by_product(conn, self.org_id)[product["id"]]
+            result = app.create_sale(conn, self.org_id, {
                 "product_id": product["id"],
                 "partner_name": "テスト得意先",
                 "invoice_no": "ORD-S-001",
@@ -76,7 +86,7 @@ class InventoryAppTest(unittest.TestCase):
                 "tax_category": "課税売上 10%",
                 "due_date": "2026-07-31",
             })
-            after = app.stock_by_product(conn)[product["id"]]
+            after = app.stock_by_product(conn, self.org_id)[product["id"]]
             queue = conn.execute("SELECT * FROM freee_sync_queue WHERE source_type = 'sale' AND source_id = ?", (result["sale_id"],)).fetchone()
 
         self.assertEqual(after, before - 2)
@@ -86,10 +96,10 @@ class InventoryAppTest(unittest.TestCase):
 
     def test_sale_cannot_exceed_available_stock(self):
         with app.get_conn() as conn:
-            product = conn.execute("SELECT * FROM products ORDER BY id LIMIT 1").fetchone()
-            current = app.stock_by_product(conn)[product["id"]]
+            product = self._first_product(conn)
+            current = app.stock_by_product(conn, self.org_id)[product["id"]]
             with self.assertRaises(ValueError):
-                app.create_sale(conn, {
+                app.create_sale(conn, self.org_id, {
                     "product_id": product["id"],
                     "partner_name": "テスト得意先",
                     "invoice_no": "ORD-S-OVER",
@@ -100,8 +110,8 @@ class InventoryAppTest(unittest.TestCase):
 
     def test_queue_is_unique_per_source_document(self):
         with app.get_conn() as conn:
-            product = conn.execute("SELECT * FROM products ORDER BY id LIMIT 1").fetchone()
-            result = app.create_purchase(conn, {
+            product = self._first_product(conn)
+            result = app.create_purchase(conn, self.org_id, {
                 "product_id": product["id"],
                 "partner_name": "テスト仕入先",
                 "invoice_no": "INV-P-002",
@@ -110,7 +120,7 @@ class InventoryAppTest(unittest.TestCase):
                 "quantity": 1,
                 "unit_price": 1000,
             })
-            app.enqueue_freee_payload(conn, "purchase", result["purchase_id"])
+            app.enqueue_freee_payload(conn, self.org_id, "purchase", result["purchase_id"])
             count = conn.execute(
                 "SELECT COUNT(*) AS count FROM freee_sync_queue WHERE source_type = 'purchase' AND source_id = ?",
                 (result["purchase_id"],),
@@ -128,8 +138,8 @@ class InventoryAppTest(unittest.TestCase):
             return FakeResponse({"ok": True, "pseudo_freee_deal_id": 101, "created": True, "duplicate": False})
 
         with app.get_conn() as conn:
-            product = conn.execute("SELECT * FROM products ORDER BY id LIMIT 1").fetchone()
-            result = app.create_purchase(conn, {
+            product = self._first_product(conn)
+            result = app.create_purchase(conn, self.org_id, {
                 "product_id": product["id"],
                 "partner_name": "テスト仕入先",
                 "invoice_no": "INV-P-SEND",
@@ -143,7 +153,7 @@ class InventoryAppTest(unittest.TestCase):
                 (result["purchase_id"],),
             ).fetchone()
             with patch("app.urllib.request.urlopen", fake_urlopen):
-                send_result = app.send_queue_to_pseudo_freee(conn, {"id": queue["id"]})
+                send_result = app.send_queue_to_pseudo_freee(conn, self.org_id, {"id": queue["id"]})
             updated = conn.execute("SELECT * FROM freee_sync_queue WHERE id = ?", (queue["id"],)).fetchone()
 
         self.assertEqual(captured["url"], f"{app.PSEUDO_FREEE_API_URL}/api/deals")
@@ -161,8 +171,8 @@ class InventoryAppTest(unittest.TestCase):
             raise urllib.error.URLError("connection refused")
 
         with app.get_conn() as conn:
-            product = conn.execute("SELECT * FROM products ORDER BY id LIMIT 1").fetchone()
-            result = app.create_sale(conn, {
+            product = self._first_product(conn)
+            result = app.create_sale(conn, self.org_id, {
                 "product_id": product["id"],
                 "partner_name": "テスト得意先",
                 "invoice_no": "ORD-S-SEND-FAIL",
@@ -176,7 +186,7 @@ class InventoryAppTest(unittest.TestCase):
             ).fetchone()
             with patch("app.urllib.request.urlopen", fake_urlopen):
                 with self.assertRaises(ValueError):
-                    app.send_queue_to_pseudo_freee(conn, {"id": queue["id"]})
+                    app.send_queue_to_pseudo_freee(conn, self.org_id, {"id": queue["id"]})
             updated = conn.execute("SELECT * FROM freee_sync_queue WHERE id = ?", (queue["id"],)).fetchone()
 
         self.assertEqual(updated["status"], "failed")
@@ -184,8 +194,8 @@ class InventoryAppTest(unittest.TestCase):
 
     def test_send_queue_to_pseudo_freee_rejects_sent_queue(self):
         with app.get_conn() as conn:
-            product = conn.execute("SELECT * FROM products ORDER BY id LIMIT 1").fetchone()
-            result = app.create_purchase(conn, {
+            product = self._first_product(conn)
+            result = app.create_purchase(conn, self.org_id, {
                 "product_id": product["id"],
                 "partner_name": "テスト仕入先",
                 "invoice_no": "INV-P-RESENT",
@@ -198,31 +208,31 @@ class InventoryAppTest(unittest.TestCase):
                 "SELECT * FROM freee_sync_queue WHERE source_type = 'purchase' AND source_id = ?",
                 (result["purchase_id"],),
             ).fetchone()
-            app.mark_queue_status(conn, {"id": queue["id"], "status": "sent", "external_accounting_id": "pseudo-freee-1"})
+            app.mark_queue_status(conn, self.org_id, {"id": queue["id"], "status": "sent", "external_accounting_id": "pseudo-freee-1"})
             with self.assertRaises(ValueError):
-                app.send_queue_to_pseudo_freee(conn, {"id": queue["id"]})
+                app.send_queue_to_pseudo_freee(conn, self.org_id, {"id": queue["id"]})
 
     def test_business_partners_are_seeded_from_existing_data(self):
         with app.get_conn() as conn:
-            partners = app.list_business_partners(conn)
+            partners = app.list_business_partners(conn, self.org_id)
 
         self.assertIn("東京サプライ", partners["suppliers"])
         self.assertIn("青山ECストア", partners["customers"])
 
     def test_create_business_partner_adds_selectable_partner(self):
         with app.get_conn() as conn:
-            app.create_business_partner(conn, {
+            app.create_business_partner(conn, self.org_id, {
                 "partner_type": "customer",
                 "partner_name": "テスト販売先",
             })
-            partners = app.list_business_partners(conn)
+            partners = app.list_business_partners(conn, self.org_id)
 
         self.assertIn("テスト販売先", partners["customers"])
 
     def test_cancel_purchase_adds_reversal_movement(self):
         with app.get_conn() as conn:
-            product = conn.execute("SELECT * FROM products ORDER BY id LIMIT 1").fetchone()
-            result = app.create_purchase(conn, {
+            product = self._first_product(conn)
+            result = app.create_purchase(conn, self.org_id, {
                 "product_id": product["id"],
                 "partner_name": "テスト仕入先",
                 "invoice_no": "INV-P-CANCEL",
@@ -235,9 +245,9 @@ class InventoryAppTest(unittest.TestCase):
                 "SELECT * FROM inventory_movements WHERE source_type = 'purchase' AND source_id = ?",
                 (result["purchase_id"],),
             ).fetchone()
-            before_cancel = app.stock_by_product(conn)[product["id"]]
-            app.cancel_inventory_movement(conn, {"movement_id": movement["id"], "reason": "商品選択ミス"})
-            after_cancel = app.stock_by_product(conn)[product["id"]]
+            before_cancel = app.stock_by_product(conn, self.org_id)[product["id"]]
+            app.cancel_inventory_movement(conn, self.org_id, {"movement_id": movement["id"], "reason": "商品選択ミス"})
+            after_cancel = app.stock_by_product(conn, self.org_id)[product["id"]]
             queue = conn.execute(
                 "SELECT * FROM freee_sync_queue WHERE source_type = 'purchase' AND source_id = ?",
                 (result["purchase_id"],),
@@ -249,8 +259,8 @@ class InventoryAppTest(unittest.TestCase):
 
     def test_cancel_movement_cannot_be_cancelled_twice(self):
         with app.get_conn() as conn:
-            product = conn.execute("SELECT * FROM products ORDER BY id LIMIT 1").fetchone()
-            result = app.create_sale(conn, {
+            product = self._first_product(conn)
+            result = app.create_sale(conn, self.org_id, {
                 "product_id": product["id"],
                 "partner_name": "テスト得意先",
                 "invoice_no": "ORD-S-CANCEL",
@@ -262,9 +272,9 @@ class InventoryAppTest(unittest.TestCase):
                 "SELECT * FROM inventory_movements WHERE source_type = 'sale' AND source_id = ?",
                 (result["sale_id"],),
             ).fetchone()
-            app.cancel_inventory_movement(conn, {"movement_id": movement["id"], "reason": "数量ミス"})
+            app.cancel_inventory_movement(conn, self.org_id, {"movement_id": movement["id"], "reason": "数量ミス"})
             with self.assertRaises(ValueError):
-                app.cancel_inventory_movement(conn, {"movement_id": movement["id"], "reason": "再取消"})
+                app.cancel_inventory_movement(conn, self.org_id, {"movement_id": movement["id"], "reason": "再取消"})
 
     def test_recommended_order_is_exact_shortage_from_required_level(self):
         product = {
@@ -290,10 +300,12 @@ class InventoryAppTest(unittest.TestCase):
     def test_demo_history_is_seeded_for_forecasting(self):
         with app.get_conn() as conn:
             demo_sales = conn.execute(
-                "SELECT COUNT(*) AS count FROM sales WHERE invoice_no LIKE 'DEMO-HIST-S-%'"
+                "SELECT COUNT(*) AS count FROM sales WHERE organization_id = ? AND invoice_no LIKE 'DEMO-HIST-S-%'",
+                (self.org_id,),
             ).fetchone()["count"]
             demo_purchases = conn.execute(
-                "SELECT COUNT(*) AS count FROM purchases WHERE invoice_no LIKE 'DEMO-HIST-P-%'"
+                "SELECT COUNT(*) AS count FROM purchases WHERE organization_id = ? AND invoice_no LIKE 'DEMO-HIST-P-%'",
+                (self.org_id,),
             ).fetchone()["count"]
 
         self.assertGreater(demo_sales, 0)
@@ -307,14 +319,16 @@ class InventoryAppTest(unittest.TestCase):
                     MAX(CASE WHEN im.movement_type = 'initial_stock' THEN im.movement_date END) AS initial_date,
                     MIN(CASE WHEN im.note LIKE 'デモ%' THEN im.movement_date END) AS first_demo_date
                 FROM inventory_movements im
-                """
+                WHERE im.organization_id = ?
+                """,
+                (self.org_id,),
             ).fetchone()
 
         self.assertLess(row["initial_date"], row["first_demo_date"])
 
     def test_forecast_simulation_returns_product_rows(self):
         with app.get_conn() as conn:
-            result = app.forecast_simulation(conn, 30)
+            result = app.forecast_simulation(conn, self.org_id, 30)
 
         self.assertEqual(result["horizon_days"], 30)
         self.assertEqual(len(result["rows"]), 3)
@@ -328,8 +342,8 @@ class InventoryAppTest(unittest.TestCase):
 
     def test_dashboard_inventory_uses_forecast_required_inventory(self):
         with app.get_conn() as conn:
-            dashboard = app.dashboard(conn)
-            forecast = app.forecast_simulation(conn, 30)
+            dashboard = app.dashboard(conn, self.org_id)
+            forecast = app.forecast_simulation(conn, self.org_id, 30)
 
         forecast_by_sku = {row["sku"]: row for row in forecast["rows"]}
         for product in dashboard["products"]:
@@ -341,7 +355,7 @@ class InventoryAppTest(unittest.TestCase):
 
     def test_forecast_handles_product_without_sales_history(self):
         with app.get_conn() as conn:
-            app.create_product(conn, {
+            app.create_product(conn, self.org_id, {
                 "sku": "SKU-NODATA-001",
                 "product_name": "履歴なし商品",
                 "category": "テスト",
@@ -351,7 +365,7 @@ class InventoryAppTest(unittest.TestCase):
                 "safety_stock": 5,
                 "reorder_point": 10,
             })
-            result = app.forecast_simulation(conn, 30)
+            result = app.forecast_simulation(conn, self.org_id, 30)
 
         no_data = next(row for row in result["rows"] if row["sku"] == "SKU-NODATA-001")
         self.assertEqual(no_data["judgement"], "データ不足")
@@ -359,8 +373,8 @@ class InventoryAppTest(unittest.TestCase):
 
     def test_product_ledger_is_returned_newest_first(self):
         with app.get_conn() as conn:
-            product = conn.execute("SELECT * FROM products ORDER BY id LIMIT 1").fetchone()
-            ledger = app.product_ledger(conn, product["id"])["ledger"]
+            product = self._first_product(conn)
+            ledger = app.product_ledger(conn, self.org_id, product["id"])["ledger"]
 
         dates = [row["movement_date"] for row in ledger]
         self.assertEqual(dates, sorted(dates, reverse=True))

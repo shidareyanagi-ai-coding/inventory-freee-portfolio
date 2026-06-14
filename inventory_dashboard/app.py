@@ -7,16 +7,30 @@ import urllib.error
 import urllib.request
 from calendar import monthrange
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
 
-from fastapi import Body, Depends, FastAPI, Request
+from fastapi import Body, Depends, FastAPI, Header, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+import auth
 import db
-from index_html import INDEX_HTML
+from index_html import render_index
+
+
+class NotFoundError(Exception):
+    """対象リソースが存在しない／別テナントのため見えない（404 相当）。
+
+    別テナントの id を渡されたときも「存在しない」と区別なく 404 を返すことで、
+    リソースの有無を漏らさない（IDOR 対策）。
+    """
+
+
+class ForbiddenError(Exception):
+    """認証済みだが権限不足（403 相当）。RBAC（viewer は更新系不可など）。"""
 
 try:
     from dotenv import load_dotenv
@@ -47,18 +61,144 @@ def get_conn() -> Any:
 
 
 def init_db() -> None:
+    """起動時はスキーマ作成だけ。デモ seed は「初回ログインで自組織に」行う(A-3)。"""
     with get_conn() as conn:
         db.create_schema(conn)
-        count = conn.execute("SELECT COUNT(*) AS count FROM products").fetchone()["count"]
-        if count == 0:
-            seed_products(conn)
-        normalize_initial_stock_dates(conn)
-        ensure_sample_transactions(conn)
-        ensure_demo_history(conn)
-        sync_partner_master(conn)
+        db.assert_tenancy_ready(conn)
 
 
-def seed_products(conn: db.Connection) -> None:
+# ---------------------------------------------------------------------------
+# テナント＆権限（A-3）
+# ---------------------------------------------------------------------------
+# 「1サインアップ=1組織」。Clerk のユーザ(sub)を memberships で自前 organization へ
+# 紐付け、初回ログイン時に自組織サンドボックスを作ってデモ seed を入れる。
+# 認可（organization_id 絞り込み・ロール判定）はこのサーバ側が単一の主体。
+
+
+@dataclass
+class Identity:
+    """1リクエストの「誰が・どの組織で・どの権限で」を表す。"""
+
+    organization_id: int
+    user_id: str
+    role: str
+
+
+def create_organization(conn: db.Connection, name: str) -> int:
+    return db.insert_returning_id(
+        conn,
+        "INSERT INTO organizations (name) VALUES (?)",
+        (name,),
+    )
+
+
+def get_membership_by_user(conn: db.Connection, user_id: str) -> dict[str, Any] | None:
+    return conn.execute(
+        "SELECT * FROM memberships WHERE user_id = ? ORDER BY id LIMIT 1",
+        (user_id,),
+    ).fetchone()
+
+
+def set_membership(conn: db.Connection, organization_id: int, user_id: str, role: str) -> None:
+    """user_id を organization に role で所属させる（無ければ作成、あれば role 更新）。"""
+    if role not in {"admin", "staff", "viewer"}:
+        raise ValueError("invalid role")
+    existing = conn.execute(
+        "SELECT id FROM memberships WHERE organization_id = ? AND user_id = ?",
+        (organization_id, user_id),
+    ).fetchone()
+    if existing:
+        conn.execute("UPDATE memberships SET role = ? WHERE id = ?", (role, existing["id"]))
+    else:
+        conn.execute(
+            "INSERT INTO memberships (organization_id, user_id, role) VALUES (?, ?, ?)",
+            (organization_id, user_id, role),
+        )
+
+
+def provision_organization_for_user(conn: db.Connection, user_id: str) -> Identity:
+    """初回ログイン: 自組織サンドボックスを作り、admin 権限とデモ seed を用意する。"""
+    organization_id = create_organization(conn, f"{user_id} のサンドボックス")
+    set_membership(conn, organization_id, user_id, "admin")
+    seed_organization(conn, organization_id)
+    record_audit(conn, organization_id, user_id, "organization.provisioned", "organization", organization_id)
+    return Identity(organization_id=organization_id, user_id=user_id, role="admin")
+
+
+def resolve_identity(user_id: str) -> Identity:
+    """user_id(Clerk sub) から Identity を解決する。初回ログインなら組織を作成して seed。"""
+    with get_conn() as conn:
+        membership = get_membership_by_user(conn, user_id)
+        if membership:
+            return Identity(
+                organization_id=int(membership["organization_id"]),
+                user_id=user_id,
+                role=str(membership["role"]),
+            )
+        return provision_organization_for_user(conn, user_id)
+
+
+def record_audit(
+    conn: db.Connection,
+    organization_id: int,
+    actor_user_id: str,
+    action: str,
+    target_type: str = "",
+    target_id: Any = "",
+    detail: dict[str, Any] | None = None,
+) -> None:
+    """監査ログ（誰が・いつ・何を）。失敗しても業務処理は止めない方針ではなく、
+    同一トランザクション内に必ず残す（操作と監査の整合を担保する）。"""
+    conn.execute(
+        """
+        INSERT INTO audit_logs (organization_id, actor_user_id, action, target_type, target_id, detail_json)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            organization_id,
+            actor_user_id or "",
+            action,
+            target_type,
+            str(target_id),
+            json.dumps(detail or {}, ensure_ascii=False),
+        ),
+    )
+
+
+def list_audit_logs(conn: db.Connection, organization_id: int, limit: int = 50) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        """
+        SELECT id, actor_user_id, action, target_type, target_id, detail_json, created_at
+        FROM audit_logs
+        WHERE organization_id = ?
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (organization_id, limit),
+    ).fetchall()
+    for row in rows:
+        row["detail"] = json.loads(row["detail_json"])
+    return rows
+
+
+def seed_organization(conn: db.Connection, organization_id: int) -> None:
+    """指定 organization にデモデータ（商品・取引・24ヶ月履歴・取引先）を投入する。
+
+    旧 init_db のグローバル seed を「組織単位」に切り出したもの。冪等。
+    """
+    count = conn.execute(
+        "SELECT COUNT(*) AS count FROM products WHERE organization_id = ?",
+        (organization_id,),
+    ).fetchone()["count"]
+    if count == 0:
+        seed_products(conn, organization_id)
+    normalize_initial_stock_dates(conn, organization_id)
+    ensure_sample_transactions(conn, organization_id)
+    ensure_demo_history(conn, organization_id)
+    sync_partner_master(conn, organization_id)
+
+
+def seed_products(conn: db.Connection, organization_id: int) -> None:
     products = [
         ("SKU-USB-C-001", "USB-Cケーブル 1m", "ケーブル", "東京サプライ", 480, 980, 10, 5, 20, 30, 10),
         ("SKU-MOUSE-001", "ワイヤレスマウス", "周辺機器", "関東OA商事", 1200, 2480, 10, 7, 10, 18, 5),
@@ -67,26 +207,29 @@ def seed_products(conn: db.Connection) -> None:
     conn.executemany(
         """
         INSERT INTO products (
-            sku, product_name, category, supplier_name, purchase_unit_price,
+            organization_id, sku, product_name, category, supplier_name, purchase_unit_price,
             sales_unit_price, tax_rate, lead_time_days, safety_stock,
             reorder_point, min_order_quantity
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        products,
+        [(organization_id, *product) for product in products],
     )
-    rows = conn.execute("SELECT id, product_name, purchase_unit_price FROM products").fetchall()
+    rows = conn.execute(
+        "SELECT id, product_name, purchase_unit_price FROM products WHERE organization_id = ?",
+        (organization_id,),
+    ).fetchall()
     initial_stock = {"USB-Cケーブル 1m": 25, "ワイヤレスマウス": 12, "24インチモニター": 6}
     for row in rows:
         conn.execute(
             """
             INSERT INTO inventory_movements (
-                product_id, movement_type, source_type, source_id, movement_date,
+                organization_id, product_id, movement_type, source_type, source_id, movement_date,
                 quantity_delta, unit_price, note
             )
-            VALUES (?, 'initial_stock', 'seed', ?, ?, ?, ?, '初期在庫')
+            VALUES (?, ?, 'initial_stock', 'seed', ?, ?, ?, ?, '初期在庫')
             """,
-            (row["id"], row["id"], initial_stock_date(), initial_stock[row["product_name"]], row["purchase_unit_price"]),
+            (organization_id, row["id"], row["id"], initial_stock_date(), initial_stock[row["product_name"]], row["purchase_unit_price"]),
         )
 
 
@@ -94,27 +237,37 @@ def initial_stock_date() -> str:
     return add_months(date.today().replace(day=1), -DEMO_HISTORY_MONTHS).isoformat()
 
 
-def normalize_initial_stock_dates(conn: db.Connection) -> None:
+def normalize_initial_stock_dates(conn: db.Connection, organization_id: int) -> None:
     stock_date = initial_stock_date()
     conn.execute(
         """
         UPDATE inventory_movements
         SET movement_date = ?
-        WHERE movement_type = 'initial_stock'
+        WHERE organization_id = ?
+          AND movement_type = 'initial_stock'
           AND source_type = 'seed'
           AND movement_date <> ?
         """,
-        (stock_date, stock_date),
+        (stock_date, organization_id, stock_date),
     )
 
 
-def ensure_sample_transactions(conn: db.Connection) -> None:
-    purchase_count = conn.execute("SELECT COUNT(*) AS count FROM purchases").fetchone()["count"]
-    sale_count = conn.execute("SELECT COUNT(*) AS count FROM sales").fetchone()["count"]
+def ensure_sample_transactions(conn: db.Connection, organization_id: int) -> None:
+    purchase_count = conn.execute(
+        "SELECT COUNT(*) AS count FROM purchases WHERE organization_id = ?", (organization_id,)
+    ).fetchone()["count"]
+    sale_count = conn.execute(
+        "SELECT COUNT(*) AS count FROM sales WHERE organization_id = ?", (organization_id,)
+    ).fetchone()["count"]
     if purchase_count or sale_count:
         return
 
-    products = {row["sku"]: row for row in conn.execute("SELECT * FROM products").fetchall()}
+    products = {
+        row["sku"]: row
+        for row in conn.execute(
+            "SELECT * FROM products WHERE organization_id = ?", (organization_id,)
+        ).fetchall()
+    }
     samples = [
         ("purchase", "SKU-USB-C-001", "東京サプライ", "P-202606-001", "2026-06-01", "2026-06-03", 40, 480, "課税仕入 10%", "2026-06-30"),
         ("sale", "SKU-USB-C-001", "青山ECストア", "S-202606-014", "2026-06-05", "", 22, 980, "課税売上 10%", "2026-07-31"),
@@ -138,19 +291,25 @@ def ensure_sample_transactions(conn: db.Connection) -> None:
         }
         if kind == "purchase":
             data["received_date"] = received_date
-            create_purchase(conn, data)
+            create_purchase(conn, organization_id, data)
         else:
-            create_sale(conn, data)
+            create_sale(conn, organization_id, data)
 
 
-def ensure_demo_history(conn: db.Connection) -> None:
+def ensure_demo_history(conn: db.Connection, organization_id: int) -> None:
     exists = conn.execute(
-        "SELECT id FROM sales WHERE invoice_no LIKE 'DEMO-HIST-S-%' LIMIT 1"
+        "SELECT id FROM sales WHERE organization_id = ? AND invoice_no LIKE 'DEMO-HIST-S-%' LIMIT 1",
+        (organization_id,),
     ).fetchone()
     if exists:
         return
 
-    products = {row["sku"]: row for row in conn.execute("SELECT * FROM products").fetchall()}
+    products = {
+        row["sku"]: row
+        for row in conn.execute(
+            "SELECT * FROM products WHERE organization_id = ?", (organization_id,)
+        ).fetchall()
+    }
     today = date.today()
     first_month = add_months(today.replace(day=1), -DEMO_HISTORY_MONTHS)
     patterns = {
@@ -172,10 +331,10 @@ def ensure_demo_history(conn: db.Connection) -> None:
             first_sale_quantity = max(quantity // 2, 1)
             second_sale_quantity = quantity - first_sale_quantity
 
-            insert_demo_purchase(conn, product, purchase_date, quantity)
-            insert_demo_sale(conn, product, pattern["partner"], sale_date_a, first_sale_quantity, "A")
+            insert_demo_purchase(conn, organization_id, product, purchase_date, quantity)
+            insert_demo_sale(conn, organization_id, product, pattern["partner"], sale_date_a, first_sale_quantity, "A")
             if second_sale_quantity > 0:
-                insert_demo_sale(conn, product, pattern["partner"], sale_date_b, second_sale_quantity, "B")
+                insert_demo_sale(conn, organization_id, product, pattern["partner"], sale_date_b, second_sale_quantity, "B")
 
 
 def add_months(value: date, months: int) -> date:
@@ -198,20 +357,21 @@ def demo_monthly_sales_quantity(base: int, season_strength: float, month_date: d
     return max(int(round(base * season * trend * wave)), 1)
 
 
-def insert_demo_purchase(conn: db.Connection, product: dict[str, Any], purchase_date: date, quantity: int) -> None:
+def insert_demo_purchase(conn: db.Connection, organization_id: int, product: dict[str, Any], purchase_date: date, quantity: int) -> None:
     invoice_no = f"DEMO-HIST-P-{product['sku']}-{purchase_date:%Y%m}"
     created_at = purchase_date.isoformat()
     purchase_id = db.insert_returning_id(
         conn,
         """
         INSERT INTO purchases (
-            product_id, partner_name, invoice_no, transaction_date, received_date,
+            organization_id, product_id, partner_name, invoice_no, transaction_date, received_date,
             quantity, unit_price, tax_rate, tax_category, due_date,
             external_accounting_status, created_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'demo', ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'demo', ?)
         """,
         (
+            organization_id,
             product["id"],
             product["supplier_name"],
             invoice_no,
@@ -228,17 +388,18 @@ def insert_demo_purchase(conn: db.Connection, product: dict[str, Any], purchase_
     conn.execute(
         """
         INSERT INTO inventory_movements (
-            product_id, movement_type, source_type, source_id, movement_date,
+            organization_id, product_id, movement_type, source_type, source_id, movement_date,
             quantity_delta, unit_price, note, created_at
         )
-        VALUES (?, 'purchase_receipt', 'purchase', ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, 'purchase_receipt', 'purchase', ?, ?, ?, ?, ?, ?)
         """,
-        (product["id"], purchase_id, created_at, quantity, product["purchase_unit_price"], f"デモ仕入 {invoice_no}", created_at),
+        (organization_id, product["id"], purchase_id, created_at, quantity, product["purchase_unit_price"], f"デモ仕入 {invoice_no}", created_at),
     )
 
 
 def insert_demo_sale(
     conn: db.Connection,
+    organization_id: int,
     product: dict[str, Any],
     partner_name: str,
     sale_date: date,
@@ -251,13 +412,14 @@ def insert_demo_sale(
         conn,
         """
         INSERT INTO sales (
-            product_id, partner_name, invoice_no, transaction_date,
+            organization_id, product_id, partner_name, invoice_no, transaction_date,
             quantity, unit_price, tax_rate, tax_category, due_date,
             external_accounting_status, created_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'demo', ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'demo', ?)
         """,
         (
+            organization_id,
             product["id"],
             partner_name,
             invoice_no,
@@ -273,29 +435,33 @@ def insert_demo_sale(
     conn.execute(
         """
         INSERT INTO inventory_movements (
-            product_id, movement_type, source_type, source_id, movement_date,
+            organization_id, product_id, movement_type, source_type, source_id, movement_date,
             quantity_delta, unit_price, note, created_at
         )
-        VALUES (?, 'sale_shipment', 'sale', ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, 'sale_shipment', 'sale', ?, ?, ?, ?, ?, ?)
         """,
-        (product["id"], sale_id, created_at, -quantity, product["sales_unit_price"], f"デモ売上 {invoice_no}", created_at),
+        (organization_id, product["id"], sale_id, created_at, -quantity, product["sales_unit_price"], f"デモ売上 {invoice_no}", created_at),
     )
 
 
-def stock_by_product(conn: db.Connection) -> dict[int, int]:
+def stock_by_product(conn: db.Connection, organization_id: int) -> dict[int, int]:
     rows = conn.execute(
         """
         SELECT product_id, COALESCE(SUM(quantity_delta), 0) AS stock_quantity
         FROM inventory_movements
+        WHERE organization_id = ?
         GROUP BY product_id
-        """
+        """,
+        (organization_id,),
     ).fetchall()
     return {row["product_id"]: int(row["stock_quantity"]) for row in rows}
 
 
-def list_products(conn: db.Connection) -> list[dict[str, Any]]:
-    stocks = stock_by_product(conn)
-    products = conn.execute("SELECT * FROM products ORDER BY id").fetchall()
+def list_products(conn: db.Connection, organization_id: int) -> list[dict[str, Any]]:
+    stocks = stock_by_product(conn, organization_id)
+    products = conn.execute(
+        "SELECT * FROM products WHERE organization_id = ? ORDER BY id", (organization_id,)
+    ).fetchall()
     for product in products:
         stock = stocks.get(product["id"], 0)
         product["stock_quantity"] = stock
@@ -306,50 +472,58 @@ def list_products(conn: db.Connection) -> list[dict[str, Any]]:
     return products
 
 
-def sync_partner_master(conn: db.Connection) -> None:
+def sync_partner_master(conn: db.Connection, organization_id: int) -> None:
     supplier_names = [
         row["partner_name"]
         for row in conn.execute(
             """
-            SELECT supplier_name AS partner_name FROM products WHERE supplier_name <> ''
+            SELECT supplier_name AS partner_name FROM products
+            WHERE organization_id = ? AND supplier_name <> ''
             UNION
-            SELECT partner_name FROM purchases WHERE partner_name <> ''
-            """
+            SELECT partner_name FROM purchases
+            WHERE organization_id = ? AND partner_name <> ''
+            """,
+            (organization_id, organization_id),
         ).fetchall()
     ]
     customer_names = [
         row["partner_name"]
-        for row in conn.execute("SELECT DISTINCT partner_name FROM sales WHERE partner_name <> ''").fetchall()
+        for row in conn.execute(
+            "SELECT DISTINCT partner_name FROM sales WHERE organization_id = ? AND partner_name <> ''",
+            (organization_id,),
+        ).fetchall()
     ]
     for name in supplier_names:
-        add_business_partner(conn, "supplier", name)
+        add_business_partner(conn, organization_id, "supplier", name)
     for name in customer_names:
-        add_business_partner(conn, "customer", name)
+        add_business_partner(conn, organization_id, "customer", name)
 
 
-def add_business_partner(conn: db.Connection, partner_type: str, partner_name: str) -> None:
+def add_business_partner(conn: db.Connection, organization_id: int, partner_type: str, partner_name: str) -> None:
     if partner_type not in {"supplier", "customer"}:
         raise ValueError("invalid partner_type")
     name = required_text(partner_name, "partner_name")
     # INSERT OR IGNORE は SQLite 方言。両対応の "ON CONFLICT DO NOTHING" に統一する
-    # （UNIQUE(partner_type, partner_name) 衝突時は黙って無視）。
+    # （UNIQUE(organization_id, partner_type, partner_name) 衝突時は黙って無視）。
     conn.execute(
         """
-        INSERT INTO business_partners (partner_type, partner_name)
-        VALUES (?, ?)
+        INSERT INTO business_partners (organization_id, partner_type, partner_name)
+        VALUES (?, ?, ?)
         ON CONFLICT DO NOTHING
         """,
-        (partner_type, name),
+        (organization_id, partner_type, name),
     )
 
 
-def list_business_partners(conn: db.Connection) -> dict[str, list[str]]:
+def list_business_partners(conn: db.Connection, organization_id: int) -> dict[str, list[str]]:
     rows = conn.execute(
         """
         SELECT partner_type, partner_name
         FROM business_partners
+        WHERE organization_id = ?
         ORDER BY partner_type, partner_name
-        """
+        """,
+        (organization_id,),
     ).fetchall()
     partners = {"suppliers": [], "customers": []}
     for row in rows:
@@ -358,10 +532,10 @@ def list_business_partners(conn: db.Connection) -> dict[str, list[str]]:
     return partners
 
 
-def create_business_partner(conn: db.Connection, data: dict[str, Any]) -> dict[str, Any]:
+def create_business_partner(conn: db.Connection, organization_id: int, data: dict[str, Any]) -> dict[str, Any]:
     partner_type = data.get("partner_type", "")
     partner_name = required_text(data.get("partner_name"), "partner_name")
-    add_business_partner(conn, partner_type, partner_name)
+    add_business_partner(conn, organization_id, partner_type, partner_name)
     return {"ok": True, "partner_type": partner_type, "partner_name": partner_name}
 
 
@@ -379,7 +553,7 @@ def recommended_order_quantity(product: dict[str, Any], stock: int) -> int:
     return max(int(product["reorder_point"]) + int(product["safety_stock"]) - stock, 0)
 
 
-def create_product(conn: db.Connection, data: dict[str, Any]) -> dict[str, Any]:
+def create_product(conn: db.Connection, organization_id: int, data: dict[str, Any]) -> dict[str, Any]:
     required = ["sku", "product_name"]
     for key in required:
         if not str(data.get(key, "")).strip():
@@ -388,13 +562,14 @@ def create_product(conn: db.Connection, data: dict[str, Any]) -> dict[str, Any]:
     conn.execute(
         """
         INSERT INTO products (
-            sku, product_name, category, supplier_name, purchase_unit_price,
+            organization_id, sku, product_name, category, supplier_name, purchase_unit_price,
             sales_unit_price, tax_rate, tax_category, lead_time_days,
             safety_stock, reorder_point, min_order_quantity
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
+            organization_id,
             data["sku"].strip(),
             data["product_name"].strip(),
             data.get("category", "").strip(),
@@ -410,12 +585,12 @@ def create_product(conn: db.Connection, data: dict[str, Any]) -> dict[str, Any]:
         ),
     )
     if supplier_name:
-        add_business_partner(conn, "supplier", supplier_name)
+        add_business_partner(conn, organization_id, "supplier", supplier_name)
     return {"ok": True}
 
 
-def create_purchase(conn: db.Connection, data: dict[str, Any]) -> dict[str, Any]:
-    product = get_product(conn, to_int(data.get("product_id")))
+def create_purchase(conn: db.Connection, organization_id: int, data: dict[str, Any]) -> dict[str, Any]:
+    product = get_product(conn, organization_id, to_int(data.get("product_id")))
     quantity = positive_int(data.get("quantity"), "quantity")
     unit_price = to_float(data.get("unit_price", product["purchase_unit_price"]))
     transaction_date = data.get("transaction_date") or date.today().isoformat()
@@ -430,32 +605,32 @@ def create_purchase(conn: db.Connection, data: dict[str, Any]) -> dict[str, Any]
         conn,
         """
         INSERT INTO purchases (
-            product_id, partner_name, invoice_no, transaction_date, received_date,
+            organization_id, product_id, partner_name, invoice_no, transaction_date, received_date,
             quantity, unit_price, tax_rate, tax_category, due_date
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (product["id"], partner_name, invoice_no, transaction_date, received_date, quantity, unit_price, tax_rate, tax_category, due_date),
+        (organization_id, product["id"], partner_name, invoice_no, transaction_date, received_date, quantity, unit_price, tax_rate, tax_category, due_date),
     )
     conn.execute(
         """
         INSERT INTO inventory_movements (
-            product_id, movement_type, source_type, source_id, movement_date,
+            organization_id, product_id, movement_type, source_type, source_id, movement_date,
             quantity_delta, unit_price, note
         )
-        VALUES (?, 'purchase_receipt', 'purchase', ?, ?, ?, ?, ?)
+        VALUES (?, ?, 'purchase_receipt', 'purchase', ?, ?, ?, ?, ?)
         """,
-        (product["id"], purchase_id, received_date, quantity, unit_price, f"仕入 {invoice_no}"),
+        (organization_id, product["id"], purchase_id, received_date, quantity, unit_price, f"仕入 {invoice_no}"),
     )
-    enqueue_freee_payload(conn, "purchase", purchase_id)
-    add_business_partner(conn, "supplier", partner_name)
+    enqueue_freee_payload(conn, organization_id, "purchase", purchase_id)
+    add_business_partner(conn, organization_id, "supplier", partner_name)
     return {"ok": True, "purchase_id": purchase_id}
 
 
-def create_sale(conn: db.Connection, data: dict[str, Any]) -> dict[str, Any]:
-    product = get_product(conn, to_int(data.get("product_id")))
+def create_sale(conn: db.Connection, organization_id: int, data: dict[str, Any]) -> dict[str, Any]:
+    product = get_product(conn, organization_id, to_int(data.get("product_id")))
     quantity = positive_int(data.get("quantity"), "quantity")
-    current_stock = stock_by_product(conn).get(product["id"], 0)
+    current_stock = stock_by_product(conn, organization_id).get(product["id"], 0)
     if current_stock < quantity:
         raise ValueError(f"在庫不足です。現在庫 {current_stock} に対して出庫数量 {quantity} は登録できません。")
     unit_price = to_float(data.get("unit_price", product["sales_unit_price"]))
@@ -470,56 +645,56 @@ def create_sale(conn: db.Connection, data: dict[str, Any]) -> dict[str, Any]:
         conn,
         """
         INSERT INTO sales (
-            product_id, partner_name, invoice_no, transaction_date,
+            organization_id, product_id, partner_name, invoice_no, transaction_date,
             quantity, unit_price, tax_rate, tax_category, due_date
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (product["id"], partner_name, invoice_no, transaction_date, quantity, unit_price, tax_rate, tax_category, due_date),
+        (organization_id, product["id"], partner_name, invoice_no, transaction_date, quantity, unit_price, tax_rate, tax_category, due_date),
     )
     conn.execute(
         """
         INSERT INTO inventory_movements (
-            product_id, movement_type, source_type, source_id, movement_date,
+            organization_id, product_id, movement_type, source_type, source_id, movement_date,
             quantity_delta, unit_price, note
         )
-        VALUES (?, 'sale_shipment', 'sale', ?, ?, ?, ?, ?)
+        VALUES (?, ?, 'sale_shipment', 'sale', ?, ?, ?, ?, ?)
         """,
-        (product["id"], sale_id, transaction_date, -quantity, unit_price, f"売上 {invoice_no}"),
+        (organization_id, product["id"], sale_id, transaction_date, -quantity, unit_price, f"売上 {invoice_no}"),
     )
-    enqueue_freee_payload(conn, "sale", sale_id)
-    add_business_partner(conn, "customer", partner_name)
+    enqueue_freee_payload(conn, organization_id, "sale", sale_id)
+    add_business_partner(conn, organization_id, "customer", partner_name)
     return {"ok": True, "sale_id": sale_id}
 
 
-def enqueue_freee_payload(conn: db.Connection, source_type: str, source_id: int) -> None:
-    payload = build_freee_payload(conn, source_type, source_id)
+def enqueue_freee_payload(conn: db.Connection, organization_id: int, source_type: str, source_id: int) -> None:
+    payload = build_freee_payload(conn, organization_id, source_type, source_id)
     direction = "expense" if source_type == "purchase" else "income"
     conn.execute(
         """
-        INSERT INTO freee_sync_queue (source_type, source_id, direction, status, payload_json)
-        VALUES (?, ?, ?, 'pending', ?)
+        INSERT INTO freee_sync_queue (organization_id, source_type, source_id, direction, status, payload_json)
+        VALUES (?, ?, ?, ?, 'pending', ?)
         ON CONFLICT(source_type, source_id) DO UPDATE SET
             payload_json = excluded.payload_json,
             updated_at = CURRENT_TIMESTAMP
         """,
-        (source_type, source_id, direction, json.dumps(payload, ensure_ascii=False)),
+        (organization_id, source_type, source_id, direction, json.dumps(payload, ensure_ascii=False)),
     )
 
 
-def build_freee_payload(conn: db.Connection, source_type: str, source_id: int) -> dict[str, Any]:
+def build_freee_payload(conn: db.Connection, organization_id: int, source_type: str, source_id: int) -> dict[str, Any]:
     if source_type == "purchase":
         row = conn.execute(
             """
             SELECT p.*, pr.sku, pr.product_name
             FROM purchases p
             JOIN products pr ON pr.id = p.product_id
-            WHERE p.id = ?
+            WHERE p.id = ? AND p.organization_id = ?
             """,
-            (source_id,),
+            (source_id, organization_id),
         ).fetchone()
         if not row:
-            raise ValueError("purchase not found")
+            raise NotFoundError("purchase not found")
         amount = round(row["quantity"] * row["unit_price"] * (1 + row["tax_rate"] / 100))
         return {
             "api_target": "freee_accounting_deal",
@@ -547,12 +722,12 @@ def build_freee_payload(conn: db.Connection, source_type: str, source_id: int) -
             SELECT s.*, pr.sku, pr.product_name
             FROM sales s
             JOIN products pr ON pr.id = s.product_id
-            WHERE s.id = ?
+            WHERE s.id = ? AND s.organization_id = ?
             """,
-            (source_id,),
+            (source_id, organization_id),
         ).fetchone()
         if not row:
-            raise ValueError("sale not found")
+            raise NotFoundError("sale not found")
         amount = round(row["quantity"] * row["unit_price"] * (1 + row["tax_rate"] / 100))
         return {
             "api_target": "freee_accounting_deal",
@@ -577,24 +752,30 @@ def build_freee_payload(conn: db.Connection, source_type: str, source_id: int) -
     raise ValueError("invalid source_type")
 
 
-def get_product(conn: db.Connection, product_id: int) -> dict[str, Any]:
-    product = conn.execute("SELECT * FROM products WHERE id = ?", (product_id,)).fetchone()
+def get_product(conn: db.Connection, organization_id: int, product_id: int) -> dict[str, Any]:
+    product = conn.execute(
+        "SELECT * FROM products WHERE id = ? AND organization_id = ?",
+        (product_id, organization_id),
+    ).fetchone()
     if not product:
-        raise ValueError("product not found")
+        # 別テナントの id でも「存在しない」と同じ 404 にして有無を漏らさない（IDOR対策）。
+        raise NotFoundError("product not found")
     return product
 
 
-def dashboard(conn: db.Connection) -> dict[str, Any]:
-    products = list_products(conn)
+def dashboard(conn: db.Connection, organization_id: int) -> dict[str, Any]:
+    products = list_products(conn, organization_id)
     total_stock_value = sum(product["stock_value"] for product in products)
     recent_movements = conn.execute(
         """
         SELECT im.*, p.sku, p.product_name
         FROM inventory_movements im
         JOIN products p ON p.id = im.product_id
+        WHERE im.organization_id = ?
         ORDER BY im.created_at DESC, im.id DESC
         LIMIT 10
-        """
+        """,
+        (organization_id,),
     ).fetchall()
     today = date.today()
     month_start = today.replace(day=1).isoformat()
@@ -608,11 +789,11 @@ def dashboard(conn: db.Connection) -> dict[str, Any]:
             SUM(pu.quantity * pu.unit_price) AS amount
         FROM purchases pu
         JOIN products p ON p.id = pu.product_id
-        WHERE pu.transaction_date BETWEEN ? AND ?
+        WHERE pu.organization_id = ? AND pu.transaction_date BETWEEN ? AND ?
         GROUP BY p.id, p.sku, p.product_name
         ORDER BY p.id
         """,
-        (month_start, today_text),
+        (organization_id, month_start, today_text),
     ).fetchall()
     monthly_sales = conn.execute(
         """
@@ -623,29 +804,29 @@ def dashboard(conn: db.Connection) -> dict[str, Any]:
             SUM(s.quantity * s.unit_price) AS amount
         FROM sales s
         JOIN products p ON p.id = s.product_id
-        WHERE s.transaction_date BETWEEN ? AND ?
+        WHERE s.organization_id = ? AND s.transaction_date BETWEEN ? AND ?
         GROUP BY p.id, p.sku, p.product_name
         ORDER BY p.id
         """,
-        (month_start, today_text),
+        (organization_id, month_start, today_text),
     ).fetchall()
     monthly_purchase_total = conn.execute(
         """
         SELECT COALESCE(SUM(quantity * unit_price), 0) AS total
         FROM purchases
-        WHERE transaction_date BETWEEN ? AND ?
+        WHERE organization_id = ? AND transaction_date BETWEEN ? AND ?
         """,
-        (month_start, today_text),
+        (organization_id, month_start, today_text),
     ).fetchone()["total"]
     monthly_sales_total = conn.execute(
         """
         SELECT COALESCE(SUM(quantity * unit_price), 0) AS total
         FROM sales
-        WHERE transaction_date BETWEEN ? AND ?
+        WHERE organization_id = ? AND transaction_date BETWEEN ? AND ?
         """,
-        (month_start, today_text),
+        (organization_id, month_start, today_text),
     ).fetchone()["total"]
-    forecast = forecast_simulation(conn, 30)
+    forecast = forecast_simulation(conn, organization_id, 30)
     forecast_by_sku = {row["sku"]: row for row in forecast["rows"]}
     for product in products:
         forecast_row = forecast_by_sku.get(product["sku"])
@@ -676,7 +857,7 @@ def dashboard(conn: db.Connection) -> dict[str, Any]:
     }
 
 
-def forecast_simulation(conn: db.Connection, horizon_days: int = 30) -> dict[str, Any]:
+def forecast_simulation(conn: db.Connection, organization_id: int, horizon_days: int = 30) -> dict[str, Any]:
     if horizon_days not in {30, 60, 90}:
         horizon_days = 30
 
@@ -685,14 +866,14 @@ def forecast_simulation(conn: db.Connection, horizon_days: int = 30) -> dict[str
     end_date = today.isoformat()
     month_end = date(today.year, today.month, monthrange(today.year, today.month)[1])
     days_to_month_end = max((month_end - today).days + 1, 0)
-    products = list_products(conn)
+    products = list_products(conn, organization_id)
     rows = []
 
     for product in products:
-        recent_sales_quantity = active_sales_quantity(conn, product["id"], start_date, end_date)
-        total_sales_quantity = active_sales_quantity(conn, product["id"], "1900-01-01", end_date)
+        recent_sales_quantity = active_sales_quantity(conn, organization_id, product["id"], start_date, end_date)
+        total_sales_quantity = active_sales_quantity(conn, organization_id, product["id"], "1900-01-01", end_date)
         daily_average = recent_sales_quantity / horizon_days
-        seasonal_factor = monthly_seasonal_factor(conn, product["id"], today.month)
+        seasonal_factor = monthly_seasonal_factor(conn, organization_id, product["id"], today.month)
         adjusted_daily_average = daily_average * seasonal_factor
         month_end_forecast = math.ceil(adjusted_daily_average * days_to_month_end)
         lead_time_demand = math.ceil(adjusted_daily_average * int(product["lead_time_days"]))
@@ -749,23 +930,24 @@ def forecast_simulation(conn: db.Connection, horizon_days: int = 30) -> dict[str
     }
 
 
-def active_sales_quantity(conn: db.Connection, product_id: int, start_date: str, end_date: str) -> int:
+def active_sales_quantity(conn: db.Connection, organization_id: int, product_id: int, start_date: str, end_date: str) -> int:
     row = conn.execute(
         """
         SELECT COALESCE(SUM(s.quantity), 0) AS quantity
         FROM sales s
         JOIN inventory_movements im ON im.source_type = 'sale' AND im.source_id = s.id
         LEFT JOIN inventory_corrections c ON c.original_movement_id = im.id
-        WHERE s.product_id = ?
+        WHERE s.organization_id = ?
+          AND s.product_id = ?
           AND s.transaction_date BETWEEN ? AND ?
           AND c.id IS NULL
         """,
-        (product_id, start_date, end_date),
+        (organization_id, product_id, start_date, end_date),
     ).fetchone()
     return int(row["quantity"] or 0)
 
 
-def monthly_seasonal_factor(conn: db.Connection, product_id: int, target_month: int) -> float:
+def monthly_seasonal_factor(conn: db.Connection, organization_id: int, product_id: int, target_month: int) -> float:
     # 月の抽出は方言差があるため db.month_expr で吸収（strftime ⇄ EXTRACT）。
     month_sql = db.month_expr(conn, "s.transaction_date")
     rows = conn.execute(
@@ -775,11 +957,12 @@ def monthly_seasonal_factor(conn: db.Connection, product_id: int, target_month: 
         FROM sales s
         JOIN inventory_movements im ON im.source_type = 'sale' AND im.source_id = s.id
         LEFT JOIN inventory_corrections c ON c.original_movement_id = im.id
-        WHERE s.product_id = ?
+        WHERE s.organization_id = ?
+          AND s.product_id = ?
           AND c.id IS NULL
         GROUP BY {month_sql}
         """,
-        (product_id,),
+        (organization_id, product_id),
     ).fetchall()
     if len(rows) < 6:
         return 1.0
@@ -791,8 +974,8 @@ def monthly_seasonal_factor(conn: db.Connection, product_id: int, target_month: 
     return min(max(target / average, 0.75), 1.4)
 
 
-def product_ledger(conn: db.Connection, product_id: int) -> dict[str, Any]:
-    product = get_product(conn, product_id)
+def product_ledger(conn: db.Connection, organization_id: int, product_id: int) -> dict[str, Any]:
+    product = get_product(conn, organization_id, product_id)
     rows = conn.execute(
         """
         SELECT
@@ -817,10 +1000,10 @@ def product_ledger(conn: db.Connection, product_id: int) -> dict[str, Any]:
         LEFT JOIN sales sa ON im.source_type = 'sale' AND sa.id = im.source_id
         LEFT JOIN freee_sync_queue q ON q.source_type = im.source_type AND q.source_id = im.source_id
         LEFT JOIN inventory_corrections c ON c.original_movement_id = im.id
-        WHERE im.product_id = ?
+        WHERE im.organization_id = ? AND im.product_id = ?
         ORDER BY im.movement_date ASC, im.id ASC
         """,
-        (product_id,),
+        (organization_id, product_id),
     ).fetchall()
 
     balance = 0
@@ -840,12 +1023,16 @@ def product_ledger(conn: db.Connection, product_id: int) -> dict[str, Any]:
     return {"product": product, "ledger": rows, "count": len(rows)}
 
 
-def cancel_inventory_movement(conn: db.Connection, data: dict[str, Any]) -> dict[str, Any]:
+def cancel_inventory_movement(conn: db.Connection, organization_id: int, data: dict[str, Any]) -> dict[str, Any]:
     movement_id = to_int(data.get("movement_id"))
     reason = required_text(data.get("reason") or "入力ミスのため取消", "reason")
-    original = conn.execute("SELECT * FROM inventory_movements WHERE id = ?", (movement_id,)).fetchone()
+    original = conn.execute(
+        "SELECT * FROM inventory_movements WHERE id = ? AND organization_id = ?",
+        (movement_id, organization_id),
+    ).fetchone()
     if not original:
-        raise ValueError("movement not found")
+        # 別テナントの movement_id でも 404（存在の有無を漏らさない）。
+        raise NotFoundError("movement not found")
     if original["source_type"] not in {"purchase", "sale"}:
         raise ValueError("仕入入庫または売上出庫のみ取消できます。")
     exists = conn.execute(
@@ -857,7 +1044,7 @@ def cancel_inventory_movement(conn: db.Connection, data: dict[str, Any]) -> dict
 
     reversal_delta = -int(original["quantity_delta"])
     if reversal_delta < 0:
-        current_stock = stock_by_product(conn).get(original["product_id"], 0)
+        current_stock = stock_by_product(conn, organization_id).get(original["product_id"], 0)
         if current_stock + reversal_delta < 0:
             raise ValueError("取消すると在庫がマイナスになるため、先に関連する売上や調整を確認してください。")
 
@@ -866,12 +1053,13 @@ def cancel_inventory_movement(conn: db.Connection, data: dict[str, Any]) -> dict
         conn,
         """
         INSERT INTO inventory_movements (
-            product_id, movement_type, source_type, source_id, movement_date,
+            organization_id, product_id, movement_type, source_type, source_id, movement_date,
             quantity_delta, unit_price, note
         )
-        VALUES (?, ?, 'correction', ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, 'correction', ?, ?, ?, ?, ?)
         """,
         (
+            organization_id,
             original["product_id"],
             movement_type,
             movement_id,
@@ -883,10 +1071,10 @@ def cancel_inventory_movement(conn: db.Connection, data: dict[str, Any]) -> dict
     )
     conn.execute(
         """
-        INSERT INTO inventory_corrections (original_movement_id, correction_movement_id, reason)
-        VALUES (?, ?, ?)
+        INSERT INTO inventory_corrections (organization_id, original_movement_id, correction_movement_id, reason)
+        VALUES (?, ?, ?, ?)
         """,
-        (movement_id, correction_movement_id, reason),
+        (organization_id, movement_id, correction_movement_id, reason),
     )
     conn.execute(
         """
@@ -894,60 +1082,68 @@ def cancel_inventory_movement(conn: db.Connection, data: dict[str, Any]) -> dict
         SET status = 'failed',
             sync_error_message = ?,
             updated_at = CURRENT_TIMESTAMP
-        WHERE source_type = ? AND source_id = ? AND status IN ('pending', 'retry')
+        WHERE organization_id = ? AND source_type = ? AND source_id = ? AND status IN ('pending', 'retry')
         """,
-        (f"在庫元帳で取消済み: {reason}", original["source_type"], original["source_id"]),
+        (f"在庫元帳で取消済み: {reason}", organization_id, original["source_type"], original["source_id"]),
     )
     return {"ok": True, "correction_movement_id": correction_movement_id}
 
 
-def list_queue(conn: db.Connection) -> list[dict[str, Any]]:
+def list_queue(conn: db.Connection, organization_id: int) -> list[dict[str, Any]]:
     rows = conn.execute(
         """
         SELECT q.*
         FROM freee_sync_queue q
+        WHERE q.organization_id = ?
         ORDER BY q.created_at DESC, q.id DESC
-        """
+        """,
+        (organization_id,),
     ).fetchall()
     for row in rows:
         row["payload"] = json.loads(row["payload_json"])
     return rows
 
 
-def mark_queue_status(conn: db.Connection, data: dict[str, Any]) -> dict[str, Any]:
+def mark_queue_status(conn: db.Connection, organization_id: int, data: dict[str, Any]) -> dict[str, Any]:
     queue_id = to_int(data.get("id"))
     status = data.get("status", "")
     if status not in {"pending", "sent", "failed", "retry"}:
         raise ValueError("invalid status")
-    conn.execute(
+    updated = conn.execute(
         """
         UPDATE freee_sync_queue
         SET status = ?, external_accounting_id = ?, sync_error_message = ?, updated_at = CURRENT_TIMESTAMP
-        WHERE id = ?
+        WHERE id = ? AND organization_id = ?
         """,
-        (status, data.get("external_accounting_id", ""), data.get("sync_error_message", ""), queue_id),
+        (status, data.get("external_accounting_id", ""), data.get("sync_error_message", ""), queue_id, organization_id),
     )
+    if not _rowcount_positive(updated):
+        raise NotFoundError("queue not found")
     return {"ok": True}
 
 
-def fail_queue_send(conn: db.Connection, queue_id: int, message: str) -> None:
+def fail_queue_send(conn: db.Connection, organization_id: int, queue_id: int, message: str) -> None:
     conn.execute(
         """
         UPDATE freee_sync_queue
         SET status = 'failed',
             sync_error_message = ?,
             updated_at = CURRENT_TIMESTAMP
-        WHERE id = ?
+        WHERE id = ? AND organization_id = ?
         """,
-        (message, queue_id),
+        (message, queue_id, organization_id),
     )
 
 
-def send_queue_to_pseudo_freee(conn: db.Connection, data: dict[str, Any]) -> dict[str, Any]:
+def send_queue_to_pseudo_freee(conn: db.Connection, organization_id: int, data: dict[str, Any]) -> dict[str, Any]:
     queue_id = to_int(data.get("id"))
-    queue = conn.execute("SELECT * FROM freee_sync_queue WHERE id = ?", (queue_id,)).fetchone()
+    queue = conn.execute(
+        "SELECT * FROM freee_sync_queue WHERE id = ? AND organization_id = ?",
+        (queue_id, organization_id),
+    ).fetchone()
     if not queue:
-        raise ValueError("queue not found")
+        # 別テナントのキュー id でも 404。
+        raise NotFoundError("queue not found")
     if queue["status"] == "sent":
         raise ValueError("送信済みキューは再送できません")
 
@@ -974,20 +1170,20 @@ def send_queue_to_pseudo_freee(conn: db.Connection, data: dict[str, Any]) -> dic
     except urllib.error.HTTPError as exc:
         error_body = exc.read().decode("utf-8", errors="replace")
         message = f"疑似freee送信失敗 HTTP {exc.code}: {error_body}"
-        fail_queue_send(conn, queue_id, message)
+        fail_queue_send(conn, organization_id, queue_id, message)
         raise ValueError(message) from exc
     except urllib.error.URLError as exc:
         message = f"疑似freeeに接続できません: {exc.reason}"
-        fail_queue_send(conn, queue_id, message)
+        fail_queue_send(conn, organization_id, queue_id, message)
         raise ValueError(message) from exc
     except TimeoutError as exc:
         message = "疑似freee送信がタイムアウトしました"
-        fail_queue_send(conn, queue_id, message)
+        fail_queue_send(conn, organization_id, queue_id, message)
         raise ValueError(message) from exc
 
     if not response_data.get("ok"):
         message = str(response_data.get("error") or "疑似freee送信に失敗しました")
-        fail_queue_send(conn, queue_id, message)
+        fail_queue_send(conn, organization_id, queue_id, message)
         raise ValueError(message)
 
     pseudo_freee_deal_id = response_data.get("pseudo_freee_deal_id")
@@ -999,9 +1195,9 @@ def send_queue_to_pseudo_freee(conn: db.Connection, data: dict[str, Any]) -> dic
             external_accounting_id = ?,
             sync_error_message = '',
             updated_at = CURRENT_TIMESTAMP
-        WHERE id = ?
+        WHERE id = ? AND organization_id = ?
         """,
-        (external_accounting_id, queue_id),
+        (external_accounting_id, queue_id, organization_id),
     )
     return {
         "ok": True,
@@ -1009,6 +1205,14 @@ def send_queue_to_pseudo_freee(conn: db.Connection, data: dict[str, Any]) -> dic
         "external_accounting_id": external_accounting_id,
         "duplicate": bool(response_data.get("duplicate")),
     }
+
+
+def _rowcount_positive(cursor: Any) -> bool:
+    """UPDATE/DELETE が 1 行以上に当たったか（sqlite3 / psycopg どちらも rowcount を持つ）。"""
+    try:
+        return int(cursor.rowcount) > 0
+    except Exception:
+        return True
 
 
 def to_int(value: Any) -> int:
@@ -1070,6 +1274,24 @@ async def handle_value_error(request: Request, exc: ValueError) -> JSONResponse:
     return JSONResponse(status_code=400, content={"error": str(exc)})
 
 
+@app.exception_handler(auth.AuthError)
+async def handle_auth_error(request: Request, exc: auth.AuthError) -> JSONResponse:
+    # 未認証/トークン不正は 401（検証プラン 1: 未認証で各 API に到達不可）。
+    return JSONResponse(status_code=401, content={"error": str(exc) or "認証が必要です"})
+
+
+@app.exception_handler(ForbiddenError)
+async def handle_forbidden_error(request: Request, exc: ForbiddenError) -> JSONResponse:
+    # 認証済みだが権限不足は 403（検証プラン 3: viewer は更新系不可）。
+    return JSONResponse(status_code=403, content={"error": str(exc)})
+
+
+@app.exception_handler(NotFoundError)
+async def handle_not_found_error(request: Request, exc: NotFoundError) -> JSONResponse:
+    # 別テナント/存在しない id は 404（検証プラン 2: IDOR）。
+    return JSONResponse(status_code=404, content={"error": str(exc) or "not found"})
+
+
 async def handle_integrity_error(request: Request, exc: Exception) -> JSONResponse:
     return JSONResponse(status_code=400, content={"error": f"database integrity error: {exc}"})
 
@@ -1087,96 +1309,158 @@ async def handle_http_exception(request: Request, exc: StarletteHTTPException) -
     return JSONResponse(status_code=exc.status_code, content={"error": detail})
 
 
+# --- 認証/認可（A-3）-------------------------------------------------------
+# 全 API は current_identity を依存に持ち、未認証なら AuthError→401。
+# 更新系は require_roles("admin","staff") で viewer を弾く（403）。認可は常にサーバ側。
+def current_identity(
+    authorization: str | None = Header(default=None),
+    x_dev_user_id: str | None = Header(default=None, alias="X-Dev-User-Id"),
+) -> Identity:
+    token = auth.bearer_token_from_header(authorization)
+    if token is None:
+        # dev モード（Clerk 未設定のローカル/テスト）に限り、トークン無しを許可する。
+        # X-Dev-User-Id を変えると別テナントとして振る舞うのでテナント分離テストに使える。
+        if auth.auth_dev_mode():
+            user_id = (x_dev_user_id or "dev-user").strip() or "dev-user"
+            return resolve_identity(user_id)
+        raise auth.AuthError("認証が必要です（Authorization: Bearer トークンがありません）")
+    claims = auth.verify_token(token)  # 失敗時 AuthError→401
+    return resolve_identity(str(claims["sub"]))
+
+
+def require_roles(*roles: str) -> Any:
+    """指定ロールのみ通す依存を返す（RBAC）。"""
+
+    def dependency(identity: Identity = Depends(current_identity)) -> Identity:
+        if identity.role not in roles:
+            raise ForbiddenError(
+                f"この操作には {'/'.join(roles)} 権限が必要です（現在のロール: {identity.role}）"
+            )
+        return identity
+
+    return dependency
+
+
+# 更新系で使い回す依存（admin と staff は書き込み可、viewer は読み取り専用）。
+WRITER = Depends(require_roles("admin", "staff"))
+
+
 # --- 画面 -------------------------------------------------------------------
 @app.get("/", response_class=HTMLResponse)
 def index() -> str:
-    return INDEX_HTML
+    # 公開キー（ブラウザに出してよい）と dev フラグを埋め込んで配信する。
+    return render_index(
+        publishable_key=auth.clerk_publishable_key(),
+        clerk_configured=auth.clerk_configured(),
+        dev_mode=auth.auth_dev_mode(),
+    )
 
 
-# --- 参照系 API -------------------------------------------------------------
+# --- 参照系 API（認証必須・全ロール可）-------------------------------------
 @app.get("/api/dashboard")
-def api_dashboard() -> dict[str, Any]:
+def api_dashboard(identity: Identity = Depends(current_identity)) -> dict[str, Any]:
     with get_conn() as conn:
-        return dashboard(conn)
+        return dashboard(conn, identity.organization_id)
 
 
 @app.get("/api/products")
-def api_products() -> list[dict[str, Any]]:
+def api_products(identity: Identity = Depends(current_identity)) -> list[dict[str, Any]]:
     with get_conn() as conn:
-        return list_products(conn)
+        return list_products(conn, identity.organization_id)
 
 
 @app.get("/api/business-partners")
-def api_business_partners() -> dict[str, Any]:
+def api_business_partners(identity: Identity = Depends(current_identity)) -> dict[str, Any]:
     with get_conn() as conn:
-        return list_business_partners(conn)
+        return list_business_partners(conn, identity.organization_id)
 
 
 @app.get("/api/forecast-simulation")
-def api_forecast_simulation(horizon_days: int = 30) -> dict[str, Any]:
+def api_forecast_simulation(horizon_days: int = 30, identity: Identity = Depends(current_identity)) -> dict[str, Any]:
     with get_conn() as conn:
-        return forecast_simulation(conn, horizon_days)
+        return forecast_simulation(conn, identity.organization_id, horizon_days)
 
 
 @app.get("/api/products/{product_id}/ledger")
-def api_product_ledger(product_id: int) -> dict[str, Any]:
+def api_product_ledger(product_id: int, identity: Identity = Depends(current_identity)) -> dict[str, Any]:
     with get_conn() as conn:
-        return product_ledger(conn, product_id)
+        return product_ledger(conn, identity.organization_id, product_id)
 
 
 @app.get("/api/freee-sync-queue")
-def api_freee_sync_queue() -> list[dict[str, Any]]:
+def api_freee_sync_queue(identity: Identity = Depends(current_identity)) -> list[dict[str, Any]]:
     with get_conn() as conn:
-        return list_queue(conn)
+        return list_queue(conn, identity.organization_id)
 
 
 @app.get("/api/freee-preview")
-def api_freee_preview(source_type: str = "", source_id: int = 0) -> dict[str, Any]:
+def api_freee_preview(source_type: str = "", source_id: int = 0, identity: Identity = Depends(current_identity)) -> dict[str, Any]:
     with get_conn() as conn:
-        return build_freee_payload(conn, source_type, source_id)
+        return build_freee_payload(conn, identity.organization_id, source_type, source_id)
 
 
-# --- 更新系 API（成功時 201 Created）---------------------------------------
+@app.get("/api/audit-logs")
+def api_audit_logs(identity: Identity = Depends(require_roles("admin"))) -> list[dict[str, Any]]:
+    # 監査ログの閲覧は admin のみ（「見せる機能」）。
+    with get_conn() as conn:
+        return list_audit_logs(conn, identity.organization_id)
+
+
+# --- 更新系 API（成功時 201 Created・viewer は 403）-------------------------
 @app.post("/api/products", status_code=201)
-def api_create_product(data: dict[str, Any] = Depends(parse_json_body)) -> dict[str, Any]:
+def api_create_product(data: dict[str, Any] = Depends(parse_json_body), identity: Identity = WRITER) -> dict[str, Any]:
     with get_conn() as conn:
-        return create_product(conn, data)
+        result = create_product(conn, identity.organization_id, data)
+        record_audit(conn, identity.organization_id, identity.user_id, "product.create", "product", data.get("sku", ""))
+        return result
 
 
 @app.post("/api/purchases", status_code=201)
-def api_create_purchase(data: dict[str, Any] = Depends(parse_json_body)) -> dict[str, Any]:
+def api_create_purchase(data: dict[str, Any] = Depends(parse_json_body), identity: Identity = WRITER) -> dict[str, Any]:
     with get_conn() as conn:
-        return create_purchase(conn, data)
+        result = create_purchase(conn, identity.organization_id, data)
+        record_audit(conn, identity.organization_id, identity.user_id, "purchase.create", "purchase", result.get("purchase_id"), {"invoice_no": data.get("invoice_no")})
+        return result
 
 
 @app.post("/api/sales", status_code=201)
-def api_create_sale(data: dict[str, Any] = Depends(parse_json_body)) -> dict[str, Any]:
+def api_create_sale(data: dict[str, Any] = Depends(parse_json_body), identity: Identity = WRITER) -> dict[str, Any]:
     with get_conn() as conn:
-        return create_sale(conn, data)
+        result = create_sale(conn, identity.organization_id, data)
+        record_audit(conn, identity.organization_id, identity.user_id, "sale.create", "sale", result.get("sale_id"), {"invoice_no": data.get("invoice_no")})
+        return result
 
 
 @app.post("/api/business-partners", status_code=201)
-def api_create_business_partner(data: dict[str, Any] = Depends(parse_json_body)) -> dict[str, Any]:
+def api_create_business_partner(data: dict[str, Any] = Depends(parse_json_body), identity: Identity = WRITER) -> dict[str, Any]:
     with get_conn() as conn:
-        return create_business_partner(conn, data)
+        result = create_business_partner(conn, identity.organization_id, data)
+        record_audit(conn, identity.organization_id, identity.user_id, "business_partner.create", "business_partner", data.get("partner_name", ""))
+        return result
 
 
 @app.post("/api/freee-sync-queue/send", status_code=201)
-def api_send_queue(data: dict[str, Any] = Depends(parse_json_body)) -> dict[str, Any]:
+def api_send_queue(data: dict[str, Any] = Depends(parse_json_body), identity: Identity = WRITER) -> dict[str, Any]:
     with get_conn() as conn:
-        return send_queue_to_pseudo_freee(conn, data)
+        result = send_queue_to_pseudo_freee(conn, identity.organization_id, data)
+        record_audit(conn, identity.organization_id, identity.user_id, "freee_queue.send", "freee_sync_queue", data.get("id"), {"external_accounting_id": result.get("external_accounting_id")})
+        return result
 
 
 @app.post("/api/freee-sync-queue/status", status_code=201)
-def api_mark_queue_status(data: dict[str, Any] = Depends(parse_json_body)) -> dict[str, Any]:
+def api_mark_queue_status(data: dict[str, Any] = Depends(parse_json_body), identity: Identity = WRITER) -> dict[str, Any]:
     with get_conn() as conn:
-        return mark_queue_status(conn, data)
+        result = mark_queue_status(conn, identity.organization_id, data)
+        record_audit(conn, identity.organization_id, identity.user_id, "freee_queue.status", "freee_sync_queue", data.get("id"), {"status": data.get("status")})
+        return result
 
 
 @app.post("/api/inventory-movements/cancel", status_code=201)
-def api_cancel_movement(data: dict[str, Any] = Depends(parse_json_body)) -> dict[str, Any]:
+def api_cancel_movement(data: dict[str, Any] = Depends(parse_json_body), identity: Identity = WRITER) -> dict[str, Any]:
     with get_conn() as conn:
-        return cancel_inventory_movement(conn, data)
+        result = cancel_inventory_movement(conn, identity.organization_id, data)
+        record_audit(conn, identity.organization_id, identity.user_id, "inventory_movement.cancel", "inventory_movement", data.get("movement_id"), {"reason": data.get("reason")})
+        return result
 
 
 # ---------------------------------------------------------------------------
