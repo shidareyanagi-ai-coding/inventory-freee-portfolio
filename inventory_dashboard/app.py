@@ -18,6 +18,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 import auth
 import db
+from forecasting import synthetic
 from index_html import render_index
 
 
@@ -297,6 +298,13 @@ def ensure_sample_transactions(conn: db.Connection, organization_id: int) -> Non
 
 
 def ensure_demo_history(conn: db.Connection, organization_id: int) -> None:
+    """需要予測レベル2(A-4)向けに「2年・日次」のデモ履歴を投入する（冪等）。
+
+    旧実装は月次2点の粗いデータだった。ここでは forecasting.synthetic で
+    トレンド＋週次/月次季節＋補助金/キャンペーンのスパイク＋ノイズを持つ日次需要を作り、
+    (s,S) 補充で在庫を正に保ちながら 売上・仕入・在庫移動・external_factors を投入する。
+    Neon でも速いよう executemany ＋ INSERT...SELECT でバッチ化し、行単位 RETURNING を避ける。
+    """
     exists = conn.execute(
         "SELECT id FROM sales WHERE organization_id = ? AND invoice_no LIKE 'DEMO-HIST-S-%' LIMIT 1",
         (organization_id,),
@@ -310,31 +318,166 @@ def ensure_demo_history(conn: db.Connection, organization_id: int) -> None:
             "SELECT * FROM products WHERE organization_id = ?", (organization_id,)
         ).fetchall()
     }
-    today = date.today()
-    first_month = add_months(today.replace(day=1), -DEMO_HISTORY_MONTHS)
+    # 1日あたりの base に作り直した日次パターン（月次版の base/12 相当）。
     patterns = {
-        "SKU-USB-C-001": {"base": 36, "partner": "青山ECストア", "season": 1.2},
-        "SKU-MOUSE-001": {"base": 18, "partner": "新宿デザイン事務所", "season": 1.1},
-        "SKU-MONITOR-024": {"base": 5, "partner": "日本橋システムズ", "season": 1.35},
+        "SKU-USB-C-001": {"base": 9.0, "partner": "青山ECストア", "season": 1.25},
+        "SKU-MOUSE-001": {"base": 5.0, "partner": "新宿デザイン事務所", "season": 1.15},
+        "SKU-MONITOR-024": {"base": 1.6, "partner": "日本橋システムズ", "season": 1.4},
     }
 
-    for month_index in range(DEMO_HISTORY_MONTHS):
-        month_date = add_months(first_month, month_index)
-        if month_date.year == today.year and month_date.month == today.month:
-            continue
-        for sku, pattern in patterns.items():
-            product = products[sku]
-            quantity = demo_monthly_sales_quantity(pattern["base"], pattern["season"], month_date, month_index)
-            purchase_date = safe_date(month_date.year, month_date.month, 3)
-            sale_date_a = safe_date(month_date.year, month_date.month, 12)
-            sale_date_b = safe_date(month_date.year, month_date.month, 24)
-            first_sale_quantity = max(quantity // 2, 1)
-            second_sale_quantity = quantity - first_sale_quantity
+    today = date.today()
+    # 初期在庫日の翌日〜「昨日」を日次で埋める（初期在庫がデモ最古日より必ず前になる）。
+    start = date.fromisoformat(initial_stock_date()) + timedelta(days=1)
+    end = today - timedelta(days=1)
+    if end < start:
+        return
 
-            insert_demo_purchase(conn, organization_id, product, purchase_date, quantity)
-            insert_demo_sale(conn, organization_id, product, pattern["partner"], sale_date_a, first_sale_quantity, "A")
-            if second_sale_quantity > 0:
-                insert_demo_sale(conn, organization_id, product, pattern["partner"], sale_date_b, second_sale_quantity, "B")
+    # 組織横断イベント（補助金/キャンペーン）。需要スパイクの種＋LightGBM の特徴量源。
+    events = synthetic.generate_events(start, end)
+    factor_rows = [
+        (organization_id, factor_date, factor_type, None, 1.0, f"デモ{factor_type}")
+        for factor_date, factor_type in sorted(events.items())
+    ]
+    if factor_rows:
+        conn.executemany(
+            """
+            INSERT INTO external_factors
+                (organization_id, factor_date, factor_type, product_id, value, note)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            factor_rows,
+        )
+
+    # 初期在庫（seed_products が入れた initial_stock 移動）を起点に在庫を追跡する。
+    initial_stock = {
+        row["product_id"]: int(row["stock"])
+        for row in conn.execute(
+            """
+            SELECT product_id, COALESCE(SUM(quantity_delta), 0) AS stock
+            FROM inventory_movements
+            WHERE organization_id = ? AND movement_type = 'initial_stock'
+            GROUP BY product_id
+            """,
+            (organization_id,),
+        ).fetchall()
+    }
+
+    sales_rows: list[tuple[Any, ...]] = []
+    purchase_rows: list[tuple[Any, ...]] = []
+    cover_days = 30
+
+    for sku, pattern in patterns.items():
+        product = products[sku]
+        demand = synthetic.daily_demand_series(
+            pattern["base"], pattern["season"], start, end, events, seed=synthetic.seed_for_sku(sku)
+        )
+        stock = initial_stock.get(product["id"], 0)
+        reorder_level = int(product["reorder_point"]) + int(product["safety_stock"])
+        order_quantity = max(int(product["min_order_quantity"]), int(math.ceil(cover_days * pattern["base"])))
+
+        for movement_date, quantity in demand:
+            date_iso = movement_date.isoformat()
+            due_date = safe_date(movement_date.year, movement_date.month, 28).isoformat()
+            # (s,S) 補充: 必要水準以下なら cover_days 分まとめて仕入れる（在庫を正に保つ）。
+            if stock <= reorder_level:
+                purchase_rows.append(
+                    (
+                        organization_id,
+                        product["id"],
+                        product["supplier_name"],
+                        f"DEMO-HIST-P-{sku}-{movement_date:%Y%m%d}",
+                        date_iso,
+                        date_iso,
+                        order_quantity,
+                        product["purchase_unit_price"],
+                        product["tax_rate"],
+                        "課税仕入 10%",
+                        due_date,
+                        "demo",
+                        date_iso,
+                    )
+                )
+                stock += order_quantity
+            sell = min(quantity, stock)
+            if sell > 0:
+                sales_rows.append(
+                    (
+                        organization_id,
+                        product["id"],
+                        pattern["partner"],
+                        f"DEMO-HIST-S-{sku}-{movement_date:%Y%m%d}",
+                        date_iso,
+                        sell,
+                        product["sales_unit_price"],
+                        product["tax_rate"],
+                        "課税売上 10%",
+                        due_date,
+                        "demo",
+                        date_iso,
+                    )
+                )
+                stock -= sell
+
+    if purchase_rows:
+        conn.executemany(
+            """
+            INSERT INTO purchases (
+                organization_id, product_id, partner_name, invoice_no, transaction_date, received_date,
+                quantity, unit_price, tax_rate, tax_category, due_date,
+                external_accounting_status, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            purchase_rows,
+        )
+    if sales_rows:
+        conn.executemany(
+            """
+            INSERT INTO sales (
+                organization_id, product_id, partner_name, invoice_no, transaction_date,
+                quantity, unit_price, tax_rate, tax_category, due_date,
+                external_accounting_status, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            sales_rows,
+        )
+
+    # 在庫移動は INSERT...SELECT で一括生成（採番済み id を参照。'||' 連結は両方言可）。
+    conn.execute(
+        """
+        INSERT INTO inventory_movements (
+            organization_id, product_id, movement_type, source_type, source_id,
+            movement_date, quantity_delta, unit_price, note, created_at
+        )
+        SELECT organization_id, product_id, 'purchase_receipt', 'purchase', id,
+               received_date, quantity, unit_price, 'デモ仕入 ' || invoice_no, created_at
+        FROM purchases
+        WHERE organization_id = ? AND invoice_no LIKE 'DEMO-HIST-P-%'
+          AND NOT EXISTS (
+              SELECT 1 FROM inventory_movements im
+              WHERE im.source_type = 'purchase' AND im.source_id = purchases.id
+          )
+        """,
+        (organization_id,),
+    )
+    conn.execute(
+        """
+        INSERT INTO inventory_movements (
+            organization_id, product_id, movement_type, source_type, source_id,
+            movement_date, quantity_delta, unit_price, note, created_at
+        )
+        SELECT organization_id, product_id, 'sale_shipment', 'sale', id,
+               transaction_date, -quantity, unit_price, 'デモ売上 ' || invoice_no, created_at
+        FROM sales
+        WHERE organization_id = ? AND invoice_no LIKE 'DEMO-HIST-S-%'
+          AND NOT EXISTS (
+              SELECT 1 FROM inventory_movements im
+              WHERE im.source_type = 'sale' AND im.source_id = sales.id
+          )
+        """,
+        (organization_id,),
+    )
 
 
 def add_months(value: date, months: int) -> date:
@@ -347,101 +490,6 @@ def add_months(value: date, months: int) -> date:
 
 def safe_date(year: int, month: int, day: int) -> date:
     return date(year, month, min(day, monthrange(year, month)[1]))
-
-
-def demo_monthly_sales_quantity(base: int, season_strength: float, month_date: date, month_index: int) -> int:
-    seasonal_months = {3, 6, 11, 12}
-    season = season_strength if month_date.month in seasonal_months else 1.0
-    trend = 1 + (month_index / max(DEMO_HISTORY_MONTHS - 1, 1)) * 0.12
-    wave = 1 + (((month_index % 5) - 2) * 0.04)
-    return max(int(round(base * season * trend * wave)), 1)
-
-
-def insert_demo_purchase(conn: db.Connection, organization_id: int, product: dict[str, Any], purchase_date: date, quantity: int) -> None:
-    invoice_no = f"DEMO-HIST-P-{product['sku']}-{purchase_date:%Y%m}"
-    created_at = purchase_date.isoformat()
-    purchase_id = db.insert_returning_id(
-        conn,
-        """
-        INSERT INTO purchases (
-            organization_id, product_id, partner_name, invoice_no, transaction_date, received_date,
-            quantity, unit_price, tax_rate, tax_category, due_date,
-            external_accounting_status, created_at
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'demo', ?)
-        """,
-        (
-            organization_id,
-            product["id"],
-            product["supplier_name"],
-            invoice_no,
-            created_at,
-            created_at,
-            quantity,
-            product["purchase_unit_price"],
-            product["tax_rate"],
-            "課税仕入 10%",
-            safe_date(purchase_date.year, purchase_date.month, 28).isoformat(),
-            created_at,
-        ),
-    )
-    conn.execute(
-        """
-        INSERT INTO inventory_movements (
-            organization_id, product_id, movement_type, source_type, source_id, movement_date,
-            quantity_delta, unit_price, note, created_at
-        )
-        VALUES (?, ?, 'purchase_receipt', 'purchase', ?, ?, ?, ?, ?, ?)
-        """,
-        (organization_id, product["id"], purchase_id, created_at, quantity, product["purchase_unit_price"], f"デモ仕入 {invoice_no}", created_at),
-    )
-
-
-def insert_demo_sale(
-    conn: db.Connection,
-    organization_id: int,
-    product: dict[str, Any],
-    partner_name: str,
-    sale_date: date,
-    quantity: int,
-    suffix: str,
-) -> None:
-    invoice_no = f"DEMO-HIST-S-{product['sku']}-{sale_date:%Y%m}-{suffix}"
-    created_at = sale_date.isoformat()
-    sale_id = db.insert_returning_id(
-        conn,
-        """
-        INSERT INTO sales (
-            organization_id, product_id, partner_name, invoice_no, transaction_date,
-            quantity, unit_price, tax_rate, tax_category, due_date,
-            external_accounting_status, created_at
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'demo', ?)
-        """,
-        (
-            organization_id,
-            product["id"],
-            partner_name,
-            invoice_no,
-            created_at,
-            quantity,
-            product["sales_unit_price"],
-            product["tax_rate"],
-            "課税売上 10%",
-            safe_date(sale_date.year, sale_date.month, 28).isoformat(),
-            created_at,
-        ),
-    )
-    conn.execute(
-        """
-        INSERT INTO inventory_movements (
-            organization_id, product_id, movement_type, source_type, source_id, movement_date,
-            quantity_delta, unit_price, note, created_at
-        )
-        VALUES (?, ?, 'sale_shipment', 'sale', ?, ?, ?, ?, ?, ?)
-        """,
-        (organization_id, product["id"], sale_id, created_at, -quantity, product["sales_unit_price"], f"デモ売上 {invoice_no}", created_at),
-    )
 
 
 def stock_by_product(conn: db.Connection, organization_id: int) -> dict[int, int]:
@@ -1023,6 +1071,100 @@ def product_ledger(conn: db.Connection, organization_id: int, product_id: int) -
     return {"product": product, "ledger": rows, "count": len(rows)}
 
 
+# ---------------------------------------------------------------------------
+# 需要予測レベル2（A-4）の読み取り。書き込み（バッチ）は forecasting.service に委譲。
+# ---------------------------------------------------------------------------
+ACTUAL_CHART_DAYS = 180  # チャートに出す実績の日数（直近のみ＝見やすさ優先）。
+
+
+def _actual_daily_series(conn: db.Connection, organization_id: int, product_id: int) -> list[dict[str, Any]]:
+    """商品の日次実績需要（取消除外）。forecasting.data と同じ条件の読み取り。"""
+    rows = conn.execute(
+        """
+        SELECT s.transaction_date AS date, COALESCE(SUM(s.quantity), 0) AS qty
+        FROM sales s
+        JOIN inventory_movements im ON im.source_type = 'sale' AND im.source_id = s.id
+        LEFT JOIN inventory_corrections c ON c.original_movement_id = im.id
+        WHERE s.organization_id = ?
+          AND s.product_id = ?
+          AND c.id IS NULL
+        GROUP BY s.transaction_date
+        ORDER BY s.transaction_date
+        """,
+        (organization_id, product_id),
+    ).fetchall()
+    for row in rows:
+        row["qty"] = int(row["qty"] or 0)
+    return rows
+
+
+def forecast_series(conn: db.Connection, organization_id: int, product_id: int, model_name: str = "") -> dict[str, Any]:
+    """実績線＋予測線（predicted/lower/upper）を返す。別テナントの product_id は 404。"""
+    product = get_product(conn, organization_id, product_id)  # IDOR: 他テナントは NotFoundError→404
+
+    present = [
+        row["model_name"]
+        for row in conn.execute(
+            "SELECT DISTINCT model_name FROM forecasts WHERE organization_id = ? AND product_id = ?",
+            (organization_id, product_id),
+        ).fetchall()
+    ]
+    if not model_name:
+        for preferred in ("lightgbm", "sarima", "baseline"):
+            if preferred in present:
+                model_name = preferred
+                break
+        if not model_name and present:
+            model_name = present[0]
+
+    forecast_rows = conn.execute(
+        """
+        SELECT target_date AS date, predicted_quantity AS predicted, lower, upper
+        FROM forecasts
+        WHERE organization_id = ? AND product_id = ? AND model_name = ?
+        ORDER BY target_date
+        """,
+        (organization_id, product_id, model_name),
+    ).fetchall()
+
+    actual = _actual_daily_series(conn, organization_id, product_id)
+    return {
+        "product": {"id": product["id"], "sku": product["sku"], "product_name": product["product_name"]},
+        "model_name": model_name,
+        "available_models": present,
+        "actual": actual[-ACTUAL_CHART_DAYS:],
+        "forecast": forecast_rows,
+    }
+
+
+def list_model_evaluations(conn: db.Connection, organization_id: int) -> list[dict[str, Any]]:
+    """モデル比較表（MAE/MAPE）。バックテスト結果。"""
+    return conn.execute(
+        """
+        SELECT model_name, period, mae, mape, created_at
+        FROM model_evaluations
+        WHERE organization_id = ?
+        ORDER BY mae ASC
+        """,
+        (organization_id,),
+    ).fetchall()
+
+
+def list_order_candidates(conn: db.Connection, organization_id: int) -> list[dict[str, Any]]:
+    """発注候補（予測で在庫が必要水準を割る商品）。商品名を添えて返す。"""
+    return conn.execute(
+        """
+        SELECT oc.id, oc.product_id, p.sku, p.product_name,
+               oc.suggested_date, oc.recommended_quantity, oc.basis, oc.status
+        FROM order_candidates oc
+        JOIN products p ON p.id = oc.product_id
+        WHERE oc.organization_id = ?
+        ORDER BY oc.suggested_date ASC
+        """,
+        (organization_id,),
+    ).fetchall()
+
+
 def cancel_inventory_movement(conn: db.Connection, organization_id: int, data: dict[str, Any]) -> dict[str, Any]:
     movement_id = to_int(data.get("movement_id"))
     reason = required_text(data.get("reason") or "入力ミスのため取消", "reason")
@@ -1381,6 +1523,40 @@ def api_forecast_simulation(horizon_days: int = 30, identity: Identity = Depends
         return forecast_simulation(conn, identity.organization_id, horizon_days)
 
 
+# --- 需要予測レベル2（A-4）------------------------------------------------
+@app.get("/api/forecast/models")
+def api_forecast_models(identity: Identity = Depends(current_identity)) -> dict[str, Any]:
+    # この環境で利用可能なモデル（依存が無いものは自動的に外れる）。
+    from forecasting import models as forecast_models
+
+    return {
+        "models": [
+            {"name": model.name, "label": model.label}
+            for model in forecast_models.available_models()
+        ]
+    }
+
+
+@app.get("/api/forecast/series")
+def api_forecast_series(
+    product_id: int, model_name: str = "", identity: Identity = Depends(current_identity)
+) -> dict[str, Any]:
+    with get_conn() as conn:
+        return forecast_series(conn, identity.organization_id, product_id, model_name)
+
+
+@app.get("/api/forecast/evaluations")
+def api_forecast_evaluations(identity: Identity = Depends(current_identity)) -> list[dict[str, Any]]:
+    with get_conn() as conn:
+        return list_model_evaluations(conn, identity.organization_id)
+
+
+@app.get("/api/forecast/order-candidates")
+def api_forecast_order_candidates(identity: Identity = Depends(current_identity)) -> list[dict[str, Any]]:
+    with get_conn() as conn:
+        return list_order_candidates(conn, identity.organization_id)
+
+
 @app.get("/api/products/{product_id}/ledger")
 def api_product_ledger(product_id: int, identity: Identity = Depends(current_identity)) -> dict[str, Any]:
     with get_conn() as conn:
@@ -1407,6 +1583,17 @@ def api_audit_logs(identity: Identity = Depends(require_roles("admin"))) -> list
 
 
 # --- 更新系 API（成功時 201 Created・viewer は 403）-------------------------
+@app.post("/api/forecast/run")
+def api_forecast_run(horizon_days: int = 30, identity: Identity = WRITER) -> dict[str, Any]:
+    # 予測バッチの実行は admin/staff のみ（重い処理＋データ更新のため）。
+    from forecasting import service as forecast_service
+
+    with get_conn() as conn:
+        return forecast_service.run_forecast(
+            conn, identity.organization_id, horizon_days=horizon_days, actor_user_id=identity.user_id
+        )
+
+
 @app.post("/api/products", status_code=201)
 def api_create_product(data: dict[str, Any] = Depends(parse_json_body), identity: Identity = WRITER) -> dict[str, Any]:
     with get_conn() as conn:

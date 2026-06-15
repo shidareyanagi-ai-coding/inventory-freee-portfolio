@@ -177,6 +177,29 @@ class PostgresSmokeTest(unittest.TestCase):
         self.assertEqual(len(result["rows"]), 3)
         self.assertIn("required_inventory", result["rows"][0])
 
+    def test_forecast_tables_exist_on_postgres(self):
+        # A-4: 予測系4テーブルが Postgres 方言 DDL で作成されている。
+        with app.get_conn() as conn:
+            for table in ("forecasts", "external_factors", "order_candidates", "model_evaluations"):
+                self.assertTrue(db.table_exists(conn, table))
+
+    def test_run_forecast_writes_on_postgres(self):
+        # A-4: 予測バッチが Postgres 上でも forecasts/model_evaluations を書ける
+        # （日次 seed のバッチ投入 INSERT...SELECT / executemany が PG 方言で通ること）。
+        from forecasting import service
+
+        with app.get_conn() as conn:
+            summary = service.run_forecast(conn, self.org_id, horizon_days=14, test_days=14)
+            forecasts = conn.execute(
+                "SELECT COUNT(*) AS c FROM forecasts WHERE organization_id = ?", (self.org_id,)
+            ).fetchone()["c"]
+            evaluations = conn.execute(
+                "SELECT COUNT(*) AS c FROM model_evaluations WHERE organization_id = ?", (self.org_id,)
+            ).fetchone()["c"]
+        self.assertGreater(forecasts, 0)
+        self.assertGreater(evaluations, 0)
+        self.assertIn("baseline", summary["models"])
+
     def test_product_ledger_newest_first(self):
         with app.get_conn() as conn:
             product = self._first_product(conn)

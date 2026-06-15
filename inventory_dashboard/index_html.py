@@ -93,13 +93,19 @@ _INDEX_TEMPLATE = r"""
     .inline-control select { width: auto; min-width: 110px; padding: 7px 9px; }
     pre { white-space: pre-wrap; word-break: break-word; background: #1f2933; color: #f7fafc; padding: 12px; border-radius: 8px; max-height: 360px; overflow: auto; }
     .message { min-height: 24px; color: var(--accent-2); font-weight: 700; }
+    .forecast-controls { display: flex; gap: 16px; flex-wrap: wrap; margin: 4px 0 10px; }
+    .chart-wrap { position: relative; height: 320px; margin: 6px 0 14px; }
+    .forecast-grid { display: grid; grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr); gap: 16px; align-items: start; }
+    .forecast-grid h3.sub { margin: 0 0 8px; font-size: 14px; color: var(--muted); }
     @media (max-width: 900px) {
-      .metrics, .top-grid, .ledger-entry-grid, .bottom-grid { grid-template-columns: 1fr; }
+      .metrics, .top-grid, .ledger-entry-grid, .bottom-grid, .forecast-grid { grid-template-columns: 1fr; }
       .entry-panel { position: static; }
       main { padding: 12px; }
       table { display: block; overflow-x: auto; }
     }
   </style>
+  <!-- A-4: 実績線＋予測線＋信頼区間の描画に Chart.js を CDN から読み込む（公開用デモ）。 -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
   <script>
     // サーバが埋め込む認証設定（公開キーは出して良い／秘密キーは出さない）。
     window.__APP_CONFIG__ = __APP_CONFIG_JSON__;
@@ -207,6 +213,32 @@ _INDEX_TEMPLATE = r"""
       <p class="note" id="forecastNote">過去売上から月末販売数、リードタイム需要、必要在庫、推奨発注量を計算します。</p>
       <div id="forecastSimulation"></div>
     </section>
+    <section class="panel" id="forecastMlSection">
+      <div class="section-head">
+        <h2>需要予測レベル2（実績×予測）</h2>
+        <button type="button" id="runForecastBtn" onclick="runForecastBatch()">予測バッチを実行</button>
+      </div>
+      <p class="note" id="forecastMlNote">baseline / SARIMA / LightGBM をバックテスト(MAE/MAPE)で比較し、実績線＋予測線＋信頼区間(80%)を表示します。「予測バッチを実行」で再計算します。</p>
+      <div class="forecast-controls">
+        <label class="inline-control">商品
+          <select id="forecastProduct" onchange="loadForecastChart()"></select>
+        </label>
+        <label class="inline-control">モデル
+          <select id="forecastModel" onchange="loadForecastChart()"></select>
+        </label>
+      </div>
+      <div class="chart-wrap"><canvas id="forecastChart"></canvas></div>
+      <div class="forecast-grid">
+        <div>
+          <h3 class="sub">モデル精度（バックテスト・末尾28日／★=最良）</h3>
+          <div id="forecastEvaluations"></div>
+        </div>
+        <div>
+          <h3 class="sub">発注候補（予測で在庫が必要水準を割る商品）</h3>
+          <div id="forecastCandidates"></div>
+        </div>
+      </div>
+    </section>
     <section class="bottom-grid">
       <div class="summary-box">
         <h2>freee送信待ちキュー</h2>
@@ -259,6 +291,7 @@ _INDEX_TEMPLATE = r"""
       renderMonthlySummary("monthlySales", data.monthly_sales, data.monthly_sales_total, "今月売上 合計");
       await loadForecast();
       renderSelects(data.products);
+      await loadForecastML(data.products);
       await loadPartners();
       if (currentLedgerProductId) {
         await loadLedger(currentLedgerProductId);
@@ -332,6 +365,133 @@ _INDEX_TEMPLATE = r"""
     function forecastJudgement(text) {
       const cls = (text === "発注不要" || text === "月末OK") ? "ok" : (text === "データ不足" ? "warn" : "danger");
       return `<span class="status ${cls}">${text}</span>`;
+    }
+
+    // --- 需要予測レベル2（A-4: 実績線＋予測線＋信頼区間） ---------------------
+    let forecastChartInstance = null;
+    const MODEL_LABELS = { baseline: "ベースライン", sarima: "SARIMA", lightgbm: "LightGBM" };
+    function modelLabel(name) { return MODEL_LABELS[name] || name || "—"; }
+
+    async function loadForecastML(products) {
+      const select = document.getElementById("forecastProduct");
+      const previous = select.value;
+      select.innerHTML = products.map(p => `<option value="${p.id}">${p.sku} ${p.product_name}</option>`).join("");
+      if (previous && [...select.options].some(o => o.value === previous)) select.value = previous;
+      await refreshForecastModelOptions();
+      await Promise.all([loadForecastChart(), loadForecastEvaluations(), loadForecastCandidates()]);
+    }
+
+    async function refreshForecastModelOptions() {
+      try {
+        const data = await api("/api/forecast/models");
+        const select = document.getElementById("forecastModel");
+        const previous = select.value;
+        select.innerHTML = '<option value="">自動(最良)</option>'
+          + data.models.map(m => `<option value="${m.name}">${m.label}</option>`).join("");
+        if (previous && [...select.options].some(o => o.value === previous)) select.value = previous;
+      } catch (e) { /* モデル一覧の取得失敗は致命でない */ }
+    }
+
+    async function loadForecastChart() {
+      const productId = document.getElementById("forecastProduct").value;
+      if (!productId) return;
+      const model = document.getElementById("forecastModel").value;
+      const query = `/api/forecast/series?product_id=${productId}` + (model ? `&model_name=${encodeURIComponent(model)}` : "");
+      const data = await api(query);
+      renderForecastChart(data);
+    }
+
+    function renderForecastChart(data) {
+      const actual = data.actual || [];
+      const forecast = data.forecast || [];
+      const note = document.getElementById("forecastMlNote");
+      if (typeof Chart === "undefined") {
+        note.textContent = "グラフ描画ライブラリ(Chart.js)を読み込めませんでした（ネットワークをご確認ください）。";
+        return;
+      }
+      if (!forecast.length) {
+        note.textContent = "この商品の予測はまだありません。「予測バッチを実行」を押してください。";
+      }
+      const dates = Array.from(new Set([...actual.map(a => a.date), ...forecast.map(f => f.date)])).sort();
+      const actualMap = Object.fromEntries(actual.map(a => [a.date, a.qty]));
+      const predMap = Object.fromEntries(forecast.map(f => [f.date, f.predicted]));
+      const lowerMap = Object.fromEntries(forecast.map(f => [f.date, f.lower]));
+      const upperMap = Object.fromEntries(forecast.map(f => [f.date, f.upper]));
+      // 実績の最終日に予測値も置いて、実績線と予測線をつなげる。
+      if (actual.length && forecast.length) {
+        const lastActual = actual[actual.length - 1].date;
+        if (!(lastActual in predMap)) predMap[lastActual] = actualMap[lastActual];
+      }
+      const pick = (map) => dates.map(d => (d in map ? map[d] : null));
+      const band = "rgba(182, 75, 53, 0.12)";
+      const datasets = [
+        { label: "実績", data: pick(actualMap), borderColor: "#256c64", backgroundColor: "#256c64", borderWidth: 2, pointRadius: 0, tension: 0.2 },
+        { label: "予測", data: pick(predMap), borderColor: "#b64b35", borderDash: [6, 4], borderWidth: 2, pointRadius: 0, tension: 0.2, spanGaps: true },
+        { label: "信頼区間(80%)", data: pick(upperMap), borderColor: "transparent", backgroundColor: band, pointRadius: 0, fill: "+1", spanGaps: true },
+        { label: "下限", data: pick(lowerMap), borderColor: "transparent", backgroundColor: band, pointRadius: 0, fill: false, spanGaps: true },
+      ];
+      if (forecastChartInstance) forecastChartInstance.destroy();
+      forecastChartInstance = new Chart(document.getElementById("forecastChart"), {
+        type: "line",
+        data: { labels: dates, datasets },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          interaction: { mode: "index", intersect: false },
+          plugins: { legend: { labels: { filter: (item) => item.text !== "下限" } } },
+          scales: {
+            x: { ticks: { maxTicksLimit: 10, autoSkip: true } },
+            y: { beginAtZero: true, title: { display: true, text: "販売数量 / 日" } },
+          },
+        },
+      });
+    }
+
+    async function loadForecastEvaluations() {
+      const rows = await api("/api/forecast/evaluations");
+      const target = document.getElementById("forecastEvaluations");
+      if (!rows.length) {
+        target.innerHTML = '<p class="note">まだバックテスト結果がありません。「予測バッチを実行」を押してください。</p>';
+        return;
+      }
+      const best = rows[0].model_name; // MAE 昇順で返るため先頭が最良。
+      target.innerHTML = table(["モデル", "期間", "MAE", "MAPE(%)"],
+        rows.map(r => [
+          modelLabel(r.model_name) + (r.model_name === best ? " ★" : ""),
+          r.period,
+          Number(r.mae).toFixed(2),
+          Number.isFinite(r.mape) && r.mape > 0 ? Number(r.mape).toFixed(1) : "—",
+        ]));
+    }
+
+    async function loadForecastCandidates() {
+      const rows = await api("/api/forecast/order-candidates");
+      const target = document.getElementById("forecastCandidates");
+      if (!rows.length) {
+        target.innerHTML = '<p class="note">発注候補はありません（予測上、在庫は当面足ります）。</p>';
+        return;
+      }
+      target.innerHTML = table(["商品", "必要水準を割る日", "推奨発注量", "根拠"],
+        rows.map(r => [`${r.sku} ${r.product_name}`, r.suggested_date, r.recommended_quantity, r.basis]));
+    }
+
+    async function runForecastBatch() {
+      const button = document.getElementById("runForecastBtn");
+      const original = button.textContent;
+      button.disabled = true;
+      button.textContent = "計算中…";
+      try {
+        const result = await api("/api/forecast/run", { method: "POST" });
+        document.getElementById("forecastMlNote").textContent =
+          `予測を更新しました（最良モデル: ${modelLabel(result.best_model)} ／ 対象 ${result.products_forecasted} 商品 ／ 発注候補 ${result.order_candidates} 件）。`;
+        await refreshForecastModelOptions();
+        await Promise.all([loadForecastChart(), loadForecastEvaluations(), loadForecastCandidates()]);
+      } catch (e) {
+        alert(e.message);
+      } finally {
+        button.disabled = false;
+        button.textContent = original;
+      }
     }
 
     function renderSelects(products) {
