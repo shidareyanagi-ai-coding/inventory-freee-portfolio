@@ -36,12 +36,25 @@ def app_env() -> str:
     return os.environ.get("APP_ENV", "development").strip().lower()
 
 
+def _env(name: str) -> str:
+    """環境変数を読む（前後空白を除去）。
+
+    防御: `.env` テンプレの「行末コメント」が値に混入した場合に備える。
+    python-dotenv は「空の値 + ` # コメント`」の行で `#` 以降を値として読んでしまうため、
+    '#' で始まる値（CLERK_* 等に正規の値が '#' で始まることはない）は未設定とみなす。
+    """
+    value = os.environ.get(name, "").strip()
+    if value.startswith("#"):
+        return ""
+    return value
+
+
 def clerk_issuer() -> str:
-    return os.environ.get("CLERK_ISSUER", "").strip().rstrip("/")
+    return _env("CLERK_ISSUER").rstrip("/")
 
 
 def clerk_jwks_url() -> str:
-    url = os.environ.get("CLERK_JWKS_URL", "").strip()
+    url = _env("CLERK_JWKS_URL")
     if url:
         return url
     issuer = clerk_issuer()
@@ -52,7 +65,7 @@ def clerk_jwks_url() -> str:
 
 def clerk_publishable_key() -> str:
     """フロントに渡してよい公開キー（ブラウザに出して問題ないもの）。"""
-    return os.environ.get("CLERK_PUBLISHABLE_KEY", "").strip()
+    return _env("CLERK_PUBLISHABLE_KEY")
 
 
 def clerk_configured() -> bool:
