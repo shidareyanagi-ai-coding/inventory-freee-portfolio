@@ -97,8 +97,19 @@ _INDEX_TEMPLATE = r"""
     .chart-wrap { position: relative; height: 320px; margin: 6px 0 14px; }
     .forecast-grid { display: grid; grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr); gap: 16px; align-items: start; }
     .forecast-grid h3.sub { margin: 0 0 8px; font-size: 14px; color: var(--muted); }
+    /* A-5: 経費キャプチャ（AI証憑入力） */
+    .expense-grid { display: grid; grid-template-columns: minmax(0, 360px) minmax(0, 1fr); gap: 16px; align-items: start; }
+    .expense-grid h3.sub { margin: 4px 0 8px; font-size: 14px; color: var(--muted); }
+    .ai-pill { display: inline-block; font-size: 11px; padding: 2px 8px; border-radius: 999px; background: #eef3f1; color: var(--accent); border: 1px solid #cfe0da; }
+    label.low-confidence { color: var(--warn); font-weight: 700; }
+    label.low-confidence::after { content: " ⚠ 要確認"; font-size: 11px; font-weight: 700; }
+    .field-low { border-color: var(--warn); background: #fff8ec; }
+    .voucher-thumb { max-width: 240px; max-height: 220px; border: 1px solid var(--line); border-radius: 6px; display: block; margin: 6px 0; }
+    .badge { display: inline-block; font-size: 11px; padding: 2px 7px; border-radius: 4px; }
+    .badge.registered { background: #e6f3ec; color: var(--ok); }
+    .badge.draft { background: #fdeee9; color: var(--accent-2); }
     @media (max-width: 900px) {
-      .metrics, .top-grid, .ledger-entry-grid, .bottom-grid, .forecast-grid { grid-template-columns: 1fr; }
+      .metrics, .top-grid, .ledger-entry-grid, .bottom-grid, .forecast-grid, .expense-grid { grid-template-columns: 1fr; }
       .entry-panel { position: static; }
       main { padding: 12px; }
       table { display: block; overflow-x: auto; }
@@ -239,6 +250,38 @@ _INDEX_TEMPLATE = r"""
         </div>
       </div>
     </section>
+    <section class="panel" id="expenseCaptureSection">
+      <div class="section-head">
+        <h2>経費キャプチャ（AI証憑入力）</h2>
+        <span class="ai-pill" id="captureSourcePill" hidden></span>
+      </div>
+      <p class="note">レシート・請求書の画像をアップロード（スマホはカメラ撮影）すると、AIが発生日・支払先・金額・税区分・勘定科目・摘要を推定して下書きに反映します。<strong>AIは下書きまで。「登録」はあなたが確認して押します（自動登録はしません）。</strong></p>
+      <div class="expense-grid">
+        <div>
+          <form id="expenseCaptureForm">
+            <label>証憑画像（レシート / 請求書）</label>
+            <input type="file" id="expenseImage" accept="image/*" capture="environment" required>
+            <button type="submit" id="captureBtn">AIで解析して下書きを作る</button>
+          </form>
+          <p class="note" id="expenseCaptureStatus"></p>
+          <form id="expenseDraftForm" hidden>
+            <h3 class="sub">下書き（確認・修正して登録）</h3>
+            <label data-field="issue_date">発生日</label><input type="date" name="issue_date">
+            <label data-field="partner_name">支払先</label><input name="partner_name" required>
+            <label data-field="amount">金額（税込）</label><input type="number" name="amount" min="1" required>
+            <label data-field="tax_category">税区分</label><select name="tax_category"></select>
+            <label data-field="account_item">勘定科目</label><select name="account_item"></select>
+            <label data-field="memo">摘要</label><input name="memo">
+            <button type="submit" id="registerVoucherBtn">この内容で登録</button>
+          </form>
+        </div>
+        <div>
+          <h3 class="sub">証憑一覧（元画像・AI抽出・人の修正後を後から確認）</h3>
+          <div id="voucherList"></div>
+          <div id="voucherDetail"></div>
+        </div>
+      </div>
+    </section>
     <section class="bottom-grid">
       <div class="summary-box">
         <h2>freee送信待ちキュー</h2>
@@ -259,6 +302,8 @@ _INDEX_TEMPLATE = r"""
     let currentPartners = { suppliers: [], customers: [] };
     let currentQueueRows = [];
     let currentPreviewKey = null;
+    let currentDraftVoucherId = null;
+    let voucherCandidates = { account_items: [], tax_categories: [] };
     const defaultPreviewText = "キューの「確認」を押すと、freee送信用の中間データを表示します。";
     for (const input of document.querySelectorAll('input[type="date"][required]')) input.value = today;
 
@@ -300,6 +345,7 @@ _INDEX_TEMPLATE = r"""
       }
       const queue = await api("/api/freee-sync-queue");
       renderQueue(queue);
+      await loadVouchers();
     }
 
     function renderMetrics(data) {
@@ -738,6 +784,140 @@ _INDEX_TEMPLATE = r"""
       event.preventDefault();
       try { await submitForm(event.target, "/api/sales"); } catch (error) { document.getElementById("message").textContent = error.message; }
     });
+
+    // --- A-5: 経費キャプチャ（AI証憑入力） ----------------------------------
+    // 認証付きで元画像を取得し、object URL を返す（<img src> では Bearer を付けられないため）。
+    async function voucherImageObjectUrl(id) {
+      const token = await getAuthToken();
+      const headers = {};
+      if (token) headers["Authorization"] = "Bearer " + token;
+      const res = await fetch(`/api/vouchers/${id}/image`, { headers });
+      if (!res.ok) throw new Error("画像の取得に失敗しました");
+      return URL.createObjectURL(await res.blob());
+    }
+
+    function fillSelect(select, options, value) {
+      select.innerHTML = options.map(o => `<option value="${o}">${o}</option>`).join("");
+      if (value && !options.includes(value)) select.insertAdjacentHTML("afterbegin", `<option value="${value}">${value}</option>`);
+      select.value = value || (options[0] || "");
+    }
+
+    function markLowConfidence(lowFields) {
+      const form = document.getElementById("expenseDraftForm");
+      for (const label of form.querySelectorAll("label[data-field]")) {
+        const field = label.dataset.field;
+        const low = lowFields.includes(field);
+        label.classList.toggle("low-confidence", low);
+        const input = form.querySelector(`[name="${field}"]`);
+        if (input) input.classList.toggle("field-low", low);
+      }
+    }
+
+    async function captureExpense(event) {
+      event.preventDefault();
+      const fileInput = document.getElementById("expenseImage");
+      const file = fileInput.files[0];
+      if (!file) return;
+      const status = document.getElementById("expenseCaptureStatus");
+      const btn = document.getElementById("captureBtn");
+      btn.disabled = true; status.textContent = "AIが画像を解析しています…";
+      try {
+        const body = new FormData();
+        body.append("file", file);
+        const result = await api("/api/expense-capture", { method: "POST", body });
+        voucherCandidates = { account_items: result.account_item_candidates, tax_categories: result.tax_category_candidates };
+        currentDraftVoucherId = result.voucher_id;
+        const draft = result.draft;
+        const form = document.getElementById("expenseDraftForm");
+        form.issue_date.value = draft.issue_date || today;
+        form.partner_name.value = draft.partner_name || "";
+        form.amount.value = draft.amount || "";
+        form.memo.value = draft.memo || "";
+        fillSelect(form.tax_category, voucherCandidates.tax_categories, draft.tax_category);
+        fillSelect(form.account_item, voucherCandidates.account_items, draft.account_item);
+        markLowConfidence(result.low_confidence_fields || []);
+        form.hidden = false;
+        const pill = document.getElementById("captureSourcePill");
+        pill.hidden = false;
+        pill.textContent = `${result.source === "anthropic" ? "Claude解析" : "デモ解析(スタブ)"} ・ 全体信頼度 ${Math.round(result.overall_confidence * 100)}%`;
+        const lows = (result.low_confidence_fields || []).length;
+        status.textContent = lows ? `下書きを作成しました。⚠ の${lows}項目は信頼度が低めです。確認して登録してください。` : "下書きを作成しました。確認して登録してください。";
+        await loadVouchers();
+      } catch (error) {
+        status.textContent = error.message;
+      } finally {
+        btn.disabled = false;
+      }
+    }
+
+    async function registerVoucher(event) {
+      event.preventDefault();
+      if (!currentDraftVoucherId) return;
+      const form = document.getElementById("expenseDraftForm");
+      const payload = Object.fromEntries(new FormData(form).entries());
+      const status = document.getElementById("expenseCaptureStatus");
+      try {
+        await api(`/api/vouchers/${currentDraftVoucherId}/register`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+        status.textContent = "登録しました（人が確認のうえ登録）。";
+        form.hidden = true;
+        document.getElementById("captureSourcePill").hidden = true;
+        document.getElementById("expenseCaptureForm").reset();
+        const registeredId = currentDraftVoucherId;
+        currentDraftVoucherId = null;
+        await loadVouchers();
+        await showVoucherDetail(registeredId);
+      } catch (error) {
+        status.textContent = error.message;
+      }
+    }
+
+    async function loadVouchers() {
+      const rows = await api("/api/vouchers");
+      const el = document.getElementById("voucherList");
+      if (!rows.length) { el.innerHTML = `<p class="note">まだ証憑はありません。上のフォームから画像を解析してください。</p>`; return; }
+      el.innerHTML = table(["証憑", "支払先(AI)", "金額(AI)", "信頼度", "状態", ""],
+        rows.map(v => {
+          const ai = (v.ai_extracted && v.ai_extracted.fields) || {};
+          const badge = v.registered ? `<span class="badge registered">登録済</span>` : `<span class="badge draft">下書き</span>`;
+          return [v.file_name, ai.partner_name || "-", ai.amount ? yen.format(ai.amount) : "-", `${Math.round((v.confidence || 0) * 100)}%`, badge, `<button class="link" onclick="showVoucherDetail(${v.id})">詳細</button>`];
+        }));
+    }
+
+    function draftFieldsTable(fields, confidence, lowFields) {
+      const labels = { issue_date: "発生日", partner_name: "支払先", amount: "金額", tax_category: "税区分", account_item: "勘定科目", memo: "摘要" };
+      return table(["項目", "AI推定値", "信頼度"],
+        Object.keys(labels).map(k => {
+          const conf = confidence && confidence[k] != null ? Math.round(confidence[k] * 100) + "%" : "-";
+          const low = (lowFields || []).includes(k);
+          const val = k === "amount" && fields[k] ? yen.format(fields[k]) : (fields[k] || "-");
+          return [labels[k], val, low ? `<span class="low-confidence">${conf}</span>` : conf];
+        }));
+    }
+
+    async function showVoucherDetail(id) {
+      const detail = document.getElementById("voucherDetail");
+      try {
+        const v = await api(`/api/vouchers/${id}`);
+        const ai = v.ai_extracted || {};
+        let html = `<h3 class="sub">証憑詳細 #${v.id}（${v.registered ? "登録済" : "下書き"}）</h3>`;
+        try { html += `<img class="voucher-thumb" src="${await voucherImageObjectUrl(id)}" alt="証憑画像">`; }
+        catch (e) { html += `<p class="note">画像を表示できませんでした。</p>`; }
+        html += `<p class="note">AI抽出（${ai.source === "anthropic" ? "Claude" : "デモ"}）：</p>`;
+        html += draftFieldsTable(ai.fields || {}, ai.confidence || {}, ai.low_confidence_fields || []);
+        if (v.user_corrected) {
+          html += `<p class="note">人の修正後（登録内容）：</p>`;
+          html += draftFieldsTable(v.user_corrected, null, []);
+        } else {
+          html += `<p class="note">まだ登録されていません（AIの下書きのみ）。</p>`;
+        }
+        detail.innerHTML = html;
+      } catch (error) {
+        detail.innerHTML = `<p class="note">${error.message}</p>`;
+      }
+    }
+
+    document.getElementById("expenseCaptureForm").addEventListener("submit", captureExpense);
+    document.getElementById("expenseDraftForm").addEventListener("submit", registerVoucher);
     // --- A-3: 認証ブートストラップ ------------------------------------------
     // Clerk 設定時はサインインを必須化し、未サインインならゲートを表示してアプリを止める。
     // dev モード（Clerk 未設定）のときはトークン無しでそのまま起動する。

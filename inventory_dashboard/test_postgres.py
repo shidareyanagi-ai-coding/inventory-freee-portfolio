@@ -23,7 +23,9 @@ DATABASE_URL が postgres を指すときだけ実行する（未設定ならス
 
 import json
 import os
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 import app
@@ -61,10 +63,18 @@ class PostgresSmokeTest(unittest.TestCase):
         with db.get_conn() as conn:
             db.reset_domain_tables(conn)
         app.init_db()
+        # A-5: 証憑画像の保存先を一時ディレクトリに逃がす（リポジトリにファイルを残さない）。
+        self._voucher_tmp = tempfile.TemporaryDirectory()
+        self._orig_voucher_dir = app.VOUCHER_DIR
+        app.VOUCHER_DIR = Path(self._voucher_tmp.name) / "voucher_store"
         # A-3: 業務ロジックは organization_id 必須。テスト用の組織を作り seed を入れる。
         with app.get_conn() as conn:
             self.org_id = app.create_organization(conn, "PGテスト組織")
             app.seed_organization(conn, self.org_id)
+
+    def tearDown(self):
+        app.VOUCHER_DIR = self._orig_voucher_dir
+        self._voucher_tmp.cleanup()
 
     def _first_product(self, conn):
         return conn.execute(
@@ -182,6 +192,26 @@ class PostgresSmokeTest(unittest.TestCase):
         with app.get_conn() as conn:
             for table in ("forecasts", "external_factors", "order_candidates", "model_evaluations"):
                 self.assertTrue(db.table_exists(conn, table))
+
+    def test_vouchers_table_exists_on_postgres(self):
+        # A-5: 証憑テーブルが Postgres 方言 DDL で作成されている。
+        with app.get_conn() as conn:
+            self.assertTrue(db.table_exists(conn, "vouchers"))
+
+    def test_voucher_capture_and_register_on_postgres(self):
+        # A-5: 証憑の保存(IDENTITY+RETURNING)と人による登録(UPDATE)が Postgres 上でも通る。
+        # ここはDB層の検証なのでAIは呼ばない（実鍵があっても安定するよう決定的スタブで下書きを作る）。
+        draft = app.ai_capture._stub_analyze(b"PG-RECEIPT-BYTES", "image/png")
+        with app.get_conn() as conn:
+            voucher_id = app.create_voucher(
+                conn, self.org_id, file_name="pg.png", mime_type="image/png",
+                image_bytes=b"PG-RECEIPT-BYTES", draft=draft,
+            )
+            self.assertIsInstance(voucher_id, int)
+            app.register_voucher(conn, self.org_id, voucher_id, {"partner_name": "PG支払先", "amount": 1200})
+            detail = app.voucher_detail(conn, self.org_id, voucher_id)
+        self.assertTrue(detail["registered"])
+        self.assertEqual(detail["user_corrected"]["partner_name"], "PG支払先")
 
     def test_run_forecast_writes_on_postgres(self):
         # A-4: 予測バッチが Postgres 上でも forecasts/model_evaluations を書ける

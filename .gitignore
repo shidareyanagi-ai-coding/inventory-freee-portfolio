@@ -10,6 +10,9 @@ venv/
 *.sqlite
 *.sqlite3
 
+# A-5: 証憑の元画像（サーバ側保存。DBにはパスのみ。リポジトリには入れない）
+voucher_store/
+
 # Environment variables
 .env
 .env.local
