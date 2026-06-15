@@ -149,7 +149,7 @@
 | **A-0. 環境整備** ✅ | プロジェクトを **OneDrive外・英数字パス**（例 `C:\Users\masah\dev\`）へ移設。`.venv`・依存定義・`.env.example` |
 | **A-1. FastAPI化** ✅ | `InventoryHandler`(stdlib) を撤去し FastAPI ルータへ。業務ロジック関数は**温存して再利用**。既存テスト移植 |
 | **A-2. Neon移行** ✅ | **完了（実Neon接続・検証済み）**。DBアクセス層を `db.py` に分離、`DATABASE_URL` で SQLite⇄Postgres 切替、SQLite→Postgres DDL、seed再現。ORMは不採用（薄い手書きアダプタ）。検証: 実Neon（PostgreSQL 16.14 / Singapore）へ接続→スキーマ作成＋seed投入→全テスト 41 passed（SQLite 28＋Neon上 Postgres 13 / `test_postgres.py`）→ダッシュボードが実Neonデータを正しく表示。`inventory_dashboard` が対象（`pseudo_freee` のPostgres化はA-3以降の検討事項） |
-| **A-3. 認証＋テナント＋RBAC** | Clerk導入・JWT検証、全テーブル `organization_id`、軽量RBAC、IDOR封鎖、監査ログ、初回 org seed。**前提作業: テスト用DBを本番Neonと分離する**（`test_postgres.py` はテーブルを DROP するため、`DATABASE_URL` を本番Neonに向けて `pytest` するとデータが消える。Neon の**テスト用ブランチ**〔無料プランで10ブランチ可〕か別テストDBの `DATABASE_URL` を用意し、テストはそちらに向ける） |
+| **A-3. 認証＋テナント＋RBAC** ✅ | **完了（実Clerk＋実Neon検証済み）**。Clerk JWT を JWKS(RS256) で検証（`auth.py`）、全ドメインテーブルに `organization_id`、新規 `organizations`/`memberships`/`audit_logs`、テナント内一意、軽量RBAC（admin/staff/viewer）、IDOR封鎖（別テナントの id は 404）、監査ログ、初回ログインで自組織サンドボックス seed。dev モード（`AUTH_DEV_MODE`）でClerk無しのローカル/テストも可。**前提作業（テスト用DBを本番Neonと分離）も実施**: Neon の**テスト用ブランチ**（`a3-test`）を作成し、`test_postgres.py` は `PYTEST_ALLOW_DB_RESET=1` の明示時のみ DROP 実行（本番誤爆防止）。検証: SQLite 45＋Neonテストブランチ上 Postgres 14 = **59 passed**、実 Clerk でサインイン→JWT検証→自組織サンドボックスにデモ seed→ダッシュボード表示まで確認。commit 48850f1・530595a（main）|
 | **A-4. 予測レベル2** | 合成データを“より現実的”に作り直す→baseline→Prophet→LightGBM(補助金/カレンダー特徴量)→任意DL、MAE/MAPE＋バックテスト、予測線表示 |
 | **A-5. 経費キャプチャ** | `POST /api/expense-capture`、画像アップ/カメラ→AI解析→**下書き反映（登録は人）**、`vouchers`表、低信頼度表示 |
 | **A-6. デプロイ** | Render/Railway へ、Neon接続、Clerk本番キー、README・スクショ更新 |
