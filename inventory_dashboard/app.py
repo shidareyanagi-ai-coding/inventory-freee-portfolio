@@ -1423,13 +1423,16 @@ def cancel_inventory_movement(conn: db.Connection, organization_id: int, data: d
         """,
         (organization_id, movement_id, correction_movement_id, reason),
     )
+    # 取消した仕訳は freee 送信待ちに残してはいけない。'cancelled' にして送信待ちから外す
+    # （'failed' だと「再送」対象として残ってしまうため）。送信済み(sent)は freee 側に
+    # 既に登録済みで取り消せないので触らない（取消は元帳の訂正行で記録される）。
     conn.execute(
         """
         UPDATE freee_sync_queue
-        SET status = 'failed',
+        SET status = 'cancelled',
             sync_error_message = ?,
             updated_at = CURRENT_TIMESTAMP
-        WHERE organization_id = ? AND source_type = ? AND source_id = ? AND status IN ('pending', 'retry')
+        WHERE organization_id = ? AND source_type = ? AND source_id = ? AND status != 'sent'
         """,
         (f"在庫元帳で取消済み: {reason}", organization_id, original["source_type"], original["source_id"]),
     )
@@ -1441,7 +1444,7 @@ def list_queue(conn: db.Connection, organization_id: int) -> list[dict[str, Any]
         """
         SELECT q.*
         FROM freee_sync_queue q
-        WHERE q.organization_id = ?
+        WHERE q.organization_id = ? AND q.status != 'cancelled'
         ORDER BY q.created_at DESC, q.id DESC
         """,
         (organization_id,),
@@ -1454,7 +1457,7 @@ def list_queue(conn: db.Connection, organization_id: int) -> list[dict[str, Any]
 def mark_queue_status(conn: db.Connection, organization_id: int, data: dict[str, Any]) -> dict[str, Any]:
     queue_id = to_int(data.get("id"))
     status = data.get("status", "")
-    if status not in {"pending", "sent", "failed", "retry"}:
+    if status not in {"pending", "sent", "failed", "retry", "cancelled"}:
         raise ValueError("invalid status")
     updated = conn.execute(
         """
@@ -1493,6 +1496,8 @@ def send_queue_to_pseudo_freee(conn: db.Connection, organization_id: int, data: 
         raise NotFoundError("queue not found")
     if queue["status"] == "sent":
         raise ValueError("送信済みキューは再送できません")
+    if queue["status"] == "cancelled":
+        raise ValueError("取消済みの仕訳は freee へ送信できません")
 
     payload = json.loads(queue["payload_json"])
     request_body = json.dumps(

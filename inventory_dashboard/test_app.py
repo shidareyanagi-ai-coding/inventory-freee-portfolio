@@ -254,8 +254,42 @@ class InventoryAppTest(unittest.TestCase):
             ).fetchone()
 
         self.assertEqual(after_cancel, before_cancel - 2)
-        self.assertEqual(queue["status"], "failed")
+        # 取消した仕訳は 'cancelled' になり、freee 送信待ちから外れて再送もできない。
+        self.assertEqual(queue["status"], "cancelled")
         self.assertIn("商品選択ミス", queue["sync_error_message"])
+
+    def test_cancelled_movement_leaves_freee_queue_and_cannot_be_sent(self):
+        with app.get_conn() as conn:
+            product = self._first_product(conn)
+            result = app.create_purchase(conn, self.org_id, {
+                "product_id": product["id"],
+                "partner_name": "テスト仕入先",
+                "invoice_no": "INV-P-CANCEL-QUEUE",
+                "transaction_date": "2026-06-01",
+                "received_date": "2026-06-02",
+                "quantity": 2,
+                "unit_price": 1000,
+            })
+            movement = conn.execute(
+                "SELECT * FROM inventory_movements WHERE source_type = 'purchase' AND source_id = ?",
+                (result["purchase_id"],),
+            ).fetchone()
+            queue = conn.execute(
+                "SELECT * FROM freee_sync_queue WHERE source_type = 'purchase' AND source_id = ?",
+                (result["purchase_id"],),
+            ).fetchone()
+            # 取消前は送信待ちキューに出る。
+            queue_ids_before = {q["id"] for q in app.list_queue(conn, self.org_id)}
+            self.assertIn(queue["id"], queue_ids_before)
+
+            app.cancel_inventory_movement(conn, self.org_id, {"movement_id": movement["id"], "reason": "入力ミスのため取消"})
+
+            # 取消後は送信待ちキューから消える。
+            queue_ids_after = {q["id"] for q in app.list_queue(conn, self.org_id)}
+            self.assertNotIn(queue["id"], queue_ids_after)
+            # 直接送信しようとしても拒否される。
+            with self.assertRaises(ValueError):
+                app.send_queue_to_pseudo_freee(conn, self.org_id, {"id": queue["id"]})
 
     def test_cancel_movement_cannot_be_cancelled_twice(self):
         with app.get_conn() as conn:

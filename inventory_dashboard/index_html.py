@@ -44,6 +44,7 @@ _INDEX_TEMPLATE = r"""
     .metric.risk-alert span, .metric.risk-alert strong { color: var(--danger); }
     .top-grid { display: grid; grid-template-columns: minmax(430px, 1.45fr) minmax(260px, 1fr) minmax(260px, 1fr); gap: 14px; align-items: start; }
     .ledger-entry-grid { display: grid; grid-template-columns: minmax(0, 1fr) 360px; gap: 16px; align-items: start; }
+    .ledger-column { display: grid; gap: 14px; align-content: start; min-width: 0; }
     .bottom-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(360px, .72fr); gap: 16px; align-items: start; }
     .entry-panel { position: sticky; top: 14px; }
     .form-tabs { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; padding: 4px; margin: 8px 0 12px; background: #eef1f4; border: 1px solid var(--line); border-radius: 8px; }
@@ -107,8 +108,18 @@ _INDEX_TEMPLATE = r"""
     label.low-confidence { color: var(--warn); font-weight: 700; }
     label.low-confidence::after { content: " ⚠ 要確認"; font-size: 11px; font-weight: 700; }
     .field-low { border-color: var(--warn); background: #fff8ec; }
-    .voucher-grid { display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr); gap: 16px; align-items: start; }
+    /* 請求書の小計/消費税/合計を確認するための欄（数量×単価×税率から自動計算） */
+    .amount-summary { margin: 12px 0 4px; padding: 10px 12px; background: #f4f7f6; border: 1px solid var(--line); border-radius: 8px; font-size: 13px; }
+    .amount-summary > div { display: flex; justify-content: space-between; align-items: baseline; padding: 3px 0; }
+    .amount-summary > div.total { margin-top: 4px; padding-top: 7px; border-top: 1px solid var(--line); }
+    .amount-summary span { color: var(--muted); }
+    .amount-summary strong { font-variant-numeric: tabular-nums; }
+    .amount-summary .total strong { font-size: 16px; color: var(--accent); }
+    /* 証憑一覧は全幅で使い、各列を潰さない（取引先名は横書きで折り返す）。詳細は一覧の下に表示。 */
+    .voucher-grid { display: grid; grid-template-columns: minmax(0, 1fr); gap: 16px; align-items: start; }
     .voucher-grid h3.sub { margin: 4px 0 8px; font-size: 14px; color: var(--muted); }
+    #voucherList th, #voucherList td { vertical-align: top; white-space: normal; word-break: break-word; }
+    #voucherList th:nth-child(3), #voucherList td:nth-child(3) { min-width: 8em; } /* 取引先(AI): 横書き2段に収まる幅 */
     .voucher-thumb { max-width: 240px; max-height: 220px; border: 1px solid var(--line); border-radius: 6px; display: block; margin: 6px 0; }
     .badge { display: inline-block; font-size: 11px; padding: 2px 7px; border-radius: 4px; }
     .badge.registered { background: #e6f3ec; color: var(--ok); }
@@ -173,6 +184,7 @@ _INDEX_TEMPLATE = r"""
       </div>
     </section>
     <section class="ledger-entry-grid">
+      <div class="ledger-column">
       <div class="panel">
         <div class="section-head">
           <h2 id="ledgerTitle">在庫元帳</h2>
@@ -182,6 +194,17 @@ _INDEX_TEMPLATE = r"""
         </div>
         <p class="note" id="ledgerNote">在庫一覧の商品名をクリックすると、仕入・売上・初期在庫から現在庫に至る記録を表示します。</p>
         <div id="ledger"></div>
+      </div>
+      <div class="panel" id="voucherSection">
+        <div class="section-head">
+          <h2>証憑（仕入・売上の請求書）</h2>
+        </div>
+        <p class="note">上の「登録」パネルで請求書を取り込むと、ここに<strong>元画像・AIの読み取り結果・取込先（仕入／売上）</strong>が残ります。後から見比べ・削除ができます。<br>多いときは折りたたんで表示します。</p>
+        <div class="voucher-grid">
+          <div id="voucherList"></div>
+          <div id="voucherDetail"></div>
+        </div>
+      </div>
       </div>
       <aside class="panel entry-panel">
         <h2>登録</h2>
@@ -213,6 +236,11 @@ _INDEX_TEMPLATE = r"""
             <label>単価</label><input type="number" name="unit_price" min="0" required>
             <label>税率</label><input type="number" name="tax_rate" value="10">
             <label>税区分</label><input name="tax_category" value="課税仕入 10%">
+            <div class="amount-summary">
+              <div><span>小計（税抜）</span><strong data-summary="subtotal">¥0</strong></div>
+              <div><span>消費税</span><strong data-summary="tax">¥0</strong></div>
+              <div class="total"><span>合計（税込）</span><strong data-summary="total">¥0</strong></div>
+            </div>
             <label>支払予定日</label><input type="date" name="due_date">
             <button type="submit">仕入登録</button>
           </form>
@@ -231,6 +259,11 @@ _INDEX_TEMPLATE = r"""
             <label>単価</label><input type="number" name="unit_price" min="0" required>
             <label>税率</label><input type="number" name="tax_rate" value="10">
             <label>税区分</label><input name="tax_category" value="課税売上 10%">
+            <div class="amount-summary">
+              <div><span>小計（税抜）</span><strong data-summary="subtotal">¥0</strong></div>
+              <div><span>消費税</span><strong data-summary="tax">¥0</strong></div>
+              <div class="total"><span>合計（税込）</span><strong data-summary="total">¥0</strong></div>
+            </div>
             <label>入金予定日</label><input type="date" name="due_date">
             <button type="submit">売上登録</button>
           </form>
@@ -275,16 +308,6 @@ _INDEX_TEMPLATE = r"""
           <h3 class="sub">発注候補（予測で在庫が必要水準を割る商品）</h3>
           <div id="forecastCandidates"></div>
         </div>
-      </div>
-    </section>
-    <section class="panel" id="voucherSection">
-      <div class="section-head">
-        <h2>証憑（仕入・売上の請求書）</h2>
-      </div>
-      <p class="note">上の「登録」パネルで請求書を取り込むと、ここに<strong>元画像・AIの読み取り結果・取込先（仕入／売上）</strong>が残ります。後から見比べ・削除ができます。</p>
-      <div class="voucher-grid">
-        <div id="voucherList"></div>
-        <div id="voucherDetail"></div>
       </div>
     </section>
     <section class="bottom-grid">
@@ -623,6 +646,10 @@ _INDEX_TEMPLATE = r"""
       if (q.status === "sent") {
         return `${previewButton} <span class="match">送信済み ${q.external_accounting_id || ""}</span>`;
       }
+      if (q.status === "cancelled") {
+        // 取消済みは送信待ちから外しているため通常は表示されないが、念のため送信不可にする。
+        return `${previewButton} <span class="status danger">取消済み（送信しません）</span>`;
+      }
       const label = q.status === "failed" ? "再送" : "疑似freeeへ送信";
       return `${previewButton} <button class="warning" onclick="sendToPseudoFreee(${q.id})">${label}</button>`;
     }
@@ -745,6 +772,7 @@ _INDEX_TEMPLATE = r"""
       document.getElementById("message").textContent = result.ok ? "登録しました" : "";
       form.reset();
       for (const input of form.querySelectorAll('input[type="date"][required]')) input.value = today;
+      updateAmountSummary(form);
       await loadAll();
       await loadLedger(productId);
     }
@@ -780,6 +808,26 @@ _INDEX_TEMPLATE = r"""
       }
       await loadAll();
     }
+
+    // 数量×単価で小計、税率で消費税（端数切り捨て=請求書の慣行）、合計＝小計＋消費税。
+    function updateAmountSummary(form) {
+      const box = form.querySelector(".amount-summary");
+      if (!box) return;
+      const qty = Number(form.quantity && form.quantity.value) || 0;
+      const unit = Number(form.unit_price && form.unit_price.value) || 0;
+      const rate = Number(form.tax_rate && form.tax_rate.value) || 0;
+      const subtotal = qty * unit;
+      const tax = Math.floor(subtotal * rate / 100);
+      box.querySelector('[data-summary="subtotal"]').textContent = yen.format(subtotal);
+      box.querySelector('[data-summary="tax"]').textContent = yen.format(tax);
+      box.querySelector('[data-summary="total"]').textContent = yen.format(subtotal + tax);
+    }
+    // 数量・単価・税率の入力に追従して再計算する。
+    document.querySelectorAll(".transaction-form").forEach(form => {
+      ["quantity", "unit_price", "tax_rate"].forEach(name => {
+        if (form[name]) form[name].addEventListener("input", () => updateAmountSummary(form));
+      });
+    });
 
     document.getElementById("purchaseForm").addEventListener("submit", async event => {
       event.preventDefault();
@@ -862,6 +910,7 @@ _INDEX_TEMPLATE = r"""
         form.unit_price.value = d.unit_price || "";
         if (form.tax_rate) form.tax_rate.value = d.tax_rate || 10;
         if (form.tax_category) form.tax_category.value = taxCategoryFor(kind, d.tax_rate);
+        updateAmountSummary(form);
         const matched = setSelectByValue(form.product_id, result.matched_product_id);
         form.voucher_id.value = result.voucher_id;
         markInvoiceLowConfidence(form, result.low_confidence_fields || []);
@@ -895,17 +944,43 @@ _INDEX_TEMPLATE = r"""
       }
     });
 
+    let currentVouchers = [];
+    let vouchersExpanded = false;
+    const VOUCHER_COLLAPSE_LIMIT = 5;
+
     async function loadVouchers() {
-      const rows = await api("/api/vouchers");
       const el = document.getElementById("voucherList");
+      if (!el) return; // 一覧の置き場所が未配置のときは何もしない（配置確定までの保護）
+      currentVouchers = await api("/api/vouchers");
+      vouchersExpanded = false;
+      renderVouchers();
+    }
+
+    function renderVouchers() {
+      const el = document.getElementById("voucherList");
+      if (!el) return;
+      const rows = currentVouchers;
       if (!rows.length) { el.innerHTML = `<p class="note">まだ証憑はありません。上の「登録」で請求書を取り込んでください。</p>`; return; }
-      el.innerHTML = table(["証憑", "区分", "支払先(AI)", "金額(AI)", "信頼度", "状態", ""],
-        rows.map(v => {
+      const visible = vouchersExpanded ? rows : rows.slice(0, VOUCHER_COLLAPSE_LIMIT);
+      el.innerHTML = table(["証憑", "区分", "取引先(AI)", "金額(AI)", "信頼度", "状態", ""],
+        visible.map(v => {
           const kindLabel = v.kind === "sale" ? "売上" : "仕入";
           const badge = v.registered ? `<span class="badge registered">取込済</span>` : `<span class="badge draft">未取込</span>`;
           const actions = `<button class="link" onclick="showVoucherDetail(${v.id})">詳細</button> <button class="danger-link" onclick="deleteVoucher(${v.id})">削除</button>`;
           return [escapeHtml(v.file_name), kindLabel, escapeHtml(v.partner_name || "-"), v.amount ? yen.format(v.amount) : "-", `${Math.round((v.confidence || 0) * 100)}%`, badge, actions];
-        }));
+        })) + voucherToggle(rows.length);
+    }
+
+    function voucherToggle(total) {
+      if (total <= VOUCHER_COLLAPSE_LIMIT) return "";
+      const label = vouchersExpanded ? `最新${VOUCHER_COLLAPSE_LIMIT}件のみ表示` : `すべて表示（全${total}件）`;
+      const state = vouchersExpanded ? "全件表示中" : `最新${VOUCHER_COLLAPSE_LIMIT}件を表示中`;
+      return `<div class="table-total"><span>${state}</span><button class="secondary" onclick="toggleVouchers()">${label}</button></div>`;
+    }
+
+    function toggleVouchers() {
+      vouchersExpanded = !vouchersExpanded;
+      renderVouchers();
     }
 
     async function deleteVoucher(id) {
@@ -920,7 +995,7 @@ _INDEX_TEMPLATE = r"""
     }
 
     function invoiceFieldsTable(fields, confidence, lowFields) {
-      const labels = { partner_name: "支払先", invoice_no: "請求書番号", transaction_date: "取引日", product_sku: "商品SKU", quantity: "数量", unit_price: "単価(税抜)", tax_rate: "税率" };
+      const labels = { partner_name: "取引先", invoice_no: "請求書番号", transaction_date: "取引日", product_sku: "商品SKU", quantity: "数量", unit_price: "単価(税抜)", tax_rate: "税率" };
       return table(["項目", "AI推定値", "信頼度"],
         Object.keys(labels).map(k => {
           const conf = confidence && confidence[k] != null ? Math.round(confidence[k] * 100) + "%" : "-";
