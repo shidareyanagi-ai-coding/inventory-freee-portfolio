@@ -1240,14 +1240,24 @@ def _voucher_row(conn: db.Connection, organization_id: int, voucher_id: int) -> 
 def _voucher_to_dict(row: dict[str, Any]) -> dict[str, Any]:
     ai = json.loads(row["ai_extracted_json"] or "{}")
     corrected = json.loads(row["user_corrected_json"]) if row["user_corrected_json"] else None
+    fields = ai.get("fields", {})
+    kind = ai.get("kind", "")  # purchase/sale=請求書, 空=一般経費
+    if kind in ("purchase", "sale"):
+        amount = float(fields.get("quantity") or 0) * float(fields.get("unit_price") or 0)
+    else:
+        amount = float(fields.get("amount") or 0)
     return {
         "id": row["id"],
         "file_name": row["file_name"],
         "mime_type": row["mime_type"],
         "confidence": row["confidence"],
-        "deal_id": row["deal_id"],
-        # 人が登録(register)すると user_corrected_json が入る。それが「登録済み」の唯一の根拠。
+        "kind": kind,
+        "partner_name": fields.get("partner_name", ""),
+        "amount": amount,
+        # 仕入/売上に紐付くと user_corrected_json が入る＝「取込済み」。それが唯一の根拠。
         "registered": corrected is not None,
+        "linked_source_type": (corrected or {}).get("source_type"),
+        "linked_source_id": (corrected or {}).get("source_id"),
         "created_at": row["created_at"],
         "ai_extracted": ai,
         "user_corrected": corrected,
@@ -1268,25 +1278,87 @@ def voucher_detail(conn: db.Connection, organization_id: int, voucher_id: int) -
     return _voucher_to_dict(_voucher_row(conn, organization_id, voucher_id))
 
 
-def register_voucher(
-    conn: db.Connection, organization_id: int, voucher_id: int, corrected: dict[str, Any]
-) -> dict[str, Any]:
-    """人による「登録」。確認・修正後の内容を user_corrected_json に残す（自動登録はしない）。
+def _products_for_matching(conn: db.Connection, organization_id: int) -> list[dict[str, Any]]:
+    """請求書の商品推測・単価生成に使う最小の商品マスタ。"""
+    return conn.execute(
+        """
+        SELECT id, sku, product_name, supplier_name, purchase_unit_price, sales_unit_price
+        FROM products
+        WHERE organization_id = ? AND is_active = 1
+        ORDER BY id
+        """,
+        (organization_id,),
+    ).fetchall()
 
-    別テナントの voucher_id は 404。最低限の検証（支払先・正の金額）を人の登録時に要求する。
+
+def capture_invoice(
+    conn: db.Connection,
+    organization_id: int,
+    *,
+    kind: str,
+    file_name: str,
+    mime_type: str,
+    image_bytes: bytes,
+) -> dict[str, Any]:
+    """仕入/売上の請求書画像 → AI下書き（登録しない）。画像と抽出結果を証憑として保存する。
+
+    AI が推測した商品SKUを既存マスタの product_id に解決して返す（フォームの商品選択に使う）。
     """
-    _voucher_row(conn, organization_id, voucher_id)  # IDOR: 別テナントは NotFoundError→404
-    fields = {name: corrected.get(name, "") for name in ai_capture.FIELDS}
-    fields["partner_name"] = required_text(fields.get("partner_name"), "partner_name")
-    amount = to_float(fields.get("amount"))
-    if amount <= 0:
-        raise ValueError("金額は正の数で入力してください。")
-    fields["amount"] = amount
+    products = [dict(p) for p in _products_for_matching(conn, organization_id)]
+    draft = ai_capture.analyze_invoice(image_bytes, mime_type, kind=kind, products=products)
+    sku = str(draft["fields"].get("product_sku") or "")
+    matched = next((p for p in products if str(p.get("sku")) == sku), None) if sku else None
+    matched_product_id = matched["id"] if matched else None
+
+    voucher_id = create_voucher(
+        conn, organization_id, file_name=file_name, mime_type=mime_type, image_bytes=image_bytes, draft=draft
+    )
+    return {
+        "voucher_id": voucher_id,
+        "kind": kind,
+        "draft": draft["fields"],
+        "matched_product_id": matched_product_id,
+        "confidence": draft["confidence"],
+        "overall_confidence": draft["overall_confidence"],
+        "low_confidence_fields": draft["low_confidence_fields"],
+        "source": draft["source"],
+    }
+
+
+def link_voucher_to_source(
+    conn: db.Connection,
+    organization_id: int,
+    voucher_id: int,
+    source_type: str,
+    source_id: int,
+    registered_fields: dict[str, Any] | None = None,
+) -> None:
+    """人が登録した仕入/売上に証憑を紐付ける（取込済みの印＝user_corrected_json）。別テナントは無視（404相当）。"""
+    row = conn.execute(
+        "SELECT id FROM vouchers WHERE id = ? AND organization_id = ?",
+        (voucher_id, organization_id),
+    ).fetchone()
+    if not row:
+        # 別テナント/存在しない voucher_id は黙ってスキップ（登録自体は成立させる）。
+        return
+    payload = {"source_type": source_type, "source_id": source_id, "fields": registered_fields or {}}
     conn.execute(
         "UPDATE vouchers SET user_corrected_json = ? WHERE id = ? AND organization_id = ?",
-        (json.dumps(fields, ensure_ascii=False), voucher_id, organization_id),
+        (json.dumps(payload, ensure_ascii=False), voucher_id, organization_id),
     )
-    return {"ok": True, "voucher_id": voucher_id, "registered": True}
+
+
+def delete_voucher(conn: db.Connection, organization_id: int, voucher_id: int) -> dict[str, Any]:
+    """証憑を削除する（DB行＋保存画像）。別テナント/不存在は 404（IDOR対策）。"""
+    row = _voucher_row(conn, organization_id, voucher_id)
+    path = VOUCHER_DIR / row["storage_path"]
+    try:
+        if path.exists():
+            path.unlink()
+    except OSError:
+        pass  # 画像が消せなくても DB 行の削除は進める
+    conn.execute("DELETE FROM vouchers WHERE id = ? AND organization_id = ?", (voucher_id, organization_id))
+    return {"ok": True, "deleted_voucher_id": voucher_id}
 
 
 def load_voucher_image(conn: db.Connection, organization_id: int, voucher_id: int) -> tuple[bytes, str]:
@@ -1690,20 +1762,11 @@ def api_forecast_order_candidates(identity: Identity = Depends(current_identity)
         return list_order_candidates(conn, identity.organization_id)
 
 
-# --- 経費キャプチャ 参照系（A-5・全ロール可）-------------------------------
+# --- 証憑（仕入・売上請求書）参照系（A-5・全ロール可）-----------------------
 @app.get("/api/vouchers")
 def api_vouchers(identity: Identity = Depends(current_identity)) -> list[dict[str, Any]]:
     with get_conn() as conn:
         return list_vouchers(conn, identity.organization_id)
-
-
-@app.get("/api/voucher-candidates")
-def api_voucher_candidates(identity: Identity = Depends(current_identity)) -> dict[str, Any]:
-    # 経費フォームの候補（勘定科目・税区分）。新FastAPI 側で自己完結。
-    return {
-        "account_items": ai_capture.account_item_candidates(),
-        "tax_categories": ai_capture.tax_category_candidates(),
-    }
 
 
 @app.get("/api/vouchers/{voucher_id}")
@@ -1718,6 +1781,15 @@ def api_voucher_image(voucher_id: int, identity: Identity = Depends(current_iden
     with get_conn() as conn:
         data, media_type = load_voucher_image(conn, identity.organization_id, voucher_id)
     return Response(content=data, media_type=media_type)
+
+
+@app.delete("/api/vouchers/{voucher_id}")
+def api_delete_voucher(voucher_id: int, identity: Identity = WRITER) -> dict[str, Any]:
+    # 証憑の削除は admin/staff のみ。別テナントの id は 404。
+    with get_conn() as conn:
+        result = delete_voucher(conn, identity.organization_id, voucher_id)
+        record_audit(conn, identity.organization_id, identity.user_id, "voucher.delete", "voucher", voucher_id)
+        return result
 
 
 @app.get("/api/products/{product_id}/ledger")
@@ -1765,11 +1837,27 @@ def api_create_product(data: dict[str, Any] = Depends(parse_json_body), identity
         return result
 
 
+def _maybe_link_voucher(conn: db.Connection, organization_id: int, data: dict[str, Any], source_type: str, source_id: int) -> None:
+    """請求書から取り込んで登録した場合、その証憑(voucher_id)を仕入/売上に紐付ける。"""
+    raw = data.get("voucher_id")
+    if not raw:
+        return
+    try:
+        voucher_id = int(raw)
+    except (TypeError, ValueError):
+        return
+    link_voucher_to_source(
+        conn, organization_id, voucher_id, source_type, source_id,
+        {k: data.get(k) for k in ("partner_name", "invoice_no", "transaction_date", "quantity", "unit_price", "tax_rate")},
+    )
+
+
 @app.post("/api/purchases", status_code=201)
 def api_create_purchase(data: dict[str, Any] = Depends(parse_json_body), identity: Identity = WRITER) -> dict[str, Any]:
     with get_conn() as conn:
         result = create_purchase(conn, identity.organization_id, data)
         record_audit(conn, identity.organization_id, identity.user_id, "purchase.create", "purchase", result.get("purchase_id"), {"invoice_no": data.get("invoice_no")})
+        _maybe_link_voucher(conn, identity.organization_id, data, "purchase", result["purchase_id"])
         return result
 
 
@@ -1778,6 +1866,7 @@ def api_create_sale(data: dict[str, Any] = Depends(parse_json_body), identity: I
     with get_conn() as conn:
         result = create_sale(conn, identity.organization_id, data)
         record_audit(conn, identity.organization_id, identity.user_id, "sale.create", "sale", result.get("sale_id"), {"invoice_no": data.get("invoice_no")})
+        _maybe_link_voucher(conn, identity.organization_id, data, "sale", result["sale_id"])
         return result
 
 
@@ -1813,53 +1902,31 @@ def api_cancel_movement(data: dict[str, Any] = Depends(parse_json_body), identit
         return result
 
 
-# --- 経費キャプチャ 更新系（A-5・admin/staff のみ・viewer は 403）-----------
-@app.post("/api/expense-capture", status_code=201)
-async def api_expense_capture(
-    file: UploadFile = File(...), identity: Identity = WRITER
+# --- 仕入・売上請求書の取り込み 更新系（A-5・admin/staff のみ・viewer は 403）---
+@app.post("/api/invoice-capture", status_code=201)
+async def api_invoice_capture(
+    kind: str = "purchase", file: UploadFile = File(...), identity: Identity = WRITER
 ) -> dict[str, Any]:
-    # 画像受信 → AI解析（下書き） → 証憑保存。**ここでは登録しない**（登録は人が /register で行う）。
+    # 仕入/売上の請求書画像 → AI下書き → 証憑保存。**ここでは登録しない**（登録は人が仕入/売上フォームで行う）。
+    if kind not in {"purchase", "sale"}:
+        raise ValueError("kind は purchase または sale です。")
     image_bytes = await file.read()
     if not image_bytes:
         raise ValueError("画像がありません。")
-    draft = ai_capture.analyze_voucher(image_bytes, file.content_type or "")
     with get_conn() as conn:
-        voucher_id = create_voucher(
+        result = capture_invoice(
             conn,
             identity.organization_id,
+            kind=kind,
             file_name=file.filename or "",
             mime_type=file.content_type or "",
             image_bytes=image_bytes,
-            draft=draft,
         )
         record_audit(
-            conn, identity.organization_id, identity.user_id, "voucher.capture", "voucher", voucher_id,
-            {"source": draft.get("source"), "overall_confidence": draft.get("overall_confidence")},
+            conn, identity.organization_id, identity.user_id, "voucher.capture", "voucher", result["voucher_id"],
+            {"kind": kind, "source": result.get("source"), "overall_confidence": result.get("overall_confidence")},
         )
-    return {
-        "voucher_id": voucher_id,
-        "draft": draft["fields"],
-        "confidence": draft["confidence"],
-        "overall_confidence": draft["overall_confidence"],
-        "low_confidence_fields": draft["low_confidence_fields"],
-        "source": draft["source"],
-        "account_item_candidates": ai_capture.account_item_candidates(),
-        "tax_category_candidates": ai_capture.tax_category_candidates(),
-    }
-
-
-@app.post("/api/vouchers/{voucher_id}/register", status_code=201)
-def api_register_voucher(
-    voucher_id: int, data: dict[str, Any] = Depends(parse_json_body), identity: Identity = WRITER
-) -> dict[str, Any]:
-    # 人による登録（確認・修正後の内容を保存）。別テナントの voucher_id は 404。
-    with get_conn() as conn:
-        result = register_voucher(conn, identity.organization_id, voucher_id, data)
-        record_audit(
-            conn, identity.organization_id, identity.user_id, "voucher.register", "voucher", voucher_id,
-            {"partner_name": data.get("partner_name"), "amount": data.get("amount")},
-        )
-        return result
+    return result
 
 
 # ---------------------------------------------------------------------------

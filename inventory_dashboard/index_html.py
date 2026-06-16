@@ -97,22 +97,41 @@ _INDEX_TEMPLATE = r"""
     .chart-wrap { position: relative; height: 320px; margin: 6px 0 14px; }
     .forecast-grid { display: grid; grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr); gap: 16px; align-items: start; }
     .forecast-grid h3.sub { margin: 0 0 8px; font-size: 14px; color: var(--muted); }
-    /* A-5: 経費キャプチャ（AI証憑入力） */
-    .expense-grid { display: grid; grid-template-columns: minmax(0, 360px) minmax(0, 1fr); gap: 16px; align-items: start; }
-    .expense-grid h3.sub { margin: 4px 0 8px; font-size: 14px; color: var(--muted); }
+    /* A-5: 仕入・売上請求書のAI取り込み */
+    .dropzone { border: 2px dashed var(--line); border-radius: 8px; padding: 12px; margin: 10px 0 12px; background: #f9fbfb; text-align: center; transition: border-color .15s, background .15s; }
+    .dropzone.dragover { border-color: var(--accent); background: #eef5f3; }
+    .dropzone.busy { opacity: .7; }
+    .dz-text { margin: 0 0 8px; font-size: 13px; color: var(--muted); }
+    .dropzone input[type="file"] { width: 100%; }
     .ai-pill { display: inline-block; font-size: 11px; padding: 2px 8px; border-radius: 999px; background: #eef3f1; color: var(--accent); border: 1px solid #cfe0da; }
     label.low-confidence { color: var(--warn); font-weight: 700; }
     label.low-confidence::after { content: " ⚠ 要確認"; font-size: 11px; font-weight: 700; }
     .field-low { border-color: var(--warn); background: #fff8ec; }
+    .voucher-grid { display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr); gap: 16px; align-items: start; }
+    .voucher-grid h3.sub { margin: 4px 0 8px; font-size: 14px; color: var(--muted); }
     .voucher-thumb { max-width: 240px; max-height: 220px; border: 1px solid var(--line); border-radius: 6px; display: block; margin: 6px 0; }
     .badge { display: inline-block; font-size: 11px; padding: 2px 7px; border-radius: 4px; }
     .badge.registered { background: #e6f3ec; color: var(--ok); }
     .badge.draft { background: #fdeee9; color: var(--accent-2); }
+    .danger-link { background: none; border: 0; color: var(--danger); font-weight: 700; cursor: pointer; padding: 2px 4px; }
     @media (max-width: 900px) {
-      .metrics, .top-grid, .ledger-entry-grid, .bottom-grid, .forecast-grid, .expense-grid { grid-template-columns: 1fr; }
+      .metrics, .top-grid, .ledger-entry-grid, .bottom-grid, .forecast-grid, .voucher-grid { grid-template-columns: 1fr; }
       .entry-panel { position: static; }
       main { padding: 12px; }
       table { display: block; overflow-x: auto; }
+    }
+    /* スマホ幅: 2列で詰まりがちな所を1列に積み、入力欄が潰れないようにする */
+    @media (max-width: 560px) {
+      header { padding: 14px 16px; flex-wrap: wrap; }
+      h1 { font-size: 17px; }
+      .metrics { gap: 8px; }
+      .partner-add { grid-template-columns: 1fr; }
+      .partner-add button { width: 100%; }
+      .forecast-controls { flex-direction: column; align-items: stretch; }
+      .section-head { flex-wrap: wrap; }
+      .inline-control { width: 100%; }
+      .inline-control select { width: 100%; }
+      input, select, button { font-size: 16px; } /* iOSの自動ズーム防止 */
     }
   </style>
   <!-- A-4: 実績線＋予測線＋信頼区間の描画に Chart.js を CDN から読み込む（公開用デモ）。 -->
@@ -171,8 +190,15 @@ _INDEX_TEMPLATE = r"""
           <button class="form-tab active" type="button" data-form="purchaseForm" onclick="showTransactionForm('purchaseForm')">仕入</button>
           <button class="form-tab" type="button" data-form="saleForm" onclick="showTransactionForm('saleForm')">売上</button>
         </div>
+        <!-- A-5: 仕入・売上の請求書からAI取り込み（下書きを下のフォームに反映。登録は人が押す）。 -->
+        <div id="invoiceDrop" class="dropzone" tabindex="0">
+          <p class="dz-text">📄 <strong>請求書</strong>をドラッグ&ドロップ / 貼り付け（Ctrl+V）<br>または下から選択・カメラ撮影</p>
+          <input type="file" id="invoiceImage" accept="image/*" capture="environment">
+          <p class="note" id="invoiceStatus">AIが「<span id="dzKindLabel">仕入</span>」フォームに下書きを反映します。⚠の項目は確認のうえ登録してください。</p>
+        </div>
         <div>
           <form id="purchaseForm" class="transaction-form active">
+            <input type="hidden" name="voucher_id">
             <h2>仕入明細</h2>
             <label>商品</label><select name="product_id"></select>
             <label>仕入先</label><select name="partner_name" data-partner-type="supplier" required></select>
@@ -191,6 +217,7 @@ _INDEX_TEMPLATE = r"""
             <button type="submit">仕入登録</button>
           </form>
           <form id="saleForm" class="transaction-form">
+            <input type="hidden" name="voucher_id">
             <h2>売上明細</h2>
             <label>商品</label><select name="product_id"></select>
             <label>得意先</label><select name="partner_name" data-partner-type="customer" required></select>
@@ -250,36 +277,14 @@ _INDEX_TEMPLATE = r"""
         </div>
       </div>
     </section>
-    <section class="panel" id="expenseCaptureSection">
+    <section class="panel" id="voucherSection">
       <div class="section-head">
-        <h2>経費キャプチャ（AI証憑入力）</h2>
-        <span class="ai-pill" id="captureSourcePill" hidden></span>
+        <h2>証憑（仕入・売上の請求書）</h2>
       </div>
-      <p class="note">レシート・請求書の画像をアップロード（スマホはカメラ撮影）すると、AIが発生日・支払先・金額・税区分・勘定科目・摘要を推定して下書きに反映します。<strong>AIは下書きまで。「登録」はあなたが確認して押します（自動登録はしません）。</strong></p>
-      <div class="expense-grid">
-        <div>
-          <form id="expenseCaptureForm">
-            <label>証憑画像（レシート / 請求書）</label>
-            <input type="file" id="expenseImage" accept="image/*" capture="environment" required>
-            <button type="submit" id="captureBtn">AIで解析して下書きを作る</button>
-          </form>
-          <p class="note" id="expenseCaptureStatus"></p>
-          <form id="expenseDraftForm" hidden>
-            <h3 class="sub">下書き（確認・修正して登録）</h3>
-            <label data-field="issue_date">発生日</label><input type="date" name="issue_date">
-            <label data-field="partner_name">支払先</label><input name="partner_name" required>
-            <label data-field="amount">金額（税込）</label><input type="number" name="amount" min="1" required>
-            <label data-field="tax_category">税区分</label><select name="tax_category"></select>
-            <label data-field="account_item">勘定科目</label><select name="account_item"></select>
-            <label data-field="memo">摘要</label><input name="memo">
-            <button type="submit" id="registerVoucherBtn">この内容で登録</button>
-          </form>
-        </div>
-        <div>
-          <h3 class="sub">証憑一覧（元画像・AI抽出・人の修正後を後から確認）</h3>
-          <div id="voucherList"></div>
-          <div id="voucherDetail"></div>
-        </div>
+      <p class="note">上の「登録」パネルで請求書を取り込むと、ここに<strong>元画像・AIの読み取り結果・取込先（仕入／売上）</strong>が残ります。後から見比べ・削除ができます。</p>
+      <div class="voucher-grid">
+        <div id="voucherList"></div>
+        <div id="voucherDetail"></div>
       </div>
     </section>
     <section class="bottom-grid">
@@ -302,8 +307,6 @@ _INDEX_TEMPLATE = r"""
     let currentPartners = { suppliers: [], customers: [] };
     let currentQueueRows = [];
     let currentPreviewKey = null;
-    let currentDraftVoucherId = null;
-    let voucherCandidates = { account_items: [], tax_categories: [] };
     const defaultPreviewText = "キューの「確認」を押すと、freee送信用の中間データを表示します。";
     for (const input of document.querySelectorAll('input[type="date"][required]')) input.value = today;
 
@@ -731,6 +734,8 @@ _INDEX_TEMPLATE = r"""
     function showTransactionForm(formId) {
       document.querySelectorAll(".transaction-form").forEach(form => form.classList.toggle("active", form.id === formId));
       document.querySelectorAll(".form-tab").forEach(tab => tab.classList.toggle("active", tab.dataset.form === formId));
+      const label = document.getElementById("dzKindLabel");
+      if (label) label.textContent = formId === "saleForm" ? "売上" : "仕入";
     }
 
     async function submitForm(form, path) {
@@ -796,101 +801,134 @@ _INDEX_TEMPLATE = r"""
       return URL.createObjectURL(await res.blob());
     }
 
-    function fillSelect(select, options, value) {
-      select.innerHTML = options.map(o => `<option value="${o}">${o}</option>`).join("");
-      if (value && !options.includes(value)) select.insertAdjacentHTML("afterbegin", `<option value="${value}">${value}</option>`);
-      select.value = value || (options[0] || "");
+    function activeTransactionForm() {
+      return document.querySelector(".transaction-form.active") || document.getElementById("purchaseForm");
     }
-
-    function markLowConfidence(lowFields) {
-      const form = document.getElementById("expenseDraftForm");
-      for (const label of form.querySelectorAll("label[data-field]")) {
-        const field = label.dataset.field;
-        const low = lowFields.includes(field);
-        label.classList.toggle("low-confidence", low);
-        const input = form.querySelector(`[name="${field}"]`);
-        if (input) input.classList.toggle("field-low", low);
+    function activeKind() {
+      return activeTransactionForm().id === "saleForm" ? "sale" : "purchase";
+    }
+    function taxCategoryFor(kind, rate) {
+      const r = Number(rate) === 8 ? "8%" : "10%";
+      return (kind === "purchase" ? "課税仕入 " : "課税売上 ") + r;
+    }
+    function setSelectByValue(select, value) {
+      // product_id を選ぶ。一致が無ければ何もしない（人が選ぶ）。
+      if (value == null || value === "") return false;
+      const v = String(value);
+      if ([...select.options].some(o => o.value === v)) { select.value = v; return true; }
+      return false;
+    }
+    function setSelectByText(select, text) {
+      // 取引先select: 一致 option を選ぶ。無ければ一時 option を足して選ぶ（後で登録時にマスタ化）。
+      if (!text) return false;
+      if (![...select.options].some(o => o.value === text)) {
+        select.insertAdjacentHTML("afterbegin", `<option value="${escapeAttr(text)}">${escapeHtml(text)}</option>`);
       }
+      select.value = text;
+      return true;
     }
 
-    async function captureExpense(event) {
-      event.preventDefault();
-      const fileInput = document.getElementById("expenseImage");
-      const file = fileInput.files[0];
+    // 請求書フィールド名 → フォームの入力欄名（product_sku は商品選択に対応）
+    const INVOICE_FIELD_TO_INPUT = {
+      partner_name: "partner_name", invoice_no: "invoice_no", transaction_date: "transaction_date",
+      product_sku: "product_id", quantity: "quantity", unit_price: "unit_price", tax_rate: "tax_rate"
+    };
+    function markInvoiceLowConfidence(form, lowFields) {
+      form.querySelectorAll(".field-low").forEach(el => el.classList.remove("field-low"));
+      (lowFields || []).forEach(f => {
+        const input = form.querySelector(`[name="${INVOICE_FIELD_TO_INPUT[f] || f}"]`);
+        if (input) input.classList.add("field-low");
+      });
+    }
+
+    async function captureInvoice(file) {
       if (!file) return;
-      const status = document.getElementById("expenseCaptureStatus");
-      const btn = document.getElementById("captureBtn");
-      btn.disabled = true; status.textContent = "AIが画像を解析しています…";
+      const kind = activeKind();
+      const form = activeTransactionForm();
+      const dz = document.getElementById("invoiceDrop");
+      const statusEl = document.getElementById("invoiceStatus");
+      dz.classList.add("busy");
+      statusEl.textContent = "AIが請求書を解析しています…";
       try {
         const body = new FormData();
         body.append("file", file);
-        const result = await api("/api/expense-capture", { method: "POST", body });
-        voucherCandidates = { account_items: result.account_item_candidates, tax_categories: result.tax_category_candidates };
-        currentDraftVoucherId = result.voucher_id;
-        const draft = result.draft;
-        const form = document.getElementById("expenseDraftForm");
-        form.issue_date.value = draft.issue_date || today;
-        form.partner_name.value = draft.partner_name || "";
-        form.amount.value = draft.amount || "";
-        form.memo.value = draft.memo || "";
-        fillSelect(form.tax_category, voucherCandidates.tax_categories, draft.tax_category);
-        fillSelect(form.account_item, voucherCandidates.account_items, draft.account_item);
-        markLowConfidence(result.low_confidence_fields || []);
-        form.hidden = false;
-        const pill = document.getElementById("captureSourcePill");
-        pill.hidden = false;
-        pill.textContent = `${result.source === "anthropic" ? "Claude解析" : "デモ解析(スタブ)"} ・ 全体信頼度 ${Math.round(result.overall_confidence * 100)}%`;
-        const lows = (result.low_confidence_fields || []).length;
-        status.textContent = lows ? `下書きを作成しました。⚠ の${lows}項目は信頼度が低めです。確認して登録してください。` : "下書きを作成しました。確認して登録してください。";
+        const result = await api(`/api/invoice-capture?kind=${kind}`, { method: "POST", body });
+        const d = result.draft;
+        if (form.partner_name) setSelectByText(form.partner_name, d.partner_name);
+        form.invoice_no.value = d.invoice_no || "";
+        form.transaction_date.value = d.transaction_date || today;
+        if (form.received_date) form.received_date.value = d.transaction_date || today;
+        form.quantity.value = d.quantity || "";
+        form.unit_price.value = d.unit_price || "";
+        if (form.tax_rate) form.tax_rate.value = d.tax_rate || 10;
+        if (form.tax_category) form.tax_category.value = taxCategoryFor(kind, d.tax_rate);
+        const matched = setSelectByValue(form.product_id, result.matched_product_id);
+        form.voucher_id.value = result.voucher_id;
+        markInvoiceLowConfidence(form, result.low_confidence_fields || []);
+        if (!matched) form.product_id.classList.add("field-low"); // 商品が決まらなければ要選択
+        const srcLabel = result.source === "anthropic" ? "Claude解析" : "デモ解析(スタブ)";
+        statusEl.innerHTML = `${srcLabel}（全体信頼度 ${Math.round(result.overall_confidence * 100)}%）。<strong>⚠の項目を確認し、内容を直して「${kind === "purchase" ? "仕入" : "売上"}登録」を押してください。</strong>`;
+        document.getElementById("invoiceImage").value = "";
         await loadVouchers();
       } catch (error) {
-        status.textContent = error.message;
+        statusEl.textContent = error.message;
       } finally {
-        btn.disabled = false;
+        dz.classList.remove("busy");
       }
     }
 
-    async function registerVoucher(event) {
-      event.preventDefault();
-      if (!currentDraftVoucherId) return;
-      const form = document.getElementById("expenseDraftForm");
-      const payload = Object.fromEntries(new FormData(form).entries());
-      const status = document.getElementById("expenseCaptureStatus");
-      try {
-        await api(`/api/vouchers/${currentDraftVoucherId}/register`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
-        status.textContent = "登録しました（人が確認のうえ登録）。";
-        form.hidden = true;
-        document.getElementById("captureSourcePill").hidden = true;
-        document.getElementById("expenseCaptureForm").reset();
-        const registeredId = currentDraftVoucherId;
-        currentDraftVoucherId = null;
-        await loadVouchers();
-        await showVoucherDetail(registeredId);
-      } catch (error) {
-        status.textContent = error.message;
+    // 入力経路: ファイル選択 / ドラッグ&ドロップ / ペースト(Ctrl+V)
+    const invoiceDrop = document.getElementById("invoiceDrop");
+    document.getElementById("invoiceImage").addEventListener("change", e => captureInvoice(e.target.files[0]));
+    ["dragenter", "dragover"].forEach(ev => invoiceDrop.addEventListener(ev, e => { e.preventDefault(); invoiceDrop.classList.add("dragover"); }));
+    ["dragleave", "dragend"].forEach(ev => invoiceDrop.addEventListener(ev, () => invoiceDrop.classList.remove("dragover")));
+    invoiceDrop.addEventListener("drop", e => {
+      e.preventDefault();
+      invoiceDrop.classList.remove("dragover");
+      const file = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+      if (file) captureInvoice(file);
+    });
+    window.addEventListener("paste", e => {
+      const items = (e.clipboardData && e.clipboardData.items) || [];
+      for (const it of items) {
+        if (it.type && it.type.startsWith("image/")) { captureInvoice(it.getAsFile()); break; }
       }
-    }
+    });
 
     async function loadVouchers() {
       const rows = await api("/api/vouchers");
       const el = document.getElementById("voucherList");
-      if (!rows.length) { el.innerHTML = `<p class="note">まだ証憑はありません。上のフォームから画像を解析してください。</p>`; return; }
-      el.innerHTML = table(["証憑", "支払先(AI)", "金額(AI)", "信頼度", "状態", ""],
+      if (!rows.length) { el.innerHTML = `<p class="note">まだ証憑はありません。上の「登録」で請求書を取り込んでください。</p>`; return; }
+      el.innerHTML = table(["証憑", "区分", "支払先(AI)", "金額(AI)", "信頼度", "状態", ""],
         rows.map(v => {
-          const ai = (v.ai_extracted && v.ai_extracted.fields) || {};
-          const badge = v.registered ? `<span class="badge registered">登録済</span>` : `<span class="badge draft">下書き</span>`;
-          return [v.file_name, ai.partner_name || "-", ai.amount ? yen.format(ai.amount) : "-", `${Math.round((v.confidence || 0) * 100)}%`, badge, `<button class="link" onclick="showVoucherDetail(${v.id})">詳細</button>`];
+          const kindLabel = v.kind === "sale" ? "売上" : "仕入";
+          const badge = v.registered ? `<span class="badge registered">取込済</span>` : `<span class="badge draft">未取込</span>`;
+          const actions = `<button class="link" onclick="showVoucherDetail(${v.id})">詳細</button> <button class="danger-link" onclick="deleteVoucher(${v.id})">削除</button>`;
+          return [escapeHtml(v.file_name), kindLabel, escapeHtml(v.partner_name || "-"), v.amount ? yen.format(v.amount) : "-", `${Math.round((v.confidence || 0) * 100)}%`, badge, actions];
         }));
     }
 
-    function draftFieldsTable(fields, confidence, lowFields) {
-      const labels = { issue_date: "発生日", partner_name: "支払先", amount: "金額", tax_category: "税区分", account_item: "勘定科目", memo: "摘要" };
+    async function deleteVoucher(id) {
+      if (!window.confirm("この証憑を削除しますか？（元画像も削除されます）")) return;
+      try {
+        await api(`/api/vouchers/${id}`, { method: "DELETE" });
+        document.getElementById("voucherDetail").innerHTML = "";
+        await loadVouchers();
+      } catch (error) {
+        document.getElementById("voucherDetail").innerHTML = `<p class="note">${escapeHtml(error.message)}</p>`;
+      }
+    }
+
+    function invoiceFieldsTable(fields, confidence, lowFields) {
+      const labels = { partner_name: "支払先", invoice_no: "請求書番号", transaction_date: "取引日", product_sku: "商品SKU", quantity: "数量", unit_price: "単価(税抜)", tax_rate: "税率" };
       return table(["項目", "AI推定値", "信頼度"],
         Object.keys(labels).map(k => {
           const conf = confidence && confidence[k] != null ? Math.round(confidence[k] * 100) + "%" : "-";
           const low = (lowFields || []).includes(k);
-          const val = k === "amount" && fields[k] ? yen.format(fields[k]) : (fields[k] || "-");
-          return [labels[k], val, low ? `<span class="low-confidence">${conf}</span>` : conf];
+          let val = fields[k];
+          if (k === "unit_price" && val) val = yen.format(val);
+          val = (val === 0 || val) ? String(val) : "-";
+          return [labels[k], escapeHtml(val), low ? `<span class="low-confidence">${conf}</span>` : conf];
         }));
     }
 
@@ -899,25 +937,23 @@ _INDEX_TEMPLATE = r"""
       try {
         const v = await api(`/api/vouchers/${id}`);
         const ai = v.ai_extracted || {};
-        let html = `<h3 class="sub">証憑詳細 #${v.id}（${v.registered ? "登録済" : "下書き"}）</h3>`;
-        try { html += `<img class="voucher-thumb" src="${await voucherImageObjectUrl(id)}" alt="証憑画像">`; }
+        const kindLabel = v.kind === "sale" ? "売上" : "仕入";
+        let html = `<h3 class="sub">証憑詳細 #${v.id}（${kindLabel}・${v.registered ? "取込済" : "未取込"}）</h3>`;
+        try { html += `<img class="voucher-thumb" src="${await voucherImageObjectUrl(id)}" alt="請求書画像">`; }
         catch (e) { html += `<p class="note">画像を表示できませんでした。</p>`; }
-        html += `<p class="note">AI抽出（${ai.source === "anthropic" ? "Claude" : "デモ"}）：</p>`;
-        html += draftFieldsTable(ai.fields || {}, ai.confidence || {}, ai.low_confidence_fields || []);
-        if (v.user_corrected) {
-          html += `<p class="note">人の修正後（登録内容）：</p>`;
-          html += draftFieldsTable(v.user_corrected, null, []);
+        html += `<p class="note">AI読み取り（${ai.source === "anthropic" ? "Claude" : "デモ"}）：</p>`;
+        html += invoiceFieldsTable(ai.fields || {}, ai.confidence || {}, ai.low_confidence_fields || []);
+        if (v.linked_source_type) {
+          html += `<p class="note">取込先：${v.linked_source_type === "sale" ? "売上" : "仕入"} #${v.linked_source_id}（人が確認して登録済）</p>`;
         } else {
-          html += `<p class="note">まだ登録されていません（AIの下書きのみ）。</p>`;
+          html += `<p class="note">まだ仕入/売上に登録されていません（AIの下書きのみ）。</p>`;
         }
+        html += `<p><button class="danger-link" onclick="deleteVoucher(${v.id})">この証憑を削除</button></p>`;
         detail.innerHTML = html;
       } catch (error) {
-        detail.innerHTML = `<p class="note">${error.message}</p>`;
+        detail.innerHTML = `<p class="note">${escapeHtml(error.message)}</p>`;
       }
     }
-
-    document.getElementById("expenseCaptureForm").addEventListener("submit", captureExpense);
-    document.getElementById("expenseDraftForm").addEventListener("submit", registerVoucher);
     // --- A-3: 認証ブートストラップ ------------------------------------------
     // Clerk 設定時はサインインを必須化し、未サインインならゲートを表示してアプリを止める。
     // dev モード（Clerk 未設定）のときはトークン無しでそのまま起動する。

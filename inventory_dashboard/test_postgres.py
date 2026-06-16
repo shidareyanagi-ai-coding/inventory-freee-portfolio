@@ -198,20 +198,21 @@ class PostgresSmokeTest(unittest.TestCase):
         with app.get_conn() as conn:
             self.assertTrue(db.table_exists(conn, "vouchers"))
 
-    def test_voucher_capture_and_register_on_postgres(self):
-        # A-5: 証憑の保存(IDENTITY+RETURNING)と人による登録(UPDATE)が Postgres 上でも通る。
+    def test_voucher_capture_and_link_on_postgres(self):
+        # A-5: 証憑の保存(IDENTITY+RETURNING)と仕入への紐付け(UPDATE)が Postgres 上でも通る。
         # ここはDB層の検証なのでAIは呼ばない（実鍵があっても安定するよう決定的スタブで下書きを作る）。
-        draft = app.ai_capture._stub_analyze(b"PG-RECEIPT-BYTES", "image/png")
+        draft = app.ai_capture._stub_invoice(b"PG-INVOICE-BYTES", "image/png", "purchase", [])
         with app.get_conn() as conn:
             voucher_id = app.create_voucher(
                 conn, self.org_id, file_name="pg.png", mime_type="image/png",
-                image_bytes=b"PG-RECEIPT-BYTES", draft=draft,
+                image_bytes=b"PG-INVOICE-BYTES", draft=draft,
             )
             self.assertIsInstance(voucher_id, int)
-            app.register_voucher(conn, self.org_id, voucher_id, {"partner_name": "PG支払先", "amount": 1200})
+            app.link_voucher_to_source(conn, self.org_id, voucher_id, "purchase", 999, {"partner_name": "PG仕入先"})
             detail = app.voucher_detail(conn, self.org_id, voucher_id)
         self.assertTrue(detail["registered"])
-        self.assertEqual(detail["user_corrected"]["partner_name"], "PG支払先")
+        self.assertEqual(detail["linked_source_type"], "purchase")
+        self.assertEqual(detail["linked_source_id"], 999)
 
     def test_run_forecast_writes_on_postgres(self):
         # A-4: 予測バッチが Postgres 上でも forecasts/model_evaluations を書ける

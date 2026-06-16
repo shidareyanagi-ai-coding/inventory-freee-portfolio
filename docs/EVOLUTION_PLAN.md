@@ -11,7 +11,7 @@
 - **DB**: Neon (Postgres) ／ **認証**: Clerk ／ **テナント**: `organization_id` ＋ 軽量RBAC
 - **予測**: **レベル2**（2年・日次の“現実的な合成データ” ＋ 本物の機械学習[Prophet/LightGBM] ＋ MAE/MAPE・バックテスト）
 - **データアクセス境界**: **FastAPI が「DB読み書き・業務ロジック・認可」の唯一の主体／フロントは UI と API 呼び出しのみ**
-- **追加機能**: 経費キャプチャ（AI証憑入力。AIは下書きまで、登録は人）
+- **追加機能**: AI証憑入力（**一般経費レシート→疑似freee** ／ **仕入・売上請求書→在庫ダッシュボードの登録フォーム**。AIは下書きまで、登録は人）
 - **freee 本物連携**: 後回し可（`pseudo_freee` が連携デモを代替）
 
 ---
@@ -114,18 +114,17 @@
 
 ---
 
-## 追加機能：経費キャプチャ（AI証憑入力）
+## 追加機能：AI証憑入力（用途で2つに分ける）
 
-`pseudo_freee` の経費入力に、請求書・レシート画像から **AIが伝票の下書きを作る** 機能を追加（既存仕様書 `EXPENSE_CAPTURE_FEATURE_SPEC.md` の手順3〜6に相当。手順1〜2＝候補マスタ化は実装済み）。
+請求書・レシート画像から **AIが下書きを作る** 機能。**鉄則**: AIは **解析してフォームに仮入力するまで**。**「登録」は人だけが押す**（会計データの自動登録はしない）。低信頼度の項目は画面で目立たせる。スマホは `<input type="file" accept="image/*" capture="environment">` ＋ **ドラッグ&ドロップ / コピー&ペースト** にも対応。画像対応AI（既定 Claude）は **サーバ側から** 呼び、**APIキーはサーバ側・環境変数のみ**（画像1枚ごとに少額課金）。
 
-**鉄則**: AIは **解析してフォームに仮入力するまで**。**「登録」ボタンは人だけが押す**（会計データの自動登録はしない）。
+> ⚠️ **設計修正（2026-06-16・ユーザ意図に合わせて訂正）**: 当初この節は「新FastAPIに載せ、古いstdlib版(pseudo_freee)には載せない」としていたが、用途で置き場所を分けるのが正しい（`EXPENSE_CAPTURE_FEATURE_SPEC.md` も経費は pseudo_freee 想定）。
 
-- **フロー**: 画像アップ(PC)／カメラ撮影(スマホ) → 画像対応AIが解析 → 発生日・支払先・金額・税区分・摘要・勘定科目候補・**信頼度** を推定 → フォームに下書き反映 → 人が確認・修正 → 登録。
-- **スマホ**: `<input type="file" accept="image/*" capture="environment">`（ネイティブアプリ不要）。低信頼度の項目は画面で目立たせる。
-- **AIモデル**: 画像が読めるAI（既定は Claude のAPI）を **サーバ側から** 呼ぶ。**APIキーはサーバ側・環境変数のみ**。画像1枚ごとに少額の従量課金。
-- **実装場所**: 新FastAPIに `POST /api/expense-capture`（画像受信→AI解析→構造化JSONを返す）。**古いstdlib版には載せない**。
-- **データ**: 上記 `vouchers` 表（元画像・AI抽出・人修正後・信頼度を保存＝後から見比べられる見せ場）。
-- **画像保存**: オブジェクトストレージ（Supabase Storage / Cloudflare R2 / S3互換）にサーバ側経由で保存。DBにはパスのみ。
+1. **一般経費レシート → `pseudo_freee`（疑似freee）**。会議費レシート等。AIが 発生日・支払先・金額・税区分・摘要・勘定科目候補・**信頼度** を推定 → 経費フォームに下書き → 人が登録。pseudo_freee は stdlib のままでよく、画像は **base64 で JSON 送信** すれば大改造せず追加できる（`ai_capture.analyze_voucher` を再利用）。
+2. **仕入・売上の請求書 → 在庫ダッシュボード（FastAPI）の登録フォームに統合**。AIが 支払先・請求書番号・取引日・商品(SKU照合)・数量・税抜単価・税率 を推定 → **仕入/売上フォームに反映** → 人が登録。登録すると証憑(`vouchers`)が仕入/売上に紐付く。`POST /api/invoice-capture?kind=purchase|sale`、`ai_capture.analyze_invoice`。
+
+- **データ**: `vouchers` 表（元画像・AI抽出・人の確定内容/紐付け先・信頼度を保存＝後から見比べ・削除できる見せ場）。
+- **画像保存**: 当面サーバ側ローカルFS（DBにはパスのみ）。本番(A-6)で オブジェクトストレージ（Supabase Storage / Cloudflare R2 / S3互換）へ差し替え。
 
 ---
 
@@ -151,7 +150,8 @@
 | **A-2. Neon移行** ✅ | **完了（実Neon接続・検証済み）**。DBアクセス層を `db.py` に分離、`DATABASE_URL` で SQLite⇄Postgres 切替、SQLite→Postgres DDL、seed再現。ORMは不採用（薄い手書きアダプタ）。検証: 実Neon（PostgreSQL 16.14 / Singapore）へ接続→スキーマ作成＋seed投入→全テスト 41 passed（SQLite 28＋Neon上 Postgres 13 / `test_postgres.py`）→ダッシュボードが実Neonデータを正しく表示。`inventory_dashboard` が対象（`pseudo_freee` のPostgres化はA-3以降の検討事項） |
 | **A-3. 認証＋テナント＋RBAC** ✅ | **完了（実Clerk＋実Neon検証済み）**。Clerk JWT を JWKS(RS256) で検証（`auth.py`）、全ドメインテーブルに `organization_id`、新規 `organizations`/`memberships`/`audit_logs`、テナント内一意、軽量RBAC（admin/staff/viewer）、IDOR封鎖（別テナントの id は 404）、監査ログ、初回ログインで自組織サンドボックス seed。dev モード（`AUTH_DEV_MODE`）でClerk無しのローカル/テストも可。**前提作業（テスト用DBを本番Neonと分離）も実施**: Neon の**テスト用ブランチ**（`a3-test`）を作成し、`test_postgres.py` は `PYTEST_ALLOW_DB_RESET=1` の明示時のみ DROP 実行（本番誤爆防止）。検証: SQLite 45＋Neonテストブランチ上 Postgres 14 = **59 passed**、実 Clerk でサインイン→JWT検証→自組織サンドボックスにデモ seed→ダッシュボード表示まで確認。commit 48850f1・530595a（main）|
 | **A-4. 予測レベル2** ✅ | **完了**（ローカルSQLite＋実Neon(a3-test)検証済・mainマージ済 3d51599）。合成データを2年・日次の“現実的”版に作り直し（トレンド＋週次/月次季節＋補助金/キャンペーンのスパイク＋ノイズ、`external_factors` 記録）、`forecasting/` パッケージに **baseline / SARIMA(statsmodels) / LightGBM(分位点回帰＋補助金/カレンダー特徴量)** をモデルレジストリ（遅延import・依存無は自動skip）として実装。ホールドアウト・バックテストで MAE/MAPE をモデル比較（model_evaluations）、`forecasts`/`order_candidates` 保存、Chart.js で実績線＋予測線＋80%信頼区間を表示。新API: `POST /api/forecast/run`(admin/staff)・`GET /api/forecast/{series,models,evaluations,order-candidates}`（テナント絞り込み・IDOR404）。検証: SQLite **60 passed**（既存45＋新15: テナント分離・予測保存・MAE/MAPE・RBAC・回帰）、ダッシュボードで実績×予測を目視、CLI `python -m forecasting.run` 動作。**正本からの差分（決定）**: Prophet は Windows+Py3.11 の導入安定性の理由で **statsmodels(SARIMA/ETS) に差し替え**／**任意DL は本フェーズ見送り**。**実Neon検証済**: a3-test ブランチで `test_postgres.py` **16 passed**（予測系4テーブルのPG DDL＋`run_forecast` on Postgres＋日次seed再現を含む。`PYTEST_ALLOW_DB_RESET=1`・本番ブランチには向けず）。次は A-5（経費キャプチャ）。 |
-| **A-5. 経費キャプチャ** ✅ | **完了（実AI＋実Neon検証済）**。`inventory_dashboard`(FastAPI) に実装（**正本の「古いstdlib版=pseudo_freee には載せない」に従い**、`db.py:441` の vouchers マーカー通り認証/テナント/監査のある新FastAPI 側へ）。新規 `ai_capture.py`（画像→構造化JSON。Claude vision＋`output_config.format`。`anthropic`未導入/`ANTHROPIC_API_KEY`未設定なら**決定的スタブ**に自動フォールバック＝鍵なしでもUI/テストが動く）。`vouchers`表（両DDL・organization_id・元画像はサーバ側ファイル＝DBはパスのみ）。新API: `POST /api/expense-capture`(admin/staff・画像→AI下書き、**登録しない**)・`POST /api/vouchers/{id}/register`(**人が登録**＝user_corrected_json保存)・`GET /api/vouchers`/`/{id}`/`/{id}/image`（テナント絞り込み・IDOR404・画像も認証必須）。UI: 経費キャプチャ section（`<input type=file accept=image/* capture=environment>`・低信頼度⚠ハイライト・「登録は人」ボタン・詳細で元画像/AI抽出/人修正後を見比べ）。検証: SQLite **73 passed**（既存60＋新13: 自動登録されない・人の登録・低信頼度表示・RBAC(viewer不可)・テナント分離/IDOR404・元画像/AI/修正後の保存・スタブ決定性）、実ASGIで `POST /api/expense-capture` 201、ブラウザ(dev)で capture→下書き→人登録→詳細(元画像blob+AI+修正後)を目視。**正本からの差分（決定）**: 画像保存はまずサーバ側ローカルFS（DBにパスのみ）、オブジェクトストレージ(S3/R2)は A-6 で差し替え／既定モデルは安価な `claude-haiku-4-5`（`ANTHROPIC_MODEL`で上書き、1枚課金を抑制）。**実物検証済（ハードゲート両方クリア・2026-06-16）**: ①`ANTHROPIC_API_KEY`(鍵名 inventory-freee-local)で**実 Claude vision**＝合成レシート画像を作り `analyze_voucher` → **source="anthropic"**・claude-haiku-4-5 で日付/支払先/金額3080/税区分/勘定科目/摘要を信頼度0.9〜0.95で正確に読取。②実Neon `a3-test` ブランチで `test_postgres.py` **18 passed**（A-2/A-3/A-4の16＋A-5 vouchers 2件: 表存在・capture/register on PG。PG用voucherテストは実鍵があると本物AIにダミーbytesを送り400になるため `_stub_analyze` 直呼びに変更＝DB層検証はAIを呼ばない）。次は A-6（デプロイ）。 |
+| **A-5. AI証憑入力（再設計中）** | **設計を用途別に訂正（一般経費→疑似freee／仕入売上請求書→在庫）。ステップ1=在庫側 完了・検証済、ステップ2=疑似freee側 未着手。** 〔ステップ1〕在庫ダッシュボードの証憑機能を「**仕入・売上請求書のAI取り込み**」に作り変え、仕入/売上の**登録フォームに統合**（請求書→AIが支払先/番号/取引日/商品SKU照合/数量/税抜単価/税率を反映→人が登録→証憑が仕入/売上に紐付く）。`POST /api/invoice-capture?kind=`・`ai_capture.analyze_invoice`（鍵無しは決定的スタブ）・**証憑の削除**(`DELETE /api/vouchers/{id}`)・**ドラッグ&ドロップ/コピー&ペースト**アップロード・**スマホ幅の改善**。検証: SQLite **74 passed**（請求書取込/自動登録されない/人の登録で紐付く/削除/RBAC/IDOR404/スタブ決定性）、ブラウザで**実Claude**が合成請求書を信頼度95%で読取→仕入フォーム反映→SKUを product 照合→人が登録(purchase #183紐付け)→削除まで目視。〔ステップ2・未着手〕疑似freeeに一般経費レシートのAI入力（base64でJSON送信、`analyze_voucher`再利用）。〔旧A-5の経緯〕一旦 inventory_dashboard に「経費キャプチャ」を載せmainマージ(26e2d45)したが、用途違い（在庫は仕入売上のみ）と判明し本再設計に至る。次は ステップ2 → A-6。 |
+| 〔旧A-5の記録〕 | 当初 inventory_dashboard に一般経費の「経費キャプチャ」を実装し、実AI(source=anthropic)＋実Neon a3-test(`test_postgres` 18 passed)で検証のうえ main(**26e2d45**)へマージ。その後ユーザ意図（在庫ダッシュボードは仕入・売上のみ／一般経費は疑似freee）と判明し、上記 A-5 へ再設計した。`ai_capture.analyze_voucher`（経費モード）と `vouchers` 表はステップ2（疑似freee）で再利用する。 |
 | **A-6. デプロイ** | Render/Railway へ、Neon接続、Clerk本番キー、README・スクショ更新 |
 
 → **ここまでで Plan A 完成** = 動いて検証された需要予測＋ログイン＋本格DB＋AI経費入力。
