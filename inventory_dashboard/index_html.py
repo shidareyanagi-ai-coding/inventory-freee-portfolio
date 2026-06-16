@@ -987,8 +987,10 @@ _INDEX_TEMPLATE = r"""
     }
 
     async function bootstrapAuth() {
-      if (!APP_CONFIG.clerkConfigured) {
-        // dev モード: 認証なしでそのまま起動（サーバ側 AUTH_DEV_MODE が許可）。
+      if (!APP_CONFIG.clerkConfigured || APP_CONFIG.devMode) {
+        // dev モード（AUTH_DEV_MODE=true）または Clerk 未設定なら、サインイン不要で起動する。
+        // dev モードは .env に Clerk の鍵が残っていても優先（ローカルで Clerk を使わず試せる）。
+        // 本番(APP_ENV=production)では auth_dev_mode() が強制 false になるので影響しない。
         await startApp();
         return;
       }
