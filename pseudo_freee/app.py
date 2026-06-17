@@ -807,12 +807,16 @@ def create_manual_expense(conn: sqlite3.Connection, data: dict[str, Any]) -> dic
 
 
 def delete_deal(conn: sqlite3.Connection, deal_id: int) -> bool:
-    """取引を削除する（明細も削除）。存在しなければ False。
+    """取引を削除する（明細も削除）。手入力経費のみ。存在しない/手入力以外なら False。
 
+    在庫連携の取引（仕入/売上）は在庫ダッシュボードが唯一の正のため、ここでは削除しない
+    （pseudo_freee 側で消すと在庫数の計算と食い違うため）。
     紐付く証憑があれば「下書き」に戻す（deal_id と確定内容をクリア）。証憑画像自体は残す。
     """
-    existing = conn.execute("SELECT id FROM pseudo_freee_deals WHERE id = ?", (deal_id,)).fetchone()
-    if not existing:
+    existing = conn.execute(
+        "SELECT id, source_type FROM pseudo_freee_deals WHERE id = ?", (deal_id,)
+    ).fetchone()
+    if not existing or existing["source_type"] != "manual_expense":
         return False
     conn.execute(
         "UPDATE pseudo_freee_vouchers SET deal_id = NULL, user_corrected_json = '' WHERE deal_id = ?",
@@ -1741,14 +1745,17 @@ def render_index(filters: dict[str, str] | None = None) -> bytes:
         else:
             source_label = f'{source_type_label(deal["source_type"])} #{deal["source_id"]}'
             queue_label = f'<br><span class="label">queue #{deal["queue_id"]}</span>'
-        # 操作: 編集は手入力経費のみ（在庫連携の取引は在庫側が正なので編集不可）。削除は全取引で可能。
-        edit_link = f'<a href="/deals/{deal["id"]}/edit">編集</a>' if deal["source_type"] == "manual_expense" else ""
-        action_cell = (
-            f'<div class="row-actions">{edit_link}'
-            f'<form method="post" action="/deals/{deal["id"]}/delete" '
-            f"""onsubmit="return confirm('取引 #{deal["id"]} を削除しますか？');">"""
-            f'<button type="submit" class="row-del">削除</button></form></div>'
-        )
+        # 操作: 手入力経費のみ 編集・削除可。在庫連携の取引（仕入/売上）は在庫ダッシュボードが
+        # 唯一の正のため、ここでは編集も削除もしない（pseudo_freee 側で消すと在庫計算と食い違う）。
+        if deal["source_type"] == "manual_expense":
+            action_cell = (
+                f'<div class="row-actions"><a href="/deals/{deal["id"]}/edit">編集</a>'
+                f'<form method="post" action="/deals/{deal["id"]}/delete" '
+                f"""onsubmit="return confirm('取引 #{deal["id"]} を削除しますか？');">"""
+                f'<button type="submit" class="row-del">削除</button></form></div>'
+            )
+        else:
+            action_cell = '<span class="label">在庫側で管理</span>'
         rows += f"""
         <tr>
           <td><a href="/deals/{deal["id"]}">#{deal["id"]}</a></td>

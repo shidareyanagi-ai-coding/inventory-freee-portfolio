@@ -182,6 +182,22 @@ class PseudoFreeeAppTest(unittest.TestCase):
                     conn, deal_id, {"issue_date": "2026-06-13", "partner_name": "X", "account_item_name": "消耗品費", "amount": 100}
                 )
 
+    def test_cannot_delete_synced_deal(self) -> None:
+        with app.db_connection() as conn:
+            deal_id, _ = app.create_deal(conn, sample_deal())
+            # 在庫連携の取引は削除不可（在庫ダッシュボードが正）。残っていること。
+            self.assertFalse(app.delete_deal(conn, deal_id))
+            self.assertIsNotNone(app.get_deal(conn, deal_id))
+
+    def test_synced_deal_row_has_no_actions(self) -> None:
+        with app.db_connection() as conn:
+            app.create_deal(conn, sample_deal())
+        html = app.render_index().decode("utf-8")
+        # 在庫連携の行は編集・削除ボタンを出さず「在庫側で管理」と表示する。
+        self.assertIn("在庫側で管理", html)
+        self.assertNotIn("/edit", html)
+        self.assertNotIn("/delete", html)
+
     def test_render_index_shows_deal_actions(self) -> None:
         with app.db_connection() as conn:
             app.create_manual_expense(
