@@ -327,6 +327,28 @@ def ensure_deals_columns(conn: sqlite3.Connection) -> None:
             conn.execute("ALTER TABLE pseudo_freee_vouchers ADD COLUMN content_hash TEXT NOT NULL DEFAULT ''")
 
 
+def backfill_voucher_hashes(conn: sqlite3.Connection) -> None:
+    """content_hash が空の既存証憑に、保存済み画像からハッシュを計算して埋める。
+
+    重複検知を「列を足す前に保存した証憑」にも効かせるための後付け処理（冪等）。
+    """
+    if not table_exists(conn, "pseudo_freee_vouchers"):
+        return
+    rows = conn.execute(
+        "SELECT id, storage_path FROM pseudo_freee_vouchers WHERE content_hash = '' AND storage_path != ''"
+    ).fetchall()
+    for row in rows:
+        path = VOUCHER_DIR / row["storage_path"]
+        try:
+            if path.exists():
+                digest = hashlib.sha256(path.read_bytes()).hexdigest()
+                conn.execute(
+                    "UPDATE pseudo_freee_vouchers SET content_hash = ? WHERE id = ?", (digest, row["id"])
+                )
+        except OSError:
+            pass  # 画像が読めない証憑はスキップ（次回起動時に再試行される）
+
+
 def default_tax_for_account_item(account_item_name: str) -> str:
     for tax_category, account_items in DEFAULT_ACCOUNT_ITEM_TAX_CATEGORIES.items():
         if account_item_name in account_items:
@@ -426,6 +448,7 @@ def init_db() -> None:
         conn.executescript(SCHEMA_SQL)
         ensure_master_schema(conn)
         ensure_deals_columns(conn)
+        backfill_voucher_hashes(conn)
         seed_master_data(conn)
 
 
@@ -780,6 +803,107 @@ def create_manual_expense(conn: sqlite3.Connection, data: dict[str, Any]) -> dic
     remember_expense_masters(conn, partner_name, account_item_name, tax_category)
     # 請求書/レシートから取り込んで登録した場合、その証憑(voucher_id)を経費伝票に紐付ける。
     _maybe_link_voucher(conn, data, deal_id)
+    return {"ok": True, "pseudo_freee_deal_id": deal_id}
+
+
+def delete_deal(conn: sqlite3.Connection, deal_id: int) -> bool:
+    """取引を削除する（明細も削除）。存在しなければ False。
+
+    紐付く証憑があれば「下書き」に戻す（deal_id と確定内容をクリア）。証憑画像自体は残す。
+    """
+    existing = conn.execute("SELECT id FROM pseudo_freee_deals WHERE id = ?", (deal_id,)).fetchone()
+    if not existing:
+        return False
+    conn.execute(
+        "UPDATE pseudo_freee_vouchers SET deal_id = NULL, user_corrected_json = '' WHERE deal_id = ?",
+        (deal_id,),
+    )
+    conn.execute("DELETE FROM pseudo_freee_deal_lines WHERE deal_id = ?", (deal_id,))
+    conn.execute("DELETE FROM pseudo_freee_deals WHERE id = ?", (deal_id,))
+    return True
+
+
+def update_manual_expense(conn: sqlite3.Connection, deal_id: int, data: dict[str, Any]) -> dict[str, Any]:
+    """手入力経費の取引を更新する（手入力経費のみ。在庫連携の取引は編集不可）。"""
+    existing = conn.execute("SELECT * FROM pseudo_freee_deals WHERE id = ?", (deal_id,)).fetchone()
+    if not existing:
+        raise ValueError("取引が見つかりません。")
+    if existing["source_type"] != "manual_expense":
+        raise ValueError("手入力経費のみ編集できます。")
+
+    issue_date = required_text(data.get("issue_date"), "issue_date")
+    partner_name = required_text(data.get("partner_name"), "partner_name")
+    account_item_name = required_text(data.get("account_item_name"), "account_item_name")
+    amount = to_float(data.get("amount"))
+    if amount <= 0:
+        raise ValueError("amount must be greater than 0")
+    payment_method = str(data.get("payment_method", "現金") or "現金")
+    if payment_method not in {"現金", "普通預金", "未払金"}:
+        raise ValueError("payment_method must be 現金, 普通預金, or 未払金")
+    due_date = str(data.get("due_date", "") or "")
+    if payment_method != "未払金":
+        due_date = ""
+    tax_category = str(data.get("tax_category", "課税仕入 10%") or "課税仕入 10%")
+    description = str(data.get("description", "") or account_item_name)
+    memo = str(data.get("memo", "") or "")
+    tax_rate = to_float(data.get("tax_rate"), 10)
+    payload = {
+        "source_app": "manual",
+        "source_type": "manual_expense",
+        "payload": {
+            "api_target": "pseudo_freee_manual_expense",
+            "issue_date": issue_date,
+            "due_date": due_date,
+            "type": "expense",
+            "payment_method": payment_method,
+            "partner_name": partner_name,
+            "invoice_no": "",
+            "memo": memo,
+            "details": [
+                {
+                    "sku": "",
+                    "description": description,
+                    "quantity": 1,
+                    "unit_price": amount,
+                    "tax_rate": tax_rate,
+                    "tax_category": tax_category,
+                    "amount": amount,
+                    "account_item_name": account_item_name,
+                }
+            ],
+        },
+    }
+    conn.execute(
+        """
+        UPDATE pseudo_freee_deals
+        SET issue_date = ?, due_date = ?, partner_name = ?, account_item_name = ?,
+            tax_category = ?, amount = ?, memo = ?, payment_method = ?, payload_json = ?
+        WHERE id = ?
+        """,
+        (
+            issue_date,
+            due_date,
+            partner_name,
+            account_item_name,
+            tax_category,
+            amount,
+            memo,
+            payment_method,
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            deal_id,
+        ),
+    )
+    conn.execute("DELETE FROM pseudo_freee_deal_lines WHERE deal_id = ?", (deal_id,))
+    conn.execute(
+        """
+        INSERT INTO pseudo_freee_deal_lines (
+            deal_id, sku, description, quantity, unit_price, tax_rate, tax_category, amount, account_item_name
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (deal_id, "", description, 1, amount, tax_rate, tax_category, amount, account_item_name),
+    )
+    remember_expense_masters(conn, partner_name, account_item_name, tax_category)
     return {"ok": True, "pseudo_freee_deal_id": deal_id}
 
 
@@ -1510,6 +1634,18 @@ def render_page(title: str, body: str) -> bytes:
       font-weight: 700;
     }}
     .voucher-toggle:hover {{ background: #f0f5ff; }}
+    .row-actions {{ display: flex; gap: 8px; align-items: center; white-space: nowrap; }}
+    .row-actions form {{ margin: 0; }}
+    .row-del {{
+      width: auto;
+      border-color: #e2b4b4;
+      background: #fff;
+      color: #b91c1c;
+      padding: 4px 10px;
+      font-size: 12px;
+      font-weight: 700;
+    }}
+    .row-del:hover {{ background: #fdecec; }}
     .detail-grid {{
       display: grid;
       grid-template-columns: minmax(0, 1fr) minmax(280px, 420px);
@@ -1605,6 +1741,14 @@ def render_index(filters: dict[str, str] | None = None) -> bytes:
         else:
             source_label = f'{source_type_label(deal["source_type"])} #{deal["source_id"]}'
             queue_label = f'<br><span class="label">queue #{deal["queue_id"]}</span>'
+        # 操作: 編集は手入力経費のみ（在庫連携の取引は在庫側が正なので編集不可）。削除は全取引で可能。
+        edit_link = f'<a href="/deals/{deal["id"]}/edit">編集</a>' if deal["source_type"] == "manual_expense" else ""
+        action_cell = (
+            f'<div class="row-actions">{edit_link}'
+            f'<form method="post" action="/deals/{deal["id"]}/delete" '
+            f"""onsubmit="return confirm('取引 #{deal["id"]} を削除しますか？');">"""
+            f'<button type="submit" class="row-del">削除</button></form></div>'
+        )
         rows += f"""
         <tr>
           <td><a href="/deals/{deal["id"]}">#{deal["id"]}</a></td>
@@ -1617,6 +1761,7 @@ def render_index(filters: dict[str, str] | None = None) -> bytes:
           <td>{html.escape(deal["due_date"])}</td>
           <td>{html.escape(source_label)}{queue_label}</td>
           <td>{html.escape(deal["created_at"])}</td>
+          <td>{action_cell}</td>
         </tr>"""
 
     trend_rows = ""
@@ -1692,6 +1837,7 @@ def render_index(filters: dict[str, str] | None = None) -> bytes:
               <th>支払/入金予定日</th>
               <th>送信元</th>
               <th>登録日時</th>
+              <th>操作</th>
             </tr>
           </thead>
           <tbody>{rows}</tbody>
@@ -2306,6 +2452,69 @@ def render_detail(deal_id: int) -> bytes | None:
     return render_page(f"取引詳細 #{deal_id}", body)
 
 
+def render_edit_deal(deal_id: int) -> bytes | None:
+    """手入力経費の編集フォーム。手入力経費でなければ None（編集不可）。"""
+    with db_connection() as conn:
+        deal = get_deal(conn, deal_id)
+        masters = list_expense_masters(conn)
+    if not deal or deal["source_type"] != "manual_expense":
+        return None
+
+    description = deal["lines"][0]["description"] if deal.get("lines") else ""
+    pm = deal.get("payment_method") or "現金"
+    amt = float(deal["amount"])
+    amount_text = str(int(amt)) if amt.is_integer() else str(amt)
+
+    def with_current(values: list[str], current: str) -> list[str]:
+        # 現在値がマスタ候補に無くても選べるよう先頭に足す。
+        return ([current] + list(values)) if current and current not in values else list(values)
+
+    def opts(values: list[str], current: str) -> str:
+        return "".join(
+            f'<option value="{html.escape(v, quote=True)}"{selected(current, v)}>{html.escape(v)}</option>'
+            for v in values
+        )
+
+    pm_opts = "".join(f'<option value="{m}"{selected(pm, m)}>{m}</option>' for m in ("現金", "普通預金", "未払金"))
+    due_disabled = "" if pm == "未払金" else " disabled"
+    due_label_class = "" if pm == "未払金" else "is-disabled"
+
+    body = f"""
+      <div class="toolbar">
+        <h2>取引 #{deal['id']} を編集（手入力経費）</h2>
+        <a href="/">一覧へ戻る</a>
+      </div>
+      <section class="card" style="max-width: 560px;">
+        <form class="expense-form" method="post" action="/deals/{deal['id']}">
+          <div class="form-grid">
+            <label>発生日<input type="date" name="issue_date" value="{html.escape(deal['issue_date'], quote=True)}" required></label>
+            <label>支払方法<select name="payment_method" id="payment-method">{pm_opts}</select></label>
+            <label>取引先<select name="partner_name" required>{opts(with_current(masters['payees'], deal['partner_name']), deal['partner_name'])}</select></label>
+            <label>勘定科目<select name="account_item_name" required>{opts(with_current(masters['account_items'], deal['account_item_name']), deal['account_item_name'])}</select></label>
+            <label>税区分<select name="tax_category">{opts(with_current(masters['tax_categories'], deal['tax_category']), deal['tax_category'])}</select></label>
+            <label>金額<input class="no-spinner" inputmode="decimal" name="amount" value="{amount_text}" required></label>
+            <label id="due-date-label" class="{due_label_class}">支払予定日（未払金のとき）<input type="date" name="due_date" id="due-date-input" value="{html.escape(deal['due_date'], quote=True)}"{due_disabled}></label>
+          </div>
+          <label>摘要<input name="description" value="{html.escape(description, quote=True)}"></label>
+          <label>メモ<textarea name="memo">{html.escape(deal['memo'])}</textarea></label>
+          <button type="submit">更新する</button>
+        </form>
+      </section>
+      <script>
+        const pm = document.getElementById("payment-method");
+        const dd = document.getElementById("due-date-input");
+        const ddl = document.getElementById("due-date-label");
+        function sync() {{
+          const en = pm && pm.value === "未払金";
+          if (dd) dd.disabled = !en;
+          if (ddl) ddl.classList.toggle("is-disabled", !en);
+        }}
+        if (pm) {{ pm.addEventListener("change", sync); sync(); }}
+      </script>
+    """
+    return render_page(f"取引 #{deal_id} を編集", body)
+
+
 class PseudoFreeeHandler(BaseHTTPRequestHandler):
     def log_message(self, format: str, *args: Any) -> None:
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -2361,6 +2570,13 @@ class PseudoFreeeHandler(BaseHTTPRequestHandler):
         try:
             if parsed.path in {"/", "/deals"}:
                 self.respond_html(render_index(deal_filters_from_query(parsed.query)))
+            elif parsed.path.startswith("/deals/") and parsed.path.endswith("/edit"):
+                deal_id = to_int(parsed.path[len("/deals/"):-len("/edit")], "deal_id")
+                body = render_edit_deal(deal_id)
+                if body is None:
+                    self.respond_json({"ok": False, "error": "deal not editable"}, HTTPStatus.NOT_FOUND)
+                else:
+                    self.respond_html(body)
             elif parsed.path.startswith("/deals/"):
                 deal_id = to_int(parsed.path.removeprefix("/deals/"), "deal_id")
                 body = render_detail(deal_id)
@@ -2464,6 +2680,18 @@ class PseudoFreeeHandler(BaseHTTPRequestHandler):
                 data = self.read_form()
                 with db_connection() as conn:
                     create_expense_master(conn, data)
+                self.redirect("/")
+            elif parsed.path.startswith("/deals/") and parsed.path.endswith("/delete"):
+                deal_id = to_int(parsed.path[len("/deals/"):-len("/delete")], "deal_id")
+                with db_connection() as conn:
+                    delete_deal(conn, deal_id)
+                self.redirect("/")
+            elif parsed.path.startswith("/deals/"):
+                # 取引の更新（手入力経費の編集フォームから）。
+                deal_id = to_int(parsed.path.removeprefix("/deals/"), "deal_id")
+                data = self.read_form()
+                with db_connection() as conn:
+                    update_manual_expense(conn, deal_id, data)
                 self.redirect("/")
             else:
                 self.respond_json({"ok": False, "error": "not found"}, HTTPStatus.NOT_FOUND)

@@ -131,6 +131,82 @@ class PseudoFreeeAppTest(unittest.TestCase):
                     {"issue_date": "2026-06-13", "partner_name": "X", "account_item_name": "消耗品費", "amount": 100, "payment_method": "クレカ"},
                 )
 
+    def test_update_manual_expense_changes_fields(self) -> None:
+        with app.db_connection() as conn:
+            created = app.create_manual_expense(
+                conn,
+                {"issue_date": "2026-06-13", "partner_name": "日本橋文具", "account_item_name": "消耗品費", "amount": 3300, "payment_method": "現金"},
+            )
+            deal_id = created["pseudo_freee_deal_id"]
+            app.update_manual_expense(
+                conn,
+                deal_id,
+                {
+                    "issue_date": "2026-06-20", "partner_name": "東京サプライ", "account_item_name": "会議費",
+                    "tax_category": "課税仕入 8%", "amount": 5000, "payment_method": "未払金",
+                    "due_date": "2026-07-31", "memo": "更新後メモ",
+                },
+            )
+            deal = app.get_deal(conn, deal_id)
+
+        assert deal is not None
+        self.assertEqual(deal["partner_name"], "東京サプライ")
+        self.assertEqual(deal["account_item_name"], "会議費")
+        self.assertEqual(deal["amount"], 5000)
+        self.assertEqual(deal["payment_method"], "未払金")
+        self.assertEqual(deal["due_date"], "2026-07-31")
+        self.assertEqual(deal["memo"], "更新後メモ")
+        self.assertEqual(len(deal["lines"]), 1)
+        self.assertEqual(deal["lines"][0]["amount"], 5000)
+
+    def test_delete_deal_removes_deal_and_lines(self) -> None:
+        with app.db_connection() as conn:
+            created = app.create_manual_expense(
+                conn,
+                {"issue_date": "2026-06-13", "partner_name": "日本橋文具", "account_item_name": "消耗品費", "amount": 3300},
+            )
+            deal_id = created["pseudo_freee_deal_id"]
+            self.assertTrue(app.delete_deal(conn, deal_id))
+            self.assertIsNone(app.get_deal(conn, deal_id))
+            lines = conn.execute(
+                "SELECT COUNT(*) AS c FROM pseudo_freee_deal_lines WHERE deal_id = ?", (deal_id,)
+            ).fetchone()["c"]
+            self.assertEqual(lines, 0)
+            self.assertFalse(app.delete_deal(conn, 9999))
+
+    def test_cannot_edit_synced_deal(self) -> None:
+        with app.db_connection() as conn:
+            deal_id, _ = app.create_deal(conn, sample_deal())
+            with self.assertRaises(ValueError):
+                app.update_manual_expense(
+                    conn, deal_id, {"issue_date": "2026-06-13", "partner_name": "X", "account_item_name": "消耗品費", "amount": 100}
+                )
+
+    def test_render_index_shows_deal_actions(self) -> None:
+        with app.db_connection() as conn:
+            app.create_manual_expense(
+                conn,
+                {"issue_date": "2026-06-13", "partner_name": "日本橋文具", "account_item_name": "消耗品費", "amount": 3300},
+            )
+        html = app.render_index().decode("utf-8")
+        self.assertIn("<th>操作</th>", html)
+        self.assertIn("/edit", html)
+        self.assertIn("/delete", html)
+        self.assertIn('class="row-del"', html)
+
+    def test_edit_page_for_manual_and_not_for_synced(self) -> None:
+        with app.db_connection() as conn:
+            created = app.create_manual_expense(
+                conn,
+                {"issue_date": "2026-06-13", "partner_name": "日本橋文具", "account_item_name": "消耗品費", "amount": 3300},
+            )
+            synced_id, _ = app.create_deal(conn, sample_deal())
+        manual_body = app.render_edit_deal(created["pseudo_freee_deal_id"])
+        synced_body = app.render_edit_deal(synced_id)
+        assert manual_body is not None
+        self.assertIn("を編集", manual_body.decode("utf-8"))
+        self.assertIsNone(synced_body)
+
     def test_expense_master_candidates_are_seeded_and_learn_new_values(self) -> None:
         with app.db_connection() as conn:
             before = app.list_expense_masters(conn)
@@ -365,6 +441,41 @@ class PseudoFreeeVoucherTest(unittest.TestCase):
         self.assertTrue(second["duplicate"])
         self.assertIn(first["voucher_id"], second["duplicate_of"])
         self.assertFalse(other["duplicate"])
+
+    def test_backfill_voucher_hashes_enables_dup_detection(self) -> None:
+        with app.db_connection() as conn:
+            captured = app.capture_expense(conn, file_name="r.png", mime_type="image/png", image_bytes=b"old-receipt")
+            # 修正前を模擬: content_hash を空に戻す（後から列を足した既存証憑の状態）。
+            conn.execute("UPDATE pseudo_freee_vouchers SET content_hash = '' WHERE id = ?", (captured["voucher_id"],))
+        with app.db_connection() as conn:
+            app.backfill_voucher_hashes(conn)
+            row = conn.execute(
+                "SELECT content_hash FROM pseudo_freee_vouchers WHERE id = ?", (captured["voucher_id"],)
+            ).fetchone()
+            self.assertTrue(row["content_hash"])  # 画像から再計算して埋まる
+        # 同じ画像を再アップロードすると、今度は重複検知される。
+        with app.db_connection() as conn:
+            again = app.capture_expense(conn, file_name="r2.png", mime_type="image/png", image_bytes=b"old-receipt")
+        self.assertTrue(again["duplicate"])
+        self.assertIn(captured["voucher_id"], again["duplicate_of"])
+
+    def test_delete_deal_reverts_linked_voucher_to_draft(self) -> None:
+        with app.db_connection() as conn:
+            captured = app.capture_expense(conn, file_name="r.png", mime_type="image/png", image_bytes=b"dealvoucher")
+            result = app.create_manual_expense(
+                conn,
+                {
+                    "issue_date": "2026-06-13", "partner_name": "日本橋文具",
+                    "account_item_name": "消耗品費", "amount": 3300, "voucher_id": captured["voucher_id"],
+                },
+            )
+            self.assertTrue(app.voucher_detail(conn, captured["voucher_id"])["registered"])
+            app.delete_deal(conn, result["pseudo_freee_deal_id"])
+            voucher = app.voucher_detail(conn, captured["voucher_id"])
+        # 取引を消しても証憑は残り、「下書き」に戻る。
+        assert voucher is not None
+        self.assertFalse(voucher["registered"])
+        self.assertIsNone(voucher["deal_id"])
 
     def test_render_index_includes_ai_capture_ui(self) -> None:
         html = app.render_index().decode("utf-8")
