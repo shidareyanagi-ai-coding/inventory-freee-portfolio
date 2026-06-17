@@ -63,6 +63,12 @@ class PostgresSmokeTest(unittest.TestCase):
         with db.get_conn() as conn:
             db.reset_domain_tables(conn)
         app.init_db()
+        # A-6: STORAGE_* を退避＆除去＝テストは常にローカル保存（.env に R2 があっても実 R2 に書かない）。
+        self._saved_storage = {
+            k: os.environ.pop(k, None)
+            for k in ("STORAGE_ENDPOINT", "STORAGE_REGION", "STORAGE_BUCKET",
+                      "STORAGE_ACCESS_KEY_ID", "STORAGE_SECRET_ACCESS_KEY")
+        }
         # A-5: 証憑画像の保存先を一時ディレクトリに逃がす（リポジトリにファイルを残さない）。
         self._voucher_tmp = tempfile.TemporaryDirectory()
         self._orig_voucher_dir = app.VOUCHER_DIR
@@ -75,6 +81,9 @@ class PostgresSmokeTest(unittest.TestCase):
     def tearDown(self):
         app.VOUCHER_DIR = self._orig_voucher_dir
         self._voucher_tmp.cleanup()
+        for k, v in self._saved_storage.items():
+            if v is not None:
+                os.environ[k] = v
 
     def _first_product(self, conn):
         return conn.execute(

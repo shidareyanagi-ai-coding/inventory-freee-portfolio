@@ -25,13 +25,17 @@ class _Base(unittest.TestCase):
     """SQLite 一時DB + 証憑画像の一時保存先 + TestClient（スタブ経路）。"""
 
     def setUp(self):
+        # STORAGE_* も退避＆除去＝テストは常にローカル保存（.env に R2 があっても実 R2 に書かない）。
+        _storage_keys = ("STORAGE_ENDPOINT", "STORAGE_REGION", "STORAGE_BUCKET",
+                         "STORAGE_ACCESS_KEY_ID", "STORAGE_SECRET_ACCESS_KEY")
         self._saved = {
             k: os.environ.get(k)
             for k in ("DATABASE_URL", "AUTH_DEV_MODE", "APP_ENV", "ANTHROPIC_API_KEY",
-                      "CLERK_PUBLISHABLE_KEY", "CLERK_JWKS_URL", "CLERK_ISSUER")
+                      "CLERK_PUBLISHABLE_KEY", "CLERK_JWKS_URL", "CLERK_ISSUER", *_storage_keys)
         }
-        for k in ("DATABASE_URL", "ANTHROPIC_API_KEY", "CLERK_PUBLISHABLE_KEY", "CLERK_JWKS_URL", "CLERK_ISSUER"):
-            os.environ.pop(k, None)  # 鍵を外す＝決定的スタブで解析（本物AIを呼ばない）
+        for k in ("DATABASE_URL", "ANTHROPIC_API_KEY", "CLERK_PUBLISHABLE_KEY", "CLERK_JWKS_URL",
+                  "CLERK_ISSUER", *_storage_keys):
+            os.environ.pop(k, None)  # 鍵を外す＝決定的スタブで解析（本物AIを呼ばない）＋ローカル保存固定
         os.environ["APP_ENV"] = "development"
         os.environ["AUTH_DEV_MODE"] = "true"
 

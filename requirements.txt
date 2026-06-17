@@ -41,5 +41,6 @@ anthropic>=0.40              # Claude vision API（画像 → 構造化JSON, out
 #                            未導入/ANTHROPIC_API_KEY 未設定なら ai_capture が決定的スタブに自動フォールバック
 # Pillow>=10.3               # 画像前処理（現状不要: anthropic に base64 を直接渡す）
 
-# --- 証憑画像ストレージ（S3互換 / Cloudflare R2 / Supabase Storage） --------
-# boto3>=1.34
+# --- A-6: 証憑画像ストレージ（S3互換 / Cloudflare R2） -----------------------
+boto3>=1.34                  # storage.py が STORAGE_* 設定時に S3互換(R2)へ put/get/delete
+#                            未設定なら storage.py はローカルフォルダにフォールバック（boto3 不使用）

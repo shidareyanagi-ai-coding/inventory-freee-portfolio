@@ -20,6 +20,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 import ai_capture
 import auth
 import db
+import storage
 from forecasting import synthetic
 from index_html import render_index
 
@@ -45,8 +46,9 @@ except Exception:
 
 APP_DIR = Path(__file__).resolve().parent
 DB_PATH = APP_DIR / "inventory.db"
-# A-5: 証憑の元画像はサーバ側のここに保存し、DBには相対パスのみを持つ（.gitignore 済み）。
-# 本番(A-6)ではオブジェクトストレージ(S3互換/R2)に差し替える前提（EVOLUTION_PLAN.md「画像保存」）。
+# A-5: 証憑の元画像。DBには相対パス(storage_path)のみを持つ。
+# A-6: 実際の置き場所は storage.py が決める。env の STORAGE_* があれば R2 等の
+#   オブジェクトストレージ、無ければこの VOUCHER_DIR（ローカルフォルダ・.gitignore 済み）。
 VOUCHER_DIR = APP_DIR / "voucher_store"
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("INVENTORY_DASHBOARD_PORT", "8000"))
@@ -1185,15 +1187,14 @@ def _safe_filename(name: str) -> str:
 
 
 def store_voucher_image(organization_id: int, file_name: str, data: bytes) -> str:
-    """元画像をサーバ側に保存し、VOUCHER_DIR からの相対パスを返す（DBにはこれだけ持つ）。
+    """元画像を保存し、保存先からの相対パス(key)を返す（DBにはこれだけ持つ）。
 
     保存先は organization 配下に分け、内容ハッシュをファイル名に含めてテナント越えを避ける。
+    実際の置き場所（ローカル / R2 等）は storage.py が env を見て決める（A-6）。
     """
     digest = hashlib.sha256(data).hexdigest()[:16]
     rel = f"{organization_id}/{digest}_{_safe_filename(file_name)}"
-    path = VOUCHER_DIR / rel
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(data)
+    storage.save_bytes(VOUCHER_DIR, rel, data)
     return rel
 
 
@@ -1351,12 +1352,7 @@ def link_voucher_to_source(
 def delete_voucher(conn: db.Connection, organization_id: int, voucher_id: int) -> dict[str, Any]:
     """証憑を削除する（DB行＋保存画像）。別テナント/不存在は 404（IDOR対策）。"""
     row = _voucher_row(conn, organization_id, voucher_id)
-    path = VOUCHER_DIR / row["storage_path"]
-    try:
-        if path.exists():
-            path.unlink()
-    except OSError:
-        pass  # 画像が消せなくても DB 行の削除は進める
+    storage.delete(VOUCHER_DIR, row["storage_path"])  # 画像が消せなくても DB 行の削除は進める
     conn.execute("DELETE FROM vouchers WHERE id = ? AND organization_id = ?", (voucher_id, organization_id))
     return {"ok": True, "deleted_voucher_id": voucher_id}
 
@@ -1364,10 +1360,10 @@ def delete_voucher(conn: db.Connection, organization_id: int, voucher_id: int) -
 def load_voucher_image(conn: db.Connection, organization_id: int, voucher_id: int) -> tuple[bytes, str]:
     """証憑の元画像バイト列と MIME を返す。別テナント/不存在は 404（IDOR対策）。"""
     row = _voucher_row(conn, organization_id, voucher_id)
-    path = VOUCHER_DIR / row["storage_path"]
-    if not path.exists():
+    data = storage.read_bytes(VOUCHER_DIR, row["storage_path"])
+    if data is None:
         raise NotFoundError("voucher image not found")
-    return path.read_bytes(), (row["mime_type"] or "application/octet-stream")
+    return data, (row["mime_type"] or "application/octet-stream")
 
 
 def cancel_inventory_movement(conn: db.Connection, organization_id: int, data: dict[str, Any]) -> dict[str, Any]:
