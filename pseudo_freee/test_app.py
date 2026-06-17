@@ -353,6 +353,19 @@ class PseudoFreeeVoucherTest(unittest.TestCase):
         with app.db_connection() as conn:
             self.assertFalse(app.delete_voucher(conn, 999))
 
+    def test_capture_same_image_twice_flags_duplicate(self) -> None:
+        with app.db_connection() as conn:
+            first = app.capture_expense(conn, file_name="r.png", mime_type="image/png", image_bytes=b"same-image")
+            second = app.capture_expense(conn, file_name="r2.png", mime_type="image/png", image_bytes=b"same-image")
+            other = app.capture_expense(conn, file_name="x.png", mime_type="image/png", image_bytes=b"different")
+
+        # 1回目は重複なし。同じ画像の2回目は重複あり（1回目を指す）。別画像は重複なし。
+        self.assertFalse(first["duplicate"])
+        self.assertEqual(first["duplicate_of"], [])
+        self.assertTrue(second["duplicate"])
+        self.assertIn(first["voucher_id"], second["duplicate_of"])
+        self.assertFalse(other["duplicate"])
+
     def test_render_index_includes_ai_capture_ui(self) -> None:
         html = app.render_index().decode("utf-8")
 
@@ -361,11 +374,18 @@ class PseudoFreeeVoucherTest(unittest.TestCase):
         self.assertIn('name="voucher_id"', html)
         self.assertIn('id="voucher-list"', html)
         self.assertIn("/api/expense-capture", html)
-        # 追加UI: 大きいプレビュー・支払方法・支払予定日・取り消しボタン
+        # 追加UI: 大きいプレビュー・支払方法・支払予定日・取り消しボタン・重複警告・右カラム
         self.assertIn('id="receipt-preview-img"', html)
         self.assertIn('id="payment-method"', html)
         self.assertIn('id="due-date-input"', html)
         self.assertIn('id="ai-cancel"', html)
+        self.assertIn('id="ai-dup-warning"', html)
+        self.assertIn('class="right-col"', html)
+        # 下部の並び順: 取引一覧 → 月次推移 → マスタ設定
+        i_deals = html.find("<h2>取引一覧</h2>")
+        i_trend = html.find("<h2>月次推移</h2>")
+        i_master = html.find("<h2>マスタ設定</h2>")
+        self.assertTrue(0 < i_deals < i_trend < i_master)
 
 
 if __name__ == "__main__":

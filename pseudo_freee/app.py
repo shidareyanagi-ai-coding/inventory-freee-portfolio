@@ -115,6 +115,7 @@ CREATE TABLE IF NOT EXISTS pseudo_freee_vouchers (
     file_name TEXT NOT NULL DEFAULT '',
     storage_path TEXT NOT NULL DEFAULT '',
     mime_type TEXT NOT NULL DEFAULT '',
+    content_hash TEXT NOT NULL DEFAULT '',
     ai_extracted_json TEXT NOT NULL DEFAULT '{}',
     user_corrected_json TEXT NOT NULL DEFAULT '',
     confidence REAL NOT NULL DEFAULT 0,
@@ -315,11 +316,15 @@ def ensure_master_schema(conn: sqlite3.Connection) -> None:
 
 
 def ensure_deals_columns(conn: sqlite3.Connection) -> None:
-    """既存DBに後付けした列を補う（payment_method）。データは保持する。"""
+    """既存DBに後付けした列を補う（payment_method / content_hash）。データは保持する。"""
     if table_exists(conn, "pseudo_freee_deals"):
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(pseudo_freee_deals)").fetchall()}
         if "payment_method" not in columns:
             conn.execute("ALTER TABLE pseudo_freee_deals ADD COLUMN payment_method TEXT NOT NULL DEFAULT ''")
+    if table_exists(conn, "pseudo_freee_vouchers"):
+        vcolumns = {row["name"] for row in conn.execute("PRAGMA table_info(pseudo_freee_vouchers)").fetchall()}
+        if "content_hash" not in vcolumns:
+            conn.execute("ALTER TABLE pseudo_freee_vouchers ADD COLUMN content_hash TEXT NOT NULL DEFAULT ''")
 
 
 def default_tax_for_account_item(account_item_name: str) -> str:
@@ -812,19 +817,21 @@ def create_voucher(
     mime_type: str,
     image_bytes: bytes,
     draft: dict[str, Any],
+    content_hash: str = "",
 ) -> int:
     """証憑を保存する（AI下書きのみ。user_corrected_json は空＝未登録のまま）。"""
     storage_path = store_voucher_image(file_name, image_bytes)
     cursor = conn.execute(
         """
         INSERT INTO pseudo_freee_vouchers
-            (file_name, storage_path, mime_type, ai_extracted_json, confidence)
-        VALUES (?, ?, ?, ?, ?)
+            (file_name, storage_path, mime_type, content_hash, ai_extracted_json, confidence)
+        VALUES (?, ?, ?, ?, ?, ?)
         """,
         (
             _safe_filename(file_name),
             storage_path,
             mime_type,
+            content_hash,
             json.dumps(draft, ensure_ascii=False),
             float(draft.get("overall_confidence", 0) or 0),
         ),
@@ -850,8 +857,16 @@ def capture_expense(
         account_items=masters["account_items"],
         tax_categories=masters["tax_categories"],
     )
+    # 重複検知: 同じ画像（内容ハッシュ）の証憑が既にあるか。あれば警告に使う（保存は止めない）。
+    content_hash = hashlib.sha256(image_bytes).hexdigest()
+    duplicate_ids = [
+        row["id"]
+        for row in conn.execute(
+            "SELECT id FROM pseudo_freee_vouchers WHERE content_hash = ? ORDER BY id", (content_hash,)
+        ).fetchall()
+    ]
     voucher_id = create_voucher(
-        conn, file_name=file_name, mime_type=mime_type, image_bytes=image_bytes, draft=draft
+        conn, file_name=file_name, mime_type=mime_type, image_bytes=image_bytes, draft=draft, content_hash=content_hash
     )
     return {
         "ok": True,
@@ -861,6 +876,8 @@ def capture_expense(
         "overall_confidence": draft["overall_confidence"],
         "low_confidence_fields": draft["low_confidence_fields"],
         "source": draft["source"],
+        "duplicate": bool(duplicate_ids),
+        "duplicate_of": duplicate_ids,
     }
 
 
@@ -1472,6 +1489,27 @@ def render_page(title: str, body: str) -> bytes:
       font-weight: 700;
     }}
     .ai-cancel:hover {{ background: #f3f4f6; }}
+    .right-col {{ display: grid; gap: 16px; align-content: start; min-width: 0; }}
+    .ai-dup-warning {{
+      border: 1px solid #f0b4b4;
+      background: #fdecec;
+      color: #b91c1c;
+      border-radius: 8px;
+      padding: 9px 12px;
+      font-size: 13px;
+      font-weight: 700;
+    }}
+    .voucher-toggle {{
+      width: auto;
+      justify-self: start;
+      margin-top: 2px;
+      border-color: var(--line);
+      background: #fff;
+      color: var(--accent);
+      padding: 6px 12px;
+      font-weight: 700;
+    }}
+    .voucher-toggle:hover {{ background: #f0f5ff; }}
     .detail-grid {{
       display: grid;
       grid-template-columns: minmax(0, 1fr) minmax(280px, 420px);
@@ -1683,6 +1721,7 @@ def render_index(filters: dict[str, str] | None = None) -> bytes:
               <input type="file" id="ai-file" accept="image/*" capture="environment" hidden>
             </div>
             <div class="ai-status" id="ai-status"></div>
+            <div class="ai-dup-warning" id="ai-dup-warning" hidden></div>
             <div class="ai-preview" id="ai-preview">
               <img id="ai-preview-img" alt="読み取った画像">
               <div class="ai-status" id="ai-preview-meta"></div>
@@ -1724,51 +1763,21 @@ def render_index(filters: dict[str, str] | None = None) -> bytes:
             <button type="submit">経費を登録</button>
           </form>
         </div>
-        <div class="card receipt-preview-card">
-          <div class="toolbar"><h2>レシートプレビュー</h2><span class="label">フォームと見比べて確認できます</span></div>
-          <div class="receipt-preview" id="receipt-preview">
-            <div class="receipt-preview-empty" id="receipt-preview-empty">読み取ったレシート画像がここに大きく表示されます。<br>左の入力内容と見比べてください。</div>
-            <img id="receipt-preview-img" alt="レシートプレビュー">
+        <div class="right-col">
+          <div class="card receipt-preview-card">
+            <div class="toolbar"><h2>レシートプレビュー</h2><span class="label">フォームと見比べて確認できます</span></div>
+            <div class="receipt-preview" id="receipt-preview">
+              <div class="receipt-preview-empty" id="receipt-preview-empty">読み取ったレシート画像がここに大きく表示されます。<br>左の入力内容と見比べてください。</div>
+              <img id="receipt-preview-img" alt="レシートプレビュー">
+            </div>
           </div>
-        </div>
-      </section>
-      <section>
-        <div class="toolbar"><h2>月次推移</h2></div>
-        <table>
-          <thead><tr><th>月</th><th class="num">売上</th><th class="num">仕入</th><th class="num">経費</th><th class="num">粗利</th><th class="num">件数</th></tr></thead>
-          <tbody>{trend_rows or '<tr><td colspan="6">まだ月次データはありません。</td></tr>'}</tbody>
-        </table>
-      </section>
-      <section class="card">
-        <div class="toolbar">
-          <h2>証憑（レシート）一覧</h2>
-          <span class="label">AIが読み取った画像と下書き。登録すると経費に紐付きます。</span>
-        </div>
-        <div class="voucher-list" id="voucher-list"></div>
-      </section>
-      <section class="card">
-        <div class="toolbar">
-          <h2>マスタ設定</h2>
-          <span class="label">候補数: 取引先 {len(masters["payees"])} / 勘定科目 {len(masters["account_items"])} / 税区分 {len(masters["tax_categories"])}</span>
-        </div>
-        <form method="post" action="/expense-masters">
-          <div class="master-grid">
-            <label>種類
-              <select name="master_type">
-                <option value="payee">取引先</option>
-                <option value="account_item">勘定科目</option>
-              </select>
-            </label>
-            <label>名称<input name="name" required></label>
-            <label>検索キー<input name="search_key" placeholder="例: shi / s / しいれ"></label>
-            <label data-master-tax-field>標準税区分<select name="default_tax_category" disabled>{tax_category_master_options}</select></label>
-            <button type="submit" data-master-submit>追加</button>
+          <div class="card">
+            <div class="toolbar">
+              <h2>証憑（レシート）一覧</h2>
+              <span class="label">読み取った画像と下書き。登録で経費に紐付きます。</span>
+            </div>
+            <div class="voucher-list" id="voucher-list"></div>
           </div>
-        </form>
-        <div class="master-lists">
-          <div><strong>取引先</strong><ul class="master-list">{payee_list}</ul></div>
-          <div><strong>勘定科目 / 標準税区分</strong><ul class="master-list">{account_item_list}</ul></div>
-          <div><strong>税区分（固定候補）</strong><ul class="master-list">{tax_category_list}</ul></div>
         </div>
       </section>
       <section>
@@ -1806,6 +1815,38 @@ def render_index(filters: dict[str, str] | None = None) -> bytes:
           </div>
         </form>
         {table}
+      </section>
+      <section>
+        <div class="toolbar"><h2>月次推移</h2></div>
+        <table>
+          <thead><tr><th>月</th><th class="num">売上</th><th class="num">仕入</th><th class="num">経費</th><th class="num">粗利</th><th class="num">件数</th></tr></thead>
+          <tbody>{trend_rows or '<tr><td colspan="6">まだ月次データはありません。</td></tr>'}</tbody>
+        </table>
+      </section>
+      <section class="card">
+        <div class="toolbar">
+          <h2>マスタ設定</h2>
+          <span class="label">候補数: 取引先 {len(masters["payees"])} / 勘定科目 {len(masters["account_items"])} / 税区分 {len(masters["tax_categories"])}</span>
+        </div>
+        <form method="post" action="/expense-masters">
+          <div class="master-grid">
+            <label>種類
+              <select name="master_type">
+                <option value="payee">取引先</option>
+                <option value="account_item">勘定科目</option>
+              </select>
+            </label>
+            <label>名称<input name="name" required></label>
+            <label>検索キー<input name="search_key" placeholder="例: shi / s / しいれ"></label>
+            <label data-master-tax-field>標準税区分<select name="default_tax_category" disabled>{tax_category_master_options}</select></label>
+            <button type="submit" data-master-submit>追加</button>
+          </div>
+        </form>
+        <div class="master-lists">
+          <div><strong>取引先</strong><ul class="master-list">{payee_list}</ul></div>
+          <div><strong>勘定科目 / 標準税区分</strong><ul class="master-list">{account_item_list}</ul></div>
+          <div><strong>税区分（固定候補）</strong><ul class="master-list">{tax_category_list}</ul></div>
+        </div>
       </section>
       <script>
         function setupCombo(combo) {{
@@ -1924,6 +1965,8 @@ def render_index(filters: dict[str, str] | None = None) -> bytes:
         const voucherList = document.getElementById("voucher-list");
         const receiptPreviewImg = document.getElementById("receipt-preview-img");
         const receiptPreviewEmpty = document.getElementById("receipt-preview-empty");
+        const aiDupWarning = document.getElementById("ai-dup-warning");
+        let voucherExpanded = false;
 
         // 右側の大きなプレビューに画像を表示（フォームと見比べる用）。
         function showReceiptPreview(src) {{
@@ -1964,6 +2007,7 @@ def render_index(filters: dict[str, str] | None = None) -> bytes:
           if (receiptPreviewImg) {{ receiptPreviewImg.style.display = "none"; receiptPreviewImg.removeAttribute("src"); }}
           if (receiptPreviewEmpty) receiptPreviewEmpty.style.display = "";
           setStatus("", false);
+          if (aiDupWarning) aiDupWarning.hidden = true;
           if (aiCancel) aiCancel.hidden = true;
           if (aiFile) aiFile.value = "";  // 同じファイルを選び直せるようにする
           loadVouchers();
@@ -2067,6 +2111,15 @@ def render_index(filters: dict[str, str] | None = None) -> bytes:
             }}
             showReceiptPreview(dataUrl);  // 右の大きなプレビューにも表示。
             if (aiCancel) aiCancel.hidden = false;  // 取り消しボタンを出す。
+            if (aiDupWarning) {{
+              if (result.duplicate) {{
+                const n = (result.duplicate_of || []).length;
+                aiDupWarning.textContent = `⚠️ 重複注意：同じレシート画像がすでに ${{n}}件 あります。二重登録になっていないか確認してください。`;
+                aiDupWarning.hidden = false;
+              }} else {{
+                aiDupWarning.hidden = true;
+              }}
+            }}
             loadVouchers();
           }} catch (err) {{
             setStatus(err.message || "読み取りに失敗しました", true);
@@ -2110,6 +2163,7 @@ def render_index(filters: dict[str, str] | None = None) -> bytes:
           return div.innerHTML;
         }}
 
+        const VOUCHER_COLLAPSE_LIMIT = 3;
         async function loadVouchers() {{
           if (!voucherList) return;
           try {{
@@ -2120,7 +2174,9 @@ def render_index(filters: dict[str, str] | None = None) -> bytes:
               voucherList.innerHTML = '<div class="empty">まだ証憑はありません。上のエリアからレシート画像を読み取ってください。</div>';
               return;
             }}
-            voucherList.innerHTML = vouchers.map(v => {{
+            // 行が多いときは折りたたむ（既定は先頭の数件のみ表示）。
+            const shown = voucherExpanded ? vouchers : vouchers.slice(0, VOUCHER_COLLAPSE_LIMIT);
+            voucherList.innerHTML = shown.map(v => {{
               const pct = Math.round((v.confidence || 0) * 100);
               const status = v.registered
                 ? '<span class="status-pill done">登録済み</span>'
@@ -2144,6 +2200,14 @@ def render_index(filters: dict[str, str] | None = None) -> bytes:
             for (const img of voucherList.querySelectorAll(".voucher-card img")) {{
               img.style.cursor = "zoom-in";
               img.addEventListener("click", () => showReceiptPreview(img.getAttribute("src")));
+            }}
+            if (vouchers.length > VOUCHER_COLLAPSE_LIMIT) {{
+              const toggle = document.createElement("button");
+              toggle.type = "button";
+              toggle.className = "voucher-toggle";
+              toggle.textContent = voucherExpanded ? "折りたたむ" : `すべて表示（${{vouchers.length}}件）`;
+              toggle.addEventListener("click", () => {{ voucherExpanded = !voucherExpanded; loadVouchers(); }});
+              voucherList.appendChild(toggle);
             }}
           }} catch (err) {{
             voucherList.innerHTML = '<div class="empty">証憑一覧の取得に失敗しました。</div>';
