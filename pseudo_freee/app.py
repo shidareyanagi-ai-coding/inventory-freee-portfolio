@@ -1415,6 +1415,34 @@ def render_page(title: str, body: str) -> bytes:
     }}
     .status-pill.done {{ background: #d9f4ef; color: var(--income); }}
     .status-pill.draft {{ background: #fdeccb; color: var(--expense); }}
+    .receipt-preview-card {{ display: flex; flex-direction: column; }}
+    .receipt-preview {{
+      flex: 1;
+      min-height: 420px;
+      max-height: 80vh;
+      display: flex;
+      align-items: flex-start;
+      justify-content: center;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fbfcfe;
+      padding: 8px;
+      overflow: auto;
+    }}
+    .receipt-preview img {{
+      max-width: 100%;
+      height: auto;
+      border-radius: 4px;
+      display: none;
+    }}
+    .receipt-preview-empty {{
+      margin: auto;
+      padding: 24px;
+      color: var(--muted);
+      font-size: 13px;
+      text-align: center;
+      line-height: 1.8;
+    }}
     .detail-grid {{
       display: grid;
       grid-template-columns: minmax(0, 1fr) minmax(280px, 420px);
@@ -1659,13 +1687,20 @@ def render_index(filters: dict[str, str] | None = None) -> bytes:
             <button type="submit">経費を登録</button>
           </form>
         </div>
-        <div>
-          <div class="toolbar"><h2>月次推移</h2></div>
-          <table>
-            <thead><tr><th>月</th><th class="num">売上</th><th class="num">仕入</th><th class="num">経費</th><th class="num">粗利</th><th class="num">件数</th></tr></thead>
-            <tbody>{trend_rows or '<tr><td colspan="6">まだ月次データはありません。</td></tr>'}</tbody>
-          </table>
+        <div class="card receipt-preview-card">
+          <div class="toolbar"><h2>レシートプレビュー</h2><span class="label">フォームと見比べて確認できます</span></div>
+          <div class="receipt-preview" id="receipt-preview">
+            <div class="receipt-preview-empty" id="receipt-preview-empty">読み取ったレシート画像がここに大きく表示されます。<br>左の入力内容と見比べてください。</div>
+            <img id="receipt-preview-img" alt="レシートプレビュー">
+          </div>
         </div>
+      </section>
+      <section>
+        <div class="toolbar"><h2>月次推移</h2></div>
+        <table>
+          <thead><tr><th>月</th><th class="num">売上</th><th class="num">仕入</th><th class="num">経費</th><th class="num">粗利</th><th class="num">件数</th></tr></thead>
+          <tbody>{trend_rows or '<tr><td colspan="6">まだ月次データはありません。</td></tr>'}</tbody>
+        </table>
       </section>
       <section class="card">
         <div class="toolbar">
@@ -1850,6 +1885,16 @@ def render_index(filters: dict[str, str] | None = None) -> bytes:
         const aiPreviewMeta = document.getElementById("ai-preview-meta");
         const voucherIdInput = document.getElementById("voucher-id-input");
         const voucherList = document.getElementById("voucher-list");
+        const receiptPreviewImg = document.getElementById("receipt-preview-img");
+        const receiptPreviewEmpty = document.getElementById("receipt-preview-empty");
+
+        // 右側の大きなプレビューに画像を表示（フォームと見比べる用）。
+        function showReceiptPreview(src) {{
+          if (!receiptPreviewImg || !src) return;
+          receiptPreviewImg.src = src;
+          receiptPreviewImg.style.display = "block";
+          if (receiptPreviewEmpty) receiptPreviewEmpty.style.display = "none";
+        }}
 
         // AIの項目名 → 経費フォームの input/select 名。
         const FIELD_TO_NAME = {{
@@ -1946,6 +1991,7 @@ def render_index(filters: dict[str, str] | None = None) -> bytes:
                 aiPreviewMeta.textContent = `${{result.draft.partner_name || "(支払先不明)"}} / ¥${{amountText}}`;
               }}
             }}
+            showReceiptPreview(dataUrl);  // 右の大きなプレビューにも表示。
             loadVouchers();
           }} catch (err) {{
             setStatus(err.message || "読み取りに失敗しました", true);
@@ -2018,6 +2064,11 @@ def render_index(filters: dict[str, str] | None = None) -> bytes:
             }}).join("");
             for (const button of voucherList.querySelectorAll(".voucher-del")) {{
               button.addEventListener("click", () => deleteVoucher(button.dataset.voucherId));
+            }}
+            // 一覧の画像をクリックすると、右の大きなプレビューに表示（過去の証憑も見比べられる）。
+            for (const img of voucherList.querySelectorAll(".voucher-card img")) {{
+              img.style.cursor = "zoom-in";
+              img.addEventListener("click", () => showReceiptPreview(img.getAttribute("src")));
             }}
           }} catch (err) {{
             voucherList.innerHTML = '<div class="empty">証憑一覧の取得に失敗しました。</div>';
