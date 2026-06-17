@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import hashlib
 import html
 import json
 import sqlite3
@@ -11,9 +13,23 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+import ai_capture
+
+try:
+    # .env があれば ANTHROPIC_API_KEY 等を読み込む（無ければ何もしない）。
+    # python-dotenv 未導入でも疑似freee は stdlib で動く（AI はお試しモードになる）。
+    from dotenv import load_dotenv
+
+    load_dotenv()
+except Exception:
+    pass
+
 
 APP_DIR = Path(__file__).resolve().parent
 DB_PATH = APP_DIR / "pseudo_freee.db"
+# A-5 ステップ2: 証憑（レシート）の元画像はサーバ側のここに保存し、DBにはパスのみを持つ（.gitignore 済み）。
+# 本番(A-6)ではオブジェクトストレージ(S3互換/R2)に差し替える前提（EVOLUTION_PLAN.md「画像保存」）。
+VOUCHER_DIR = APP_DIR / "voucher_store"
 HOST = "127.0.0.1"
 PORT = 8010
 
@@ -88,6 +104,26 @@ CREATE TABLE IF NOT EXISTS pseudo_freee_tax_categories (
 );
 """
 
+# A-5 ステップ2: 証憑（レシート画像 + AI下書き + 人の確定内容）。
+# AIは下書き(ai_extracted_json)まで。人が登録すると deal_id と user_corrected_json が入る（=取込済み）。
+# 元画像は storage_path（サーバ側ファイル）に置き、DBにはパスのみ（EVOLUTION_PLAN.md「画像保存」）。
+VOUCHERS_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS pseudo_freee_vouchers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    deal_id INTEGER REFERENCES pseudo_freee_deals(id),
+    file_name TEXT NOT NULL DEFAULT '',
+    storage_path TEXT NOT NULL DEFAULT '',
+    mime_type TEXT NOT NULL DEFAULT '',
+    ai_extracted_json TEXT NOT NULL DEFAULT '{}',
+    user_corrected_json TEXT NOT NULL DEFAULT '',
+    confidence REAL NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_pseudo_freee_vouchers_created_at
+ON pseudo_freee_vouchers(created_at);
+"""
+
 SCHEMA_SQL = f"""
 PRAGMA foreign_keys = ON;
 
@@ -98,6 +134,8 @@ PRAGMA foreign_keys = ON;
 {INDEX_SQL}
 
 {MASTER_SQL}
+
+{VOUCHERS_TABLE_SQL}
 """
 
 DEFAULT_PAYEES = [
@@ -717,7 +755,197 @@ def create_manual_expense(conn: sqlite3.Connection, data: dict[str, Any]) -> dic
         (deal_id, "", description, 1, amount, tax_rate, tax_category, amount, account_item_name),
     )
     remember_expense_masters(conn, partner_name, account_item_name, tax_category)
+    # 請求書/レシートから取り込んで登録した場合、その証憑(voucher_id)を経費伝票に紐付ける。
+    _maybe_link_voucher(conn, data, deal_id)
     return {"ok": True, "pseudo_freee_deal_id": deal_id}
+
+
+# ---------------------------------------------------------------------------
+# AI証憑入力（A-5 ステップ2: レシート画像 → AI下書き → 人が登録）
+# ---------------------------------------------------------------------------
+# 鉄則（EVOLUTION_PLAN.md）: AIは画像→下書き(ai_extracted_json)まで。
+# 「登録」は人が経費フォームで行い、user_corrected_json と deal_id を残す（自動登録はしない）。
+# 解析(ai_capture)は副作用なし。DB書き込みはこの app.py が単一の主体。
+
+
+def _safe_filename(name: str) -> str:
+    """元ファイル名を保存用に無害化（パス区切りを除去。空なら voucher）。"""
+    base = Path(str(name or "")).name.strip().replace("\\", "").replace("/", "")
+    return base or "voucher"
+
+
+def store_voucher_image(file_name: str, data: bytes) -> str:
+    """元画像をサーバ側に保存し、VOUCHER_DIR からの相対パスを返す（DBにはこれだけ持つ）。
+
+    内容ハッシュをファイル名に含めて重複保存を避ける。
+    """
+    digest = hashlib.sha256(data).hexdigest()[:16]
+    rel = f"{digest}_{_safe_filename(file_name)}"
+    path = VOUCHER_DIR / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(data)
+    return rel
+
+
+def create_voucher(
+    conn: sqlite3.Connection,
+    *,
+    file_name: str,
+    mime_type: str,
+    image_bytes: bytes,
+    draft: dict[str, Any],
+) -> int:
+    """証憑を保存する（AI下書きのみ。user_corrected_json は空＝未登録のまま）。"""
+    storage_path = store_voucher_image(file_name, image_bytes)
+    cursor = conn.execute(
+        """
+        INSERT INTO pseudo_freee_vouchers
+            (file_name, storage_path, mime_type, ai_extracted_json, confidence)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (
+            _safe_filename(file_name),
+            storage_path,
+            mime_type,
+            json.dumps(draft, ensure_ascii=False),
+            float(draft.get("overall_confidence", 0) or 0),
+        ),
+    )
+    return int(cursor.lastrowid)
+
+
+def capture_expense(
+    conn: sqlite3.Connection,
+    *,
+    file_name: str,
+    mime_type: str,
+    image_bytes: bytes,
+) -> dict[str, Any]:
+    """レシート画像 → AI下書き（登録しない）。画像と抽出結果を証憑として保存する。
+
+    勘定科目・税区分は疑似freee のマスタ候補から選ばせる。
+    """
+    masters = list_expense_masters(conn)
+    draft = ai_capture.analyze_voucher(
+        image_bytes,
+        mime_type,
+        account_items=masters["account_items"],
+        tax_categories=masters["tax_categories"],
+    )
+    voucher_id = create_voucher(
+        conn, file_name=file_name, mime_type=mime_type, image_bytes=image_bytes, draft=draft
+    )
+    return {
+        "ok": True,
+        "voucher_id": voucher_id,
+        "draft": draft["fields"],
+        "confidence": draft["confidence"],
+        "overall_confidence": draft["overall_confidence"],
+        "low_confidence_fields": draft["low_confidence_fields"],
+        "source": draft["source"],
+    }
+
+
+def _voucher_row(conn: sqlite3.Connection, voucher_id: int) -> dict[str, Any] | None:
+    row = conn.execute(
+        "SELECT * FROM pseudo_freee_vouchers WHERE id = ?", (voucher_id,)
+    ).fetchone()
+    return row_to_dict(row) if row else None
+
+
+def _voucher_to_dict(row: dict[str, Any]) -> dict[str, Any]:
+    ai = json.loads(row["ai_extracted_json"] or "{}")
+    corrected = json.loads(row["user_corrected_json"]) if row["user_corrected_json"] else None
+    fields = ai.get("fields", {})
+    return {
+        "id": row["id"],
+        "deal_id": row["deal_id"],
+        "file_name": row["file_name"],
+        "mime_type": row["mime_type"],
+        "confidence": row["confidence"],
+        "partner_name": fields.get("partner_name", ""),
+        "amount": float(fields.get("amount") or 0),
+        "account_item": fields.get("account_item", ""),
+        "issue_date": fields.get("issue_date", ""),
+        # deal_id が入る（人が登録した）と user_corrected_json も入る＝「取込済み」。
+        "registered": corrected is not None,
+        "created_at": row["created_at"],
+        "ai_extracted": ai,
+        "user_corrected": corrected,
+        "low_confidence_fields": ai.get("low_confidence_fields", []),
+        "image_url": f"/api/vouchers/{row['id']}/image",
+    }
+
+
+def list_vouchers(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        "SELECT * FROM pseudo_freee_vouchers ORDER BY id DESC"
+    ).fetchall()
+    return [_voucher_to_dict(row_to_dict(row)) for row in rows]
+
+
+def voucher_detail(conn: sqlite3.Connection, voucher_id: int) -> dict[str, Any] | None:
+    row = _voucher_row(conn, voucher_id)
+    return _voucher_to_dict(row) if row else None
+
+
+def link_voucher_to_deal(
+    conn: sqlite3.Connection,
+    voucher_id: int,
+    deal_id: int,
+    registered_fields: dict[str, Any] | None = None,
+) -> None:
+    """人が登録した経費伝票に証憑を紐付ける（取込済みの印＝deal_id + user_corrected_json）。"""
+    row = _voucher_row(conn, voucher_id)
+    if not row:
+        return  # 存在しない voucher_id は黙ってスキップ（登録自体は成立させる）。
+    payload = {"deal_id": deal_id, "fields": registered_fields or {}}
+    conn.execute(
+        "UPDATE pseudo_freee_vouchers SET deal_id = ?, user_corrected_json = ? WHERE id = ?",
+        (deal_id, json.dumps(payload, ensure_ascii=False), voucher_id),
+    )
+
+
+def _maybe_link_voucher(conn: sqlite3.Connection, data: dict[str, Any], deal_id: int) -> None:
+    raw = data.get("voucher_id")
+    if not raw:
+        return
+    try:
+        voucher_id = int(raw)
+    except (TypeError, ValueError):
+        return
+    link_voucher_to_deal(
+        conn,
+        voucher_id,
+        deal_id,
+        {k: data.get(k) for k in ("issue_date", "partner_name", "account_item_name", "tax_category", "amount", "memo")},
+    )
+
+
+def delete_voucher(conn: sqlite3.Connection, voucher_id: int) -> bool:
+    """証憑を削除する（DB行＋保存画像）。存在しなければ False。"""
+    row = _voucher_row(conn, voucher_id)
+    if not row:
+        return False
+    path = VOUCHER_DIR / row["storage_path"]
+    try:
+        if path.exists():
+            path.unlink()
+    except OSError:
+        pass  # 画像が消せなくても DB 行の削除は進める
+    conn.execute("DELETE FROM pseudo_freee_vouchers WHERE id = ?", (voucher_id,))
+    return True
+
+
+def load_voucher_image(conn: sqlite3.Connection, voucher_id: int) -> tuple[bytes, str] | None:
+    """証憑の元画像バイト列と MIME を返す。無ければ None。"""
+    row = _voucher_row(conn, voucher_id)
+    if not row:
+        return None
+    path = VOUCHER_DIR / row["storage_path"]
+    if not path.exists():
+        return None
+    return path.read_bytes(), (row["mime_type"] or "application/octet-stream")
 
 
 def deal_filters_from_query(query: str) -> dict[str, str]:
@@ -1126,6 +1354,67 @@ def render_page(title: str, body: str) -> bytes:
       padding: 26px;
       text-align: center;
     }}
+    .ai-capture {{
+      display: grid;
+      gap: 8px;
+      margin-bottom: 12px;
+      padding: 12px;
+      border: 1px solid #c7d7ff;
+      border-radius: 8px;
+      background: #f5f8ff;
+    }}
+    .ai-capture h3 {{ margin: 0; font-size: 14px; color: #24438f; }}
+    .dropzone {{
+      border: 2px dashed #9bb4f0;
+      border-radius: 8px;
+      padding: 16px;
+      text-align: center;
+      color: var(--muted);
+      font-size: 13px;
+      cursor: pointer;
+      background: #fff;
+    }}
+    .dropzone.dragover {{ background: #eaf0ff; border-color: var(--accent); color: var(--accent); }}
+    .ai-status {{ font-size: 13px; color: var(--muted); min-height: 18px; }}
+    .ai-status.error {{ color: #b91c1c; }}
+    .ai-preview {{ display: none; gap: 10px; align-items: center; }}
+    .ai-preview img {{ width: 72px; height: 72px; object-fit: cover; border-radius: 6px; border: 1px solid var(--line); }}
+    label.low-confidence {{ color: var(--expense); }}
+    label.low-confidence input,
+    label.low-confidence select,
+    label.low-confidence textarea {{ border-color: var(--expense); background: #fff8ee; }}
+    .low-flag {{ color: var(--expense); font-weight: 700; font-size: 11px; }}
+    .voucher-list {{ display: grid; gap: 10px; margin-top: 12px; }}
+    .voucher-card {{
+      display: grid;
+      grid-template-columns: 72px minmax(0, 1fr) auto;
+      gap: 12px;
+      align-items: center;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 10px 12px;
+      background: var(--surface);
+    }}
+    .voucher-card img {{ width: 72px; height: 72px; object-fit: cover; border-radius: 6px; border: 1px solid var(--line); }}
+    .voucher-meta {{ font-size: 13px; color: var(--text); min-width: 0; }}
+    .voucher-meta .muted {{ color: var(--muted); font-size: 12px; }}
+    .voucher-del {{
+      width: auto;
+      border-color: #e2b4b4;
+      background: #fff;
+      color: #b91c1c;
+      padding: 6px 12px;
+      font-weight: 700;
+    }}
+    .status-pill {{
+      display: inline-block;
+      border-radius: 999px;
+      padding: 1px 8px;
+      font-size: 11px;
+      font-weight: 700;
+    }}
+    .status-pill.done {{ background: #d9f4ef; color: var(--income); }}
+    .status-pill.draft {{ background: #fdeccb; color: var(--expense); }}
     .detail-grid {{
       display: grid;
       grid-template-columns: minmax(0, 1fr) minmax(280px, 420px);
@@ -1330,7 +1619,20 @@ def render_index(filters: dict[str, str] | None = None) -> bytes:
       <section class="panel-grid">
         <div class="card">
           <h2>経費入力</h2>
+          <div class="ai-capture">
+            <h3>📷 レシートをAIで読み取る</h3>
+            <div class="dropzone" id="ai-dropzone" tabindex="0">
+              画像を選択 / カメラで撮影 / ここにドラッグ＆ドロップ / 貼り付け(Ctrl+V)
+              <input type="file" id="ai-file" accept="image/*" capture="environment" hidden>
+            </div>
+            <div class="ai-status" id="ai-status"></div>
+            <div class="ai-preview" id="ai-preview">
+              <img id="ai-preview-img" alt="読み取った画像">
+              <div class="ai-status" id="ai-preview-meta"></div>
+            </div>
+          </div>
           <form class="expense-form" method="post" action="/manual-expenses">
+            <input type="hidden" name="voucher_id" id="voucher-id-input" value="">
             <div class="form-grid">
               <label>発生日<input type="date" name="issue_date" value="{datetime.now().strftime("%Y-%m-%d")}" required></label>
               <label>支払予定日<input type="date" name="due_date" value="{datetime.now().strftime("%Y-%m-%d")}"></label>
@@ -1364,6 +1666,13 @@ def render_index(filters: dict[str, str] | None = None) -> bytes:
             <tbody>{trend_rows or '<tr><td colspan="6">まだ月次データはありません。</td></tr>'}</tbody>
           </table>
         </div>
+      </section>
+      <section class="card">
+        <div class="toolbar">
+          <h2>証憑（レシート）一覧</h2>
+          <span class="label">AIが読み取った画像と下書き。登録すると経費に紐付きます。</span>
+        </div>
+        <div class="voucher-list" id="voucher-list"></div>
       </section>
       <section class="card">
         <div class="toolbar">
@@ -1531,6 +1840,204 @@ def render_index(filters: dict[str, str] | None = None) -> bytes:
             if (defaultTax) taxSelect.value = defaultTax;
           }});
         }}
+
+        // --- A-5 ステップ2: レシートのAI読み取り（写真→下書き→人が登録） ---
+        const aiDropzone = document.getElementById("ai-dropzone");
+        const aiFile = document.getElementById("ai-file");
+        const aiStatus = document.getElementById("ai-status");
+        const aiPreview = document.getElementById("ai-preview");
+        const aiPreviewImg = document.getElementById("ai-preview-img");
+        const aiPreviewMeta = document.getElementById("ai-preview-meta");
+        const voucherIdInput = document.getElementById("voucher-id-input");
+        const voucherList = document.getElementById("voucher-list");
+
+        // AIの項目名 → 経費フォームの input/select 名。
+        const FIELD_TO_NAME = {{
+          issue_date: "issue_date",
+          partner_name: "partner_name",
+          amount: "amount",
+          tax_category: "tax_category",
+          account_item: "account_item_name",
+          memo: "memo",
+        }};
+
+        function setStatus(message, isError) {{
+          if (!aiStatus) return;
+          aiStatus.textContent = message;
+          aiStatus.classList.toggle("error", !!isError);
+        }}
+
+        function fieldElement(formName) {{
+          return document.querySelector(`.expense-form [name="${{formName}}"]`);
+        }}
+
+        function clearLowFlags() {{
+          for (const label of document.querySelectorAll("label.low-confidence")) {{
+            label.classList.remove("low-confidence");
+          }}
+          for (const flag of document.querySelectorAll(".low-flag")) flag.remove();
+        }}
+
+        function fillForm(draft, lowFields) {{
+          clearLowFlags();
+          for (const [aiName, formName] of Object.entries(FIELD_TO_NAME)) {{
+            const el = fieldElement(formName);
+            if (!el) continue;
+            let value = draft[aiName];
+            if (aiName === "amount") value = Math.round(Number(value) || 0);
+            el.value = value == null ? "" : value;
+            el.dispatchEvent(new Event("change", {{ bubbles: true }}));
+          }}
+          // 税区分はAIの値で上書き（勘定科目changeで既定税区分が入るため最後に設定）。
+          const taxEl = fieldElement("tax_category");
+          if (taxEl && draft.tax_category) taxEl.value = draft.tax_category;
+          // 低信頼度の項目を色付け＋「要確認」表示（人の確認を促す）。
+          for (const aiName of (lowFields || [])) {{
+            const el = fieldElement(FIELD_TO_NAME[aiName]);
+            if (!el) continue;
+            const label = el.closest("label");
+            if (!label) continue;
+            label.classList.add("low-confidence");
+            const flag = document.createElement("span");
+            flag.className = "low-flag";
+            flag.textContent = " 要確認";
+            label.appendChild(flag);
+          }}
+        }}
+
+        async function captureImage(file) {{
+          if (!file) return;
+          setStatus("AIが読み取り中…", false);
+          let dataUrl;
+          try {{
+            dataUrl = await new Promise((resolve, reject) => {{
+              const reader = new FileReader();
+              reader.onload = () => resolve(String(reader.result));
+              reader.onerror = () => reject(reader.error);
+              reader.readAsDataURL(file);
+            }});
+          }} catch (err) {{
+            setStatus("画像の読み込みに失敗しました", true);
+            return;
+          }}
+          const base64 = dataUrl.includes(",") ? dataUrl.split(",")[1] : dataUrl;
+          try {{
+            const res = await fetch("/api/expense-capture", {{
+              method: "POST",
+              headers: {{ "Content-Type": "application/json" }},
+              body: JSON.stringify({{
+                file_name: file.name || "receipt",
+                mime_type: file.type || "image/jpeg",
+                image_base64: base64,
+              }}),
+            }});
+            const result = await res.json();
+            if (!res.ok || !result.ok) throw new Error(result.error || "読み取りに失敗しました");
+            fillForm(result.draft, result.low_confidence_fields);
+            if (voucherIdInput) voucherIdInput.value = result.voucher_id;
+            const pct = Math.round((result.overall_confidence || 0) * 100);
+            const sourceLabel = result.source === "anthropic" ? "Claude" : "お試しモード";
+            setStatus(`読み取り完了（${{sourceLabel}}・全体信頼度 ${{pct}}%）。内容を確認して「経費を登録」を押してください。`, false);
+            if (aiPreview) {{
+              aiPreview.style.display = "flex";
+              if (aiPreviewImg) aiPreviewImg.src = dataUrl;
+              if (aiPreviewMeta) {{
+                const amountText = Math.round(Number(result.draft.amount) || 0).toLocaleString();
+                aiPreviewMeta.textContent = `${{result.draft.partner_name || "(支払先不明)"}} / ¥${{amountText}}`;
+              }}
+            }}
+            loadVouchers();
+          }} catch (err) {{
+            setStatus(err.message || "読み取りに失敗しました", true);
+          }}
+        }}
+
+        if (aiDropzone && aiFile) {{
+          aiDropzone.addEventListener("click", () => aiFile.click());
+          aiDropzone.addEventListener("keydown", event => {{
+            if (event.key === "Enter" || event.key === " ") {{ event.preventDefault(); aiFile.click(); }}
+          }});
+          aiFile.addEventListener("change", () => {{
+            if (aiFile.files && aiFile.files[0]) captureImage(aiFile.files[0]);
+          }});
+          aiDropzone.addEventListener("dragover", event => {{
+            event.preventDefault();
+            aiDropzone.classList.add("dragover");
+          }});
+          aiDropzone.addEventListener("dragleave", () => aiDropzone.classList.remove("dragover"));
+          aiDropzone.addEventListener("drop", event => {{
+            event.preventDefault();
+            aiDropzone.classList.remove("dragover");
+            const file = event.dataTransfer && event.dataTransfer.files[0];
+            if (file) captureImage(file);
+          }});
+          window.addEventListener("paste", event => {{
+            const items = event.clipboardData && event.clipboardData.items;
+            if (!items) return;
+            for (const item of items) {{
+              if (item.type && item.type.startsWith("image/")) {{
+                const file = item.getAsFile();
+                if (file) {{ captureImage(file); break; }}
+              }}
+            }}
+          }});
+        }}
+
+        function escapeHtml(text) {{
+          const div = document.createElement("div");
+          div.textContent = text == null ? "" : String(text);
+          return div.innerHTML;
+        }}
+
+        async function loadVouchers() {{
+          if (!voucherList) return;
+          try {{
+            const res = await fetch("/api/vouchers");
+            const result = await res.json();
+            const vouchers = (result && result.vouchers) || [];
+            if (!vouchers.length) {{
+              voucherList.innerHTML = '<div class="empty">まだ証憑はありません。上のエリアからレシート画像を読み取ってください。</div>';
+              return;
+            }}
+            voucherList.innerHTML = vouchers.map(v => {{
+              const pct = Math.round((v.confidence || 0) * 100);
+              const status = v.registered
+                ? '<span class="status-pill done">登録済み</span>'
+                : '<span class="status-pill draft">下書き</span>';
+              const amount = "¥" + (Math.round(Number(v.amount) || 0)).toLocaleString();
+              const link = v.deal_id ? ` / <a href="/deals/${{v.deal_id}}">取引 #${{v.deal_id}}</a>` : "";
+              return `
+                <div class="voucher-card">
+                  <img src="${{v.image_url}}" alt="証憑">
+                  <div class="voucher-meta">
+                    <div>${{escapeHtml(v.partner_name || "(支払先不明)")}} ・ ${{amount}} ${{status}}</div>
+                    <div class="muted">${{escapeHtml(v.account_item || "")}} ${{escapeHtml(v.issue_date || "")}} ・ 信頼度 ${{pct}}%${{link}}</div>
+                  </div>
+                  <button type="button" class="voucher-del" data-voucher-id="${{v.id}}">削除</button>
+                </div>`;
+            }}).join("");
+            for (const button of voucherList.querySelectorAll(".voucher-del")) {{
+              button.addEventListener("click", () => deleteVoucher(button.dataset.voucherId));
+            }}
+          }} catch (err) {{
+            voucherList.innerHTML = '<div class="empty">証憑一覧の取得に失敗しました。</div>';
+          }}
+        }}
+
+        async function deleteVoucher(id) {{
+          if (!id) return;
+          if (!window.confirm("この証憑を削除しますか？")) return;
+          try {{
+            const res = await fetch(`/api/vouchers/${{id}}`, {{ method: "DELETE" }});
+            const result = await res.json();
+            if (!res.ok || !result.ok) throw new Error(result.error || "削除に失敗しました");
+            loadVouchers();
+          }} catch (err) {{
+            window.alert(err.message || "削除に失敗しました");
+          }}
+        }}
+
+        loadVouchers();
       </script>
     """
     return render_page("疑似freee会計ダッシュボード", body)
@@ -1634,6 +2141,14 @@ class PseudoFreeeHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def respond_bytes(self, body: bytes, media_type: str, status: HTTPStatus = HTTPStatus.OK) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", media_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_cors_headers()
+        self.end_headers()
+        self.wfile.write(body)
+
     def redirect(self, location: str) -> None:
         self.send_response(HTTPStatus.SEE_OTHER)
         self.send_header("Location", location)
@@ -1668,6 +2183,25 @@ class PseudoFreeeHandler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/expense-masters":
                 with db_connection() as conn:
                     self.respond_json({"ok": True, **list_expense_masters(conn)})
+            elif parsed.path == "/api/vouchers":
+                with db_connection() as conn:
+                    self.respond_json({"ok": True, "vouchers": list_vouchers(conn)})
+            elif parsed.path.endswith("/image") and parsed.path.startswith("/api/vouchers/"):
+                voucher_id = to_int(parsed.path.removeprefix("/api/vouchers/").removesuffix("/image"), "voucher_id")
+                with db_connection() as conn:
+                    image = load_voucher_image(conn, voucher_id)
+                if image is None:
+                    self.respond_json({"ok": False, "error": "voucher image not found"}, HTTPStatus.NOT_FOUND)
+                else:
+                    self.respond_bytes(image[0], image[1])
+            elif parsed.path.startswith("/api/vouchers/"):
+                voucher_id = to_int(parsed.path.removeprefix("/api/vouchers/"), "voucher_id")
+                with db_connection() as conn:
+                    voucher = voucher_detail(conn, voucher_id)
+                if not voucher:
+                    self.respond_json({"ok": False, "error": "voucher not found"}, HTTPStatus.NOT_FOUND)
+                else:
+                    self.respond_json({"ok": True, "voucher": voucher})
             elif parsed.path.startswith("/api/deals/"):
                 deal_id = to_int(parsed.path.removeprefix("/api/deals/"), "deal_id")
                 with db_connection() as conn:
@@ -1705,6 +2239,26 @@ class PseudoFreeeHandler(BaseHTTPRequestHandler):
                 with db_connection() as conn:
                     result = create_manual_expense(conn, data)
                 self.respond_json(result, HTTPStatus.CREATED)
+            elif parsed.path == "/api/expense-capture":
+                # レシート画像(base64) → AI下書き → 証憑保存。**登録はしない**（登録は人が経費フォームで行う）。
+                data = parse_json_body(self)
+                image_base64 = str(data.get("image_base64", "") or "")
+                if not image_base64:
+                    raise ValueError("image_base64 is required")
+                try:
+                    image_bytes = base64.b64decode(image_base64, validate=False)
+                except Exception as exc:  # noqa: BLE001 - 不正な base64
+                    raise ValueError("invalid image_base64") from exc
+                if not image_bytes:
+                    raise ValueError("画像がありません。")
+                with db_connection() as conn:
+                    result = capture_expense(
+                        conn,
+                        file_name=str(data.get("file_name", "") or ""),
+                        mime_type=str(data.get("mime_type", "") or ""),
+                        image_bytes=image_bytes,
+                    )
+                self.respond_json(result, HTTPStatus.CREATED)
             elif parsed.path == "/api/expense-masters":
                 data = parse_json_body(self)
                 with db_connection() as conn:
@@ -1720,6 +2274,22 @@ class PseudoFreeeHandler(BaseHTTPRequestHandler):
                 with db_connection() as conn:
                     create_expense_master(conn, data)
                 self.redirect("/")
+            else:
+                self.respond_json({"ok": False, "error": "not found"}, HTTPStatus.NOT_FOUND)
+        except ValueError as exc:
+            self.respond_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
+
+    def do_DELETE(self) -> None:
+        parsed = urlparse(self.path)
+        try:
+            if parsed.path.startswith("/api/vouchers/"):
+                voucher_id = to_int(parsed.path.removeprefix("/api/vouchers/"), "voucher_id")
+                with db_connection() as conn:
+                    deleted = delete_voucher(conn, voucher_id)
+                if not deleted:
+                    self.respond_json({"ok": False, "error": "voucher not found"}, HTTPStatus.NOT_FOUND)
+                else:
+                    self.respond_json({"ok": True, "deleted_voucher_id": voucher_id})
             else:
                 self.respond_json({"ok": False, "error": "not found"}, HTTPStatus.NOT_FOUND)
         except ValueError as exc:

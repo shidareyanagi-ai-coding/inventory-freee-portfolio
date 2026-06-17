@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -227,6 +228,113 @@ class PseudoFreeeAppTest(unittest.TestCase):
 
         self.assertEqual(len(deals), 1)
         self.assertEqual(deals[0]["source_type"], "manual_expense")
+
+
+class PseudoFreeeVoucherTest(unittest.TestCase):
+    """A-5 ステップ2: レシートのAI読み取り（写真→下書き→人が登録）。"""
+
+    def setUp(self) -> None:
+        # 鍵を外す＝決定的スタブで解析（本物AIを呼ばない・課金しない）。在庫側テストと同じ方針。
+        self._saved_api_key = os.environ.get("ANTHROPIC_API_KEY")
+        os.environ.pop("ANTHROPIC_API_KEY", None)
+
+        self.tmp = tempfile.TemporaryDirectory()
+        self.original_db_path = app.DB_PATH
+        self.original_voucher_dir = app.VOUCHER_DIR
+        app.DB_PATH = Path(self.tmp.name) / "pseudo_freee_test.db"
+        app.VOUCHER_DIR = Path(self.tmp.name) / "voucher_store"
+        app.init_db()
+
+    def tearDown(self) -> None:
+        app.DB_PATH = self.original_db_path
+        app.VOUCHER_DIR = self.original_voucher_dir
+        self.tmp.cleanup()
+        if self._saved_api_key is not None:
+            os.environ["ANTHROPIC_API_KEY"] = self._saved_api_key
+
+    def test_capture_expense_returns_draft_and_saves_voucher_without_registering(self) -> None:
+        with app.db_connection() as conn:
+            result = app.capture_expense(
+                conn, file_name="receipt.png", mime_type="image/png", image_bytes=b"demo-1"
+            )
+            vouchers = app.list_vouchers(conn)
+            deals = app.list_deals(conn)
+
+        self.assertTrue(result["ok"])
+        # 鍵が無ければ決定的スタブ（お試しモード）。
+        self.assertEqual(result["source"], "stub")
+        self.assertIn("partner_name", result["draft"])
+        self.assertIn("amount", result["draft"])
+        self.assertGreater(result["voucher_id"], 0)
+        # 証憑は保存されるが、未登録（登録は人）。
+        self.assertEqual(len(vouchers), 1)
+        self.assertFalse(vouchers[0]["registered"])
+        self.assertIsNone(vouchers[0]["deal_id"])
+        # 鉄則: AIは自動登録しない（取引は作られない）。
+        self.assertEqual(len(deals), 0)
+
+    def test_capture_expense_writes_original_image(self) -> None:
+        with app.db_connection() as conn:
+            captured = app.capture_expense(
+                conn, file_name="r.png", mime_type="image/png", image_bytes=b"demo-2"
+            )
+            image = app.load_voucher_image(conn, captured["voucher_id"])
+
+        self.assertIsNotNone(image)
+        assert image is not None
+        self.assertEqual(image[0], b"demo-2")
+        self.assertEqual(image[1], "image/png")
+
+    def test_manual_expense_with_voucher_id_links_voucher(self) -> None:
+        with app.db_connection() as conn:
+            captured = app.capture_expense(
+                conn, file_name="r.png", mime_type="image/png", image_bytes=b"demo-3"
+            )
+            result = app.create_manual_expense(
+                conn,
+                {
+                    "issue_date": "2026-06-13",
+                    "partner_name": "日本橋文具",
+                    "account_item_name": "消耗品費",
+                    "tax_category": "課税仕入 10%",
+                    "amount": 3300,
+                    "voucher_id": captured["voucher_id"],
+                },
+            )
+            voucher = app.voucher_detail(conn, captured["voucher_id"])
+
+        assert voucher is not None
+        self.assertTrue(voucher["registered"])
+        self.assertEqual(voucher["deal_id"], result["pseudo_freee_deal_id"])
+
+    def test_delete_voucher_removes_row_and_image(self) -> None:
+        with app.db_connection() as conn:
+            captured = app.capture_expense(
+                conn, file_name="r.png", mime_type="image/png", image_bytes=b"demo-4"
+            )
+            row = app._voucher_row(conn, captured["voucher_id"])
+            assert row is not None
+            path = app.VOUCHER_DIR / row["storage_path"]
+            self.assertTrue(path.exists())
+            deleted = app.delete_voucher(conn, captured["voucher_id"])
+            remaining = app.list_vouchers(conn)
+
+        self.assertTrue(deleted)
+        self.assertEqual(len(remaining), 0)
+        self.assertFalse(path.exists())
+
+    def test_delete_missing_voucher_returns_false(self) -> None:
+        with app.db_connection() as conn:
+            self.assertFalse(app.delete_voucher(conn, 999))
+
+    def test_render_index_includes_ai_capture_ui(self) -> None:
+        html = app.render_index().decode("utf-8")
+
+        self.assertIn("レシートをAIで読み取る", html)
+        self.assertIn('id="ai-dropzone"', html)
+        self.assertIn('name="voucher_id"', html)
+        self.assertIn('id="voucher-list"', html)
+        self.assertIn("/api/expense-capture", html)
 
 
 if __name__ == "__main__":
