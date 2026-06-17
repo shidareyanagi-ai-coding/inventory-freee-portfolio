@@ -105,6 +105,32 @@ class PseudoFreeeAppTest(unittest.TestCase):
         self.assertIn("pseudo_freee_manual_expense", deal["payload_json"])
         self.assertEqual(len(deals), 1)
 
+    def test_payment_method_controls_due_date(self) -> None:
+        base = {"issue_date": "2026-06-13", "partner_name": "日本橋文具", "account_item_name": "消耗品費"}
+        with app.db_connection() as conn:
+            r1 = app.create_manual_expense(conn, {**base, "amount": 3300, "payment_method": "未払金", "due_date": "2026-06-30"})
+            d1 = app.get_deal(conn, r1["pseudo_freee_deal_id"])
+            r2 = app.create_manual_expense(conn, {**base, "amount": 1200, "payment_method": "現金", "due_date": "2026-06-30"})
+            d2 = app.get_deal(conn, r2["pseudo_freee_deal_id"])
+            r3 = app.create_manual_expense(conn, {**base, "amount": 500})  # 既定=現金
+            d3 = app.get_deal(conn, r3["pseudo_freee_deal_id"])
+
+        # 未払金: 支払予定日を保持。現金: クリア。既定は現金。
+        self.assertEqual(d1["payment_method"], "未払金")
+        self.assertEqual(d1["due_date"], "2026-06-30")
+        self.assertEqual(d2["payment_method"], "現金")
+        self.assertEqual(d2["due_date"], "")
+        self.assertEqual(d3["payment_method"], "現金")
+        self.assertEqual(d3["due_date"], "")
+
+    def test_invalid_payment_method_raises(self) -> None:
+        with app.db_connection() as conn:
+            with self.assertRaises(ValueError):
+                app.create_manual_expense(
+                    conn,
+                    {"issue_date": "2026-06-13", "partner_name": "X", "account_item_name": "消耗品費", "amount": 100, "payment_method": "クレカ"},
+                )
+
     def test_expense_master_candidates_are_seeded_and_learn_new_values(self) -> None:
         with app.db_connection() as conn:
             before = app.list_expense_masters(conn)
@@ -335,6 +361,11 @@ class PseudoFreeeVoucherTest(unittest.TestCase):
         self.assertIn('name="voucher_id"', html)
         self.assertIn('id="voucher-list"', html)
         self.assertIn("/api/expense-capture", html)
+        # 追加UI: 大きいプレビュー・支払方法・支払予定日・取り消しボタン
+        self.assertIn('id="receipt-preview-img"', html)
+        self.assertIn('id="payment-method"', html)
+        self.assertIn('id="due-date-input"', html)
+        self.assertIn('id="ai-cancel"', html)
 
 
 if __name__ == "__main__":

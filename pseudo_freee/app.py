@@ -52,6 +52,7 @@ CREATE TABLE IF NOT EXISTS pseudo_freee_deals (
     tax_category TEXT NOT NULL DEFAULT '',
     amount REAL NOT NULL DEFAULT 0,
     memo TEXT NOT NULL DEFAULT '',
+    payment_method TEXT NOT NULL DEFAULT '',
     payload_json TEXT NOT NULL,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(queue_id, source_type, source_id)
@@ -313,6 +314,14 @@ def ensure_master_schema(conn: sqlite3.Connection) -> None:
             conn.execute("ALTER TABLE pseudo_freee_account_items ADD COLUMN search_key TEXT NOT NULL DEFAULT ''")
 
 
+def ensure_deals_columns(conn: sqlite3.Connection) -> None:
+    """既存DBに後付けした列を補う（payment_method）。データは保持する。"""
+    if table_exists(conn, "pseudo_freee_deals"):
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(pseudo_freee_deals)").fetchall()}
+        if "payment_method" not in columns:
+            conn.execute("ALTER TABLE pseudo_freee_deals ADD COLUMN payment_method TEXT NOT NULL DEFAULT ''")
+
+
 def default_tax_for_account_item(account_item_name: str) -> str:
     for tax_category, account_items in DEFAULT_ACCOUNT_ITEM_TAX_CATEGORIES.items():
         if account_item_name in account_items:
@@ -411,6 +420,7 @@ def init_db() -> None:
         migrate_deals_schema(conn)
         conn.executescript(SCHEMA_SQL)
         ensure_master_schema(conn)
+        ensure_deals_columns(conn)
         seed_master_data(conn)
 
 
@@ -683,7 +693,13 @@ def create_manual_expense(conn: sqlite3.Connection, data: dict[str, Any]) -> dic
     if amount <= 0:
         raise ValueError("amount must be greater than 0")
 
+    payment_method = str(data.get("payment_method", "現金") or "現金")
+    if payment_method not in {"現金", "普通預金", "未払金"}:
+        raise ValueError("payment_method must be 現金, 普通預金, or 未払金")
     due_date = str(data.get("due_date", "") or "")
+    # 現金/普通預金は即時決済＝支払予定日を持たない（未払金のときだけ予定日を残す）。
+    if payment_method != "未払金":
+        due_date = ""
     tax_category = str(data.get("tax_category", "課税仕入 10%") or "課税仕入 10%")
     description = str(data.get("description", "") or account_item_name)
     memo = str(data.get("memo", "") or "")
@@ -696,6 +712,7 @@ def create_manual_expense(conn: sqlite3.Connection, data: dict[str, Any]) -> dic
             "issue_date": issue_date,
             "due_date": due_date,
             "type": "expense",
+            "payment_method": payment_method,
             "partner_name": partner_name,
             "invoice_no": "",
             "memo": memo,
@@ -720,9 +737,9 @@ def create_manual_expense(conn: sqlite3.Connection, data: dict[str, Any]) -> dic
             queue_id, source_app, source_type, source_id, deal_type,
             issue_date, due_date, partner_name, partner_master_id,
             freee_partner_id, invoice_no, account_item_name, tax_category,
-            amount, memo, payload_json
+            amount, memo, payment_method, payload_json
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             None,
@@ -740,6 +757,7 @@ def create_manual_expense(conn: sqlite3.Connection, data: dict[str, Any]) -> dic
             tax_category,
             amount,
             memo,
+            payment_method,
             json.dumps(payload, ensure_ascii=False, indent=2),
         ),
     )
@@ -1443,6 +1461,17 @@ def render_page(title: str, body: str) -> bytes:
       text-align: center;
       line-height: 1.8;
     }}
+    label.is-disabled input {{ background: #f3f4f6; color: #9ca3af; cursor: not-allowed; }}
+    .ai-cancel {{
+      width: auto;
+      justify-self: start;
+      border-color: #d1d5db;
+      background: #fff;
+      color: #4b5563;
+      padding: 6px 14px;
+      font-weight: 700;
+    }}
+    .ai-cancel:hover {{ background: #f3f4f6; }}
     .detail-grid {{
       display: grid;
       grid-template-columns: minmax(0, 1fr) minmax(280px, 420px);
@@ -1658,12 +1687,19 @@ def render_index(filters: dict[str, str] | None = None) -> bytes:
               <img id="ai-preview-img" alt="読み取った画像">
               <div class="ai-status" id="ai-preview-meta"></div>
             </div>
+            <button type="button" class="ai-cancel" id="ai-cancel" hidden>アップロードを取り消す</button>
           </div>
           <form class="expense-form" method="post" action="/manual-expenses">
             <input type="hidden" name="voucher_id" id="voucher-id-input" value="">
             <div class="form-grid">
               <label>発生日<input type="date" name="issue_date" value="{datetime.now().strftime("%Y-%m-%d")}" required></label>
-              <label>支払予定日<input type="date" name="due_date" value="{datetime.now().strftime("%Y-%m-%d")}"></label>
+              <label>支払方法
+                <select name="payment_method" id="payment-method">
+                  <option value="現金" selected>現金</option>
+                  <option value="普通預金">普通預金</option>
+                  <option value="未払金">未払金</option>
+                </select>
+              </label>
               <label>取引先
                 <div class="combo" data-combo>
                   <input class="combo-input" name="partner_name" autocomplete="off" placeholder="検索して選択" required>
@@ -1680,6 +1716,7 @@ def render_index(filters: dict[str, str] | None = None) -> bytes:
               </label>
               <label>税区分<select name="tax_category">{tax_category_options}</select></label>
               <label>金額<input class="no-spinner" inputmode="decimal" name="amount" placeholder="例: 3300" required></label>
+              <label id="due-date-label" class="is-disabled">支払予定日（未払金のとき）<input type="date" name="due_date" id="due-date-input" value="{datetime.now().strftime("%Y-%m-%d")}" disabled></label>
             </div>
             <label>摘要<input name="description" placeholder="例: 梱包資材"></label>
             <label>メモ<textarea name="memo"></textarea></label>
@@ -1896,6 +1933,43 @@ def render_index(filters: dict[str, str] | None = None) -> bytes:
           if (receiptPreviewEmpty) receiptPreviewEmpty.style.display = "none";
         }}
 
+        const paymentMethod = document.getElementById("payment-method");
+        const dueDateInput = document.getElementById("due-date-input");
+        const dueDateLabel = document.getElementById("due-date-label");
+        const aiCancel = document.getElementById("ai-cancel");
+
+        // 支払方法が「未払金」のときだけ支払予定日を有効化（現金/普通預金は即時決済＝予定日なし）。
+        function syncDueDate() {{
+          const enabled = paymentMethod && paymentMethod.value === "未払金";
+          if (dueDateInput) dueDateInput.disabled = !enabled;
+          if (dueDateLabel) dueDateLabel.classList.toggle("is-disabled", !enabled);
+        }}
+        if (paymentMethod) {{
+          paymentMethod.addEventListener("change", syncDueDate);
+          syncDueDate();
+        }}
+
+        // アップロードを取り消す: 下書きの証憑を削除し、フォームとプレビューを初期状態へ戻す。
+        async function cancelCapture() {{
+          const vid = voucherIdInput ? voucherIdInput.value : "";
+          if (vid) {{
+            try {{ await fetch(`/api/vouchers/${{vid}}`, {{ method: "DELETE" }}); }} catch (e) {{}}
+          }}
+          if (voucherIdInput) voucherIdInput.value = "";
+          clearLowFlags();
+          const form = document.querySelector(".expense-form");
+          if (form) form.reset();
+          syncDueDate();
+          if (aiPreview) aiPreview.style.display = "none";
+          if (receiptPreviewImg) {{ receiptPreviewImg.style.display = "none"; receiptPreviewImg.removeAttribute("src"); }}
+          if (receiptPreviewEmpty) receiptPreviewEmpty.style.display = "";
+          setStatus("", false);
+          if (aiCancel) aiCancel.hidden = true;
+          if (aiFile) aiFile.value = "";  // 同じファイルを選び直せるようにする
+          loadVouchers();
+        }}
+        if (aiCancel) aiCancel.addEventListener("click", cancelCapture);
+
         // AIの項目名 → 経費フォームの input/select 名。
         const FIELD_TO_NAME = {{
           issue_date: "issue_date",
@@ -1992,6 +2066,7 @@ def render_index(filters: dict[str, str] | None = None) -> bytes:
               }}
             }}
             showReceiptPreview(dataUrl);  // 右の大きなプレビューにも表示。
+            if (aiCancel) aiCancel.hidden = false;  // 取り消しボタンを出す。
             loadVouchers();
           }} catch (err) {{
             setStatus(err.message || "読み取りに失敗しました", true);
@@ -2140,6 +2215,7 @@ def render_detail(deal_id: int) -> bytes | None:
               <dt>勘定科目</dt><dd>{html.escape(deal["account_item_name"])}</dd>
               <dt>税区分</dt><dd>{html.escape(deal["tax_category"])}</dd>
               <dt>金額</dt><dd>{yen(deal["amount"])}</dd>
+              <dt>支払方法</dt><dd>{html.escape(deal.get("payment_method", "") or "—")}</dd>
               <dt>メモ</dt><dd>{html.escape(deal["memo"])}</dd>
               <dt>送信元</dt><dd>{html.escape(source_label)}</dd>
               <dt>キューID</dt><dd>{html.escape(queue_label)}</dd>
