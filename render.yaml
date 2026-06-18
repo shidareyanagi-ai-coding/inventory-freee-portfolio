@@ -1,0 +1,39 @@
+# Render Blueprint（A-6 デプロイ）: 在庫ダッシュボード(inventory_dashboard)のみ公開する。
+# 使い方: Render で「New + → Blueprint」→ この GitHub リポジトリを選ぶと本ファイルを自動で読む。
+#   秘密値(sync:false の項目)は Render の画面で各自入力する（このファイルには絶対に書かない）。
+# 疑似freee(pseudo_freee)は現状デプロイ非対応のため今回は公開しない。
+services:
+  - type: web
+    name: inventory-dashboard
+    runtime: python
+    plan: free                    # 無料枠（15分無アクセスでスリープ→次アクセスで数十秒の起動）
+    region: singapore             # Neon/R2 と同じ APAC（日本から近い）
+    buildCommand: pip install -r requirements.txt
+    startCommand: python inventory_dashboard/app.py
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.9"
+      - key: APP_ENV
+        value: production         # Clerk 認証を強制（AUTH_DEV_MODE は本番では無効）
+      - key: STORAGE_REGION
+        value: auto               # R2 は auto
+
+      # --- 以下は秘密 or 環境依存。Render 画面で入力する（sync:false=Blueprintから同期しない） ---
+      - key: DATABASE_URL
+        sync: false               # Neon 本番ブランチの接続文字列（?sslmode=require 付き）
+      - key: CLERK_PUBLISHABLE_KEY
+        sync: false               # pk_test_...（デモは Clerk の Development キーを流用）
+      - key: CLERK_ISSUER
+        sync: false               # https://xxxx.clerk.accounts.dev
+      - key: STORAGE_ENDPOINT
+        sync: false               # R2 の S3 API エンドポイント（https://〇〇.r2.cloudflarestorage.com）
+      - key: STORAGE_BUCKET
+        sync: false               # inventory-vouchers
+      - key: STORAGE_ACCESS_KEY_ID
+        sync: false
+      - key: STORAGE_SECRET_ACCESS_KEY
+        sync: false
+
+      # ANTHROPIC_API_KEY は「設定しない」: BYO-key のため空のまま＝利用者が各自ブラウザで入力する。
+      #   ここに鍵を入れると全員の解析が運営者(あなた)の課金になるので注意。
+      # PSEUDO_FREEE_API_URL も未設定: 疑似freee未公開。送信操作は「接続できません」と穏当に表示される。

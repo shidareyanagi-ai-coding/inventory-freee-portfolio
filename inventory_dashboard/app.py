@@ -50,8 +50,10 @@ DB_PATH = APP_DIR / "inventory.db"
 # A-6: 実際の置き場所は storage.py が決める。env の STORAGE_* があれば R2 等の
 #   オブジェクトストレージ、無ければこの VOUCHER_DIR（ローカルフォルダ・.gitignore 済み）。
 VOUCHER_DIR = APP_DIR / "voucher_store"
-HOST = "127.0.0.1"
-PORT = int(os.environ.get("INVENTORY_DASHBOARD_PORT", "8000"))
+# 本番(Render等)は環境変数 PORT で待ち受けポートが渡され、外部公開のため 0.0.0.0 にバインドする。
+# ローカルは従来どおり 127.0.0.1。PORT が来ているか（=クラウド上か）で自動で切り替える（A-6）。
+PORT = int(os.environ.get("PORT") or os.environ.get("INVENTORY_DASHBOARD_PORT", "8000"))
+HOST = os.environ.get("INVENTORY_DASHBOARD_HOST") or ("0.0.0.0" if os.environ.get("PORT") else "127.0.0.1")
 DEMO_HISTORY_MONTHS = 24
 PSEUDO_FREEE_API_URL = os.environ.get("PSEUDO_FREEE_API_URL", "http://127.0.0.1:8010").rstrip("/")
 
