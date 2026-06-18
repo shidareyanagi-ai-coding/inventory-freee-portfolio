@@ -55,6 +55,9 @@ VOUCHER_DIR = APP_DIR / "voucher_store"
 PORT = int(os.environ.get("PORT") or os.environ.get("INVENTORY_DASHBOARD_PORT", "8000"))
 HOST = os.environ.get("INVENTORY_DASHBOARD_HOST") or ("0.0.0.0" if os.environ.get("PORT") else "127.0.0.1")
 DEMO_HISTORY_MONTHS = 24
+# A-6: デモ組織の seed 直後に予測バッチを流し「常にAI版（必要在庫）」を保証する。
+# テストは速度のため setUp で False にする（毎回の重い学習を避ける）。
+RUN_FORECAST_ON_SEED = True
 PSEUDO_FREEE_API_URL = os.environ.get("PSEUDO_FREEE_API_URL", "http://127.0.0.1:8010").rstrip("/")
 
 
@@ -206,6 +209,14 @@ def seed_organization(conn: db.Connection, organization_id: int) -> None:
     ensure_sample_transactions(conn, organization_id)
     ensure_demo_history(conn, organization_id)
     sync_partner_master(conn, organization_id)
+    # A-6: 「常にAI版」のため、デモ投入直後に予測バッチを1回流して AI 必要在庫を用意する。
+    if RUN_FORECAST_ON_SEED:
+        try:
+            from forecasting import service as forecast_service
+
+            forecast_service.run_forecast(conn, organization_id, horizon_days=30)
+        except Exception:
+            pass  # 予測失敗でも seed 自体は成立させる（次回「予測バッチを実行」で補完）
 
 
 def seed_products(conn: db.Connection, organization_id: int) -> None:
@@ -914,6 +925,49 @@ def dashboard(conn: db.Connection, organization_id: int) -> dict[str, Any]:
     }
 
 
+def _ranked_models(conn: db.Connection, organization_id: int) -> list[str]:
+    """精度(MAE)昇順のモデル名リスト。バックテスト結果が無ければ既定の優先順を補完する。
+    「最良モデル」を選ぶための順位（A-6: 必要在庫を AI 予測ベースに一本化）。"""
+    ranked = [
+        row["model_name"]
+        for row in conn.execute(
+            "SELECT model_name FROM model_evaluations WHERE organization_id = ? ORDER BY mae ASC",
+            (organization_id,),
+        ).fetchall()
+    ]
+    for preferred in ("lightgbm", "sarima", "baseline"):
+        if preferred not in ranked:
+            ranked.append(preferred)
+    return ranked
+
+
+def _ai_daily_forecast(
+    conn: db.Connection, organization_id: int, product_id: int, ranked_models: list[str]
+) -> tuple[str, list[tuple[str, float]]]:
+    """この商品の「最良モデル」の日次予測を (model_name, [(date_iso, predicted), ...]) で返す。
+    予測がまだ生成されていなければ ("", [])（呼び出し側は簡易計算にフォールバックする）。"""
+    present = {
+        row["model_name"]
+        for row in conn.execute(
+            "SELECT DISTINCT model_name FROM forecasts WHERE organization_id = ? AND product_id = ?",
+            (organization_id, product_id),
+        ).fetchall()
+    }
+    model = next((m for m in ranked_models if m in present), None)
+    if not model:
+        return "", []
+    rows = conn.execute(
+        """
+        SELECT target_date, predicted_quantity
+        FROM forecasts
+        WHERE organization_id = ? AND product_id = ? AND model_name = ?
+        ORDER BY target_date
+        """,
+        (organization_id, product_id, model),
+    ).fetchall()
+    return model, [(r["target_date"], max(float(r["predicted_quantity"]), 0.0)) for r in rows]
+
+
 def forecast_simulation(conn: db.Connection, organization_id: int, horizon_days: int = 30) -> dict[str, Any]:
     if horizon_days not in {30, 60, 90}:
         horizon_days = 30
@@ -924,6 +978,7 @@ def forecast_simulation(conn: db.Connection, organization_id: int, horizon_days:
     month_end = date(today.year, today.month, monthrange(today.year, today.month)[1])
     days_to_month_end = max((month_end - today).days + 1, 0)
     products = list_products(conn, organization_id)
+    ranked_models = _ranked_models(conn, organization_id)
     rows = []
 
     for product in products:
@@ -934,6 +989,12 @@ def forecast_simulation(conn: db.Connection, organization_id: int, horizon_days:
         adjusted_daily_average = daily_average * seasonal_factor
         month_end_forecast = math.ceil(adjusted_daily_average * days_to_month_end)
         lead_time_demand = math.ceil(adjusted_daily_average * int(product["lead_time_days"]))
+        # A-6: AI予測(最良モデル)があれば、リードタイム需要・月末予測販売数をそれで上書きする
+        #（=必要在庫/発注量をAI予測ベースに一本化。簡易計算は予測未生成時のフォールバック）。
+        ai_model, ai_daily = _ai_daily_forecast(conn, organization_id, product["id"], ranked_models)
+        if ai_daily:
+            lead_time_demand = math.ceil(sum(v for _, v in ai_daily[: int(product["lead_time_days"])]))
+            month_end_forecast = math.ceil(sum(v for d, v in ai_daily if d <= month_end.isoformat()))
         required_inventory = lead_time_demand + int(product["safety_stock"])
         recommended_order_quantity = max(required_inventory - int(product["stock_quantity"]), 0)
         projected_month_end_stock = int(product["stock_quantity"]) - month_end_forecast
@@ -959,6 +1020,7 @@ def forecast_simulation(conn: db.Connection, organization_id: int, horizon_days:
                 "sku": product["sku"],
                 "product_name": product["product_name"],
                 "stock_quantity": product["stock_quantity"],
+                "model": ai_model,  # A-6: 採用したAIモデル名（"" のときは簡易計算フォールバック）
                 "recent_sales_quantity": recent_sales_quantity,
                 "daily_average": round(daily_average, 2),
                 "seasonal_factor": round(seasonal_factor, 2),
@@ -1160,18 +1222,22 @@ def list_model_evaluations(conn: db.Connection, organization_id: int) -> list[di
 
 
 def list_order_candidates(conn: db.Connection, organization_id: int) -> list[dict[str, Any]]:
-    """発注候補（予測で在庫が必要水準を割る商品）。商品名を添えて返す。"""
-    return conn.execute(
-        """
-        SELECT oc.id, oc.product_id, p.sku, p.product_name,
-               oc.suggested_date, oc.recommended_quantity, oc.basis, oc.status
-        FROM order_candidates oc
-        JOIN products p ON p.id = oc.product_id
-        WHERE oc.organization_id = ?
-        ORDER BY oc.suggested_date ASC
-        """,
-        (organization_id,),
-    ).fetchall()
+    """発注候補（今すぐ発注が必要な商品）。適正在庫シミュレーション(AI予測ベース)から
+    「今すぐ発注量 > 0」の商品を、現在在庫・必要在庫・今すぐ発注量で返す（A-6: 全画面で表記統一）。"""
+    sim = forecast_simulation(conn, organization_id, 30)
+    candidates = [
+        {
+            "sku": row["sku"],
+            "product_name": row["product_name"],
+            "stock_quantity": row["stock_quantity"],
+            "required_inventory": row["required_inventory"],
+            "recommended_order_quantity": row["recommended_order_quantity"],
+        }
+        for row in sim["rows"]
+        if row["recommended_order_quantity"] > 0
+    ]
+    candidates.sort(key=lambda r: r["recommended_order_quantity"], reverse=True)
+    return candidates
 
 
 # ---------------------------------------------------------------------------

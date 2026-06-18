@@ -62,6 +62,36 @@ class ForecastingTest(unittest.TestCase):
         self.assertGreater(sale_days, 365)
         self.assertGreater(factors, 0)
 
+    # --- A-6: 必要在庫を AI 予測ベースに一本化 -----------------------------
+    def test_simulation_required_inventory_uses_ai_forecast(self):
+        import math
+
+        with app.get_conn() as conn:
+            sim = app.forecast_simulation(conn, self.org_id, 30)
+            pid = self._first_product_id(conn, self.org_id)
+            product = app.get_product(conn, self.org_id, pid)
+            ranked = app._ranked_models(conn, self.org_id)
+            model_name, daily = app._ai_daily_forecast(conn, self.org_id, pid, ranked)
+        self.assertTrue(daily, "予測バッチ後なので AI 予測があるはず")
+        row = next(r for r in sim["rows"] if r["sku"] == product["sku"])
+        # 採用モデルが入る＝AI 経路で計算された（簡易計算フォールバックではない）。
+        self.assertEqual(row["model"], model_name)
+        self.assertIn(model_name, ("baseline", "sarima", "lightgbm"))
+        # 必要在庫 = AI のリードタイム需要 + 安全在庫（式の一貫性）。
+        lt = int(product["lead_time_days"])
+        expected_ltd = math.ceil(sum(v for _, v in daily[:lt]))
+        self.assertEqual(row["lead_time_demand"], expected_ltd)
+        self.assertEqual(row["required_inventory"], expected_ltd + int(product["safety_stock"]))
+
+    def test_order_candidates_are_ai_based_with_stock_fields(self):
+        # 発注候補は AI シミュレーションから「現在在庫/必要在庫/今すぐ発注量」を返す（旧 basis 等は無い）。
+        with app.get_conn() as conn:
+            candidates = app.list_order_candidates(conn, self.org_id)
+        for c in candidates:
+            self.assertEqual(set(c.keys()), {"sku", "product_name", "stock_quantity", "required_inventory", "recommended_order_quantity"})
+            self.assertGreater(c["recommended_order_quantity"], 0)
+            self.assertEqual(c["recommended_order_quantity"], max(c["required_inventory"] - c["stock_quantity"], 0))
+
     # --- 予測の書き込み ---------------------------------------------------
     def test_run_forecast_writes_all_tables_scoped_to_org(self):
         with app.get_conn() as conn:

@@ -315,7 +315,7 @@ _INDEX_TEMPLATE = r"""
           <div id="forecastEvaluations"></div>
         </div>
         <div>
-          <h3 class="sub">発注候補（予測で在庫が必要水準を割る商品）</h3>
+          <h3 class="sub">発注候補（今すぐ発注が必要な商品）</h3>
           <div id="forecastCandidates"></div>
         </div>
       </div>
@@ -403,7 +403,7 @@ _INDEX_TEMPLATE = r"""
       document.getElementById("products").innerHTML = table(["SKU", "商品", "必要水準", "現在在庫", "状態", "在庫金額", "推奨発注量"],
         products.map(p => [p.sku, `<button class="link" onclick="loadLedger(${p.id})">${p.product_name}</button>`, p.required_stock_level, p.stock_quantity, status(p.status), yen.format(p.stock_value), p.recommended_order_quantity]))
         + `<div class="table-total"><span>在庫一覧 合計</span><strong>${yen.format(listTotal)}</strong><span>${diffText}</span></div>`
-        + `<p class="note">在庫一覧の必要水準は、適正在庫シミュレーションと同じ直近30日予測ベースです。必要水準 = リードタイム需要 + 安全在庫。推奨発注量 = max(必要水準 - 現在在庫, 0) です。</p>`;
+        + `<p class="note">在庫一覧の必要水準・推奨発注量は、適正在庫シミュレーション（AIモデル予測）と同じ基準です。必要水準 = リードタイム需要(予測) + 安全在庫。</p>`;
     }
 
     function renderMonthlySummary(elementId, rows, total, totalLabel) {
@@ -420,16 +420,14 @@ _INDEX_TEMPLATE = r"""
 
     function renderForecast(data) {
       document.getElementById("forecastNote").textContent =
-        `${data.start_date} から ${data.end_date} までの販売実績を使い、${data.month_end} までの残り ${data.days_to_month_end} 日を予測しています。リードタイム需要は「発注から入荷までに売れそうな数量」、必要在庫は「リードタイム需要 + 安全在庫」です。`;
+        `AIモデル(最良)の予測で ${data.month_end} までの需要を見込み、各商品の「必要在庫」と「今すぐ発注量」を出しています。必要在庫 = リードタイム需要(入荷までに売れる予測数) + 安全在庫。今すぐ発注量 = max(必要在庫 − 現在在庫, 0)。`;
       document.getElementById("forecastSimulation").innerHTML = table(
-        ["SKU", "商品", "現在在庫", "期間販売数", "日次平均", "季節係数", "リードタイム日数", "リードタイム需要", "安全在庫", "必要在庫", "今すぐ推奨発注量", "リードタイム判定", "月末までの予測販売数", "月末在庫見込み", "月末不足数", "月末判定"],
+        ["SKU", "商品", "現在在庫", "採用モデル", "リードタイム日数", "リードタイム需要", "安全在庫", "必要在庫", "今すぐ発注量", "リードタイム判定", "月末予測販売数", "月末在庫見込み", "月末不足数", "月末判定"],
         data.rows.map(row => [
           row.sku,
           row.product_name,
           row.stock_quantity,
-          row.recent_sales_quantity,
-          row.daily_average,
-          row.seasonal_factor,
+          modelLabel(row.model),
           row.lead_time_days,
           row.lead_time_demand,
           row.safety_stock,
@@ -553,8 +551,8 @@ _INDEX_TEMPLATE = r"""
         target.innerHTML = '<p class="note">発注候補はありません（予測上、在庫は当面足ります）。</p>';
         return;
       }
-      target.innerHTML = table(["商品", "必要水準を割る日", "推奨発注量", "根拠"],
-        rows.map(r => [`${r.sku} ${r.product_name}`, r.suggested_date, r.recommended_quantity, r.basis]));
+      target.innerHTML = table(["商品", "現在在庫", "必要在庫", "今すぐ発注量"],
+        rows.map(r => [`${r.sku} ${r.product_name}`, r.stock_quantity, r.required_inventory, r.recommended_order_quantity]));
     }
 
     async function runForecastBatch() {
