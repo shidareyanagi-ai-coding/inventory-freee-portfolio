@@ -67,12 +67,20 @@ def tax_category_candidates() -> list[str]:
     return list(TAX_CATEGORIES)
 
 
-def _api_key() -> str:
-    """サーバ側のみ。`.env` の行末コメント混入を防ぐため '#' 始まりは未設定扱い（auth._env と同じ防御）。"""
-    value = os.environ.get("ANTHROPIC_API_KEY", "").strip()
-    if value.startswith("#"):
-        return ""
-    return value
+def _clean_key(value: str) -> str:
+    """前後空白を除去。`.env` の行末コメント混入を防ぐため '#' 始まりは未設定扱い（auth._env と同じ防御）。"""
+    value = (value or "").strip()
+    return "" if value.startswith("#") else value
+
+
+def _api_key(override: str = "") -> str:
+    """使う API キーを決める。override（リクエストごとに利用者が貼ったキー）が最優先、
+    無ければ環境変数 ANTHROPIC_API_KEY。
+
+    BYO-key（A-6・各自APIキー）: 公開デモでは server 側 env を空にし、利用者が自分のキーを
+    解析の都度ヘッダで渡す。キーはサーバに保存・記録しない（受け取ってその場で使うだけ）。
+    """
+    return _clean_key(override) or _clean_key(os.environ.get("ANTHROPIC_API_KEY", ""))
 
 
 def _model() -> str:
@@ -81,9 +89,10 @@ def _model() -> str:
     return value or "claude-haiku-4-5"
 
 
-def anthropic_ready() -> bool:
-    """実 Claude vision を呼べる状態か（鍵あり かつ ライブラリ導入済み）。"""
-    if not _api_key():
+def anthropic_ready(api_key: str = "") -> bool:
+    """実 Claude vision を呼べる状態か（鍵あり かつ ライブラリ導入済み）。
+    api_key を渡すとそのキーで判定（server 側 env が空でも、利用者キーで有効になる）。"""
+    if not _api_key(api_key):
         return False
     try:
         import anthropic  # noqa: F401
@@ -196,10 +205,10 @@ _SCHEMA: dict[str, Any] = {
 }
 
 
-def _analyze_with_anthropic(image_bytes: bytes, mime_type: str) -> dict[str, Any]:
+def _analyze_with_anthropic(image_bytes: bytes, mime_type: str, api_key: str = "") -> dict[str, Any]:
     import anthropic
 
-    client = anthropic.Anthropic(api_key=_api_key())
+    client = anthropic.Anthropic(api_key=_api_key(api_key))
     model = _model()
     image_b64 = base64.standard_b64encode(image_bytes).decode("ascii")
     media_type = mime_type if mime_type in {"image/png", "image/jpeg", "image/gif", "image/webp"} else "image/jpeg"
@@ -235,16 +244,17 @@ def _analyze_with_anthropic(image_bytes: bytes, mime_type: str) -> dict[str, Any
     return _finalize(fields, confidence, source="anthropic", model=model)
 
 
-def analyze_voucher(image_bytes: bytes, mime_type: str = "") -> dict[str, Any]:
+def analyze_voucher(image_bytes: bytes, mime_type: str = "", *, api_key: str = "") -> dict[str, Any]:
     """証憑画像から経費伝票の下書き(構造化JSON)を返す。副作用なし（登録しない）。
 
     鍵+ライブラリがあれば実 Claude vision、無ければ決定的スタブ。戻り値の "source" で見分けられる。
+    api_key: 利用者が都度渡すキー（BYO-key）。空なら env、それも無ければスタブ。
     用途: 一般経費（疑似freee側）。仕入・売上の請求書は analyze_invoice を使う。
     """
     if not image_bytes:
         raise ValueError("画像がありません。")
-    if anthropic_ready():
-        return _analyze_with_anthropic(image_bytes, mime_type)
+    if anthropic_ready(api_key):
+        return _analyze_with_anthropic(image_bytes, mime_type, api_key)
     return _stub_analyze(image_bytes, mime_type)
 
 
@@ -320,10 +330,10 @@ def _stub_invoice(image_bytes: bytes, mime_type: str, kind: str, products: list[
     return _finalize_invoice(fields, confidence, source="stub", kind=kind)
 
 
-def _analyze_invoice_with_anthropic(image_bytes: bytes, mime_type: str, kind: str, products: list[dict[str, Any]]) -> dict[str, Any]:
+def _analyze_invoice_with_anthropic(image_bytes: bytes, mime_type: str, kind: str, products: list[dict[str, Any]], api_key: str = "") -> dict[str, Any]:
     import anthropic
 
-    client = anthropic.Anthropic(api_key=_api_key())
+    client = anthropic.Anthropic(api_key=_api_key(api_key))
     model = _model()
     image_b64 = base64.standard_b64encode(image_bytes).decode("ascii")
     media_type = mime_type if mime_type in {"image/png", "image/jpeg", "image/gif", "image/webp"} else "image/jpeg"
@@ -387,17 +397,19 @@ def _analyze_invoice_with_anthropic(image_bytes: bytes, mime_type: str, kind: st
 
 
 def analyze_invoice(
-    image_bytes: bytes, mime_type: str = "", *, kind: str = "purchase", products: list[dict[str, Any]] | None = None
+    image_bytes: bytes, mime_type: str = "", *, kind: str = "purchase",
+    products: list[dict[str, Any]] | None = None, api_key: str = ""
 ) -> dict[str, Any]:
     """仕入/売上の請求書画像から取引フォームの下書き(構造化JSON)を返す。副作用なし（登録しない）。
 
     kind: "purchase"(仕入) / "sale"(売上)。products: 既存商品マスタ（SKU推測に使う）。
+    api_key: 利用者が都度渡すキー（BYO-key）。空なら env、それも無ければスタブ。
     """
     if not image_bytes:
         raise ValueError("画像がありません。")
     if kind not in {"purchase", "sale"}:
         raise ValueError("kind は purchase または sale です。")
     products = products or []
-    if anthropic_ready():
-        return _analyze_invoice_with_anthropic(image_bytes, mime_type, kind, products)
+    if anthropic_ready(api_key):
+        return _analyze_invoice_with_anthropic(image_bytes, mime_type, kind, products, api_key)
     return _stub_invoice(image_bytes, mime_type, kind, products)

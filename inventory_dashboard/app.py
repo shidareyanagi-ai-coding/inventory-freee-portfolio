@@ -1300,13 +1300,15 @@ def capture_invoice(
     file_name: str,
     mime_type: str,
     image_bytes: bytes,
+    api_key: str = "",
 ) -> dict[str, Any]:
     """仕入/売上の請求書画像 → AI下書き（登録しない）。画像と抽出結果を証憑として保存する。
 
     AI が推測した商品SKUを既存マスタの product_id に解決して返す（フォームの商品選択に使う）。
+    api_key: 利用者が都度渡す Anthropic キー（BYO-key）。サーバには保存・記録しない。
     """
     products = [dict(p) for p in _products_for_matching(conn, organization_id)]
-    draft = ai_capture.analyze_invoice(image_bytes, mime_type, kind=kind, products=products)
+    draft = ai_capture.analyze_invoice(image_bytes, mime_type, kind=kind, products=products, api_key=api_key)
     sku = str(draft["fields"].get("product_sku") or "")
     matched = next((p for p in products if str(p.get("sku")) == sku), None) if sku else None
     matched_product_id = matched["id"] if matched else None
@@ -1906,9 +1908,13 @@ def api_cancel_movement(data: dict[str, Any] = Depends(parse_json_body), identit
 # --- 仕入・売上請求書の取り込み 更新系（A-5・admin/staff のみ・viewer は 403）---
 @app.post("/api/invoice-capture", status_code=201)
 async def api_invoice_capture(
-    kind: str = "purchase", file: UploadFile = File(...), identity: Identity = WRITER
+    kind: str = "purchase",
+    file: UploadFile = File(...),
+    identity: Identity = WRITER,
+    x_anthropic_key: str = Header(default="", alias="X-Anthropic-Key"),
 ) -> dict[str, Any]:
     # 仕入/売上の請求書画像 → AI下書き → 証憑保存。**ここでは登録しない**（登録は人が仕入/売上フォームで行う）。
+    # x_anthropic_key: 利用者が貼った自分の Anthropic キー（BYO-key）。受け取って解析に使うだけで保存・記録しない。
     if kind not in {"purchase", "sale"}:
         raise ValueError("kind は purchase または sale です。")
     image_bytes = await file.read()
@@ -1922,6 +1928,7 @@ async def api_invoice_capture(
             file_name=file.filename or "",
             mime_type=file.content_type or "",
             image_bytes=image_bytes,
+            api_key=x_anthropic_key,
         )
         record_audit(
             conn, identity.organization_id, identity.user_id, "voucher.capture", "voucher", result["voucher_id"],

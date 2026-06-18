@@ -14,6 +14,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from fastapi.testclient import TestClient
 
@@ -92,6 +93,64 @@ class CaptureTest(_Base):
     def test_empty_image_is_400(self):
         res = self.client.post("/api/invoice-capture?kind=purchase", headers=self._h("userA"), files={"file": ("x.png", b"", "image/png")})
         self.assertEqual(res.status_code, 400)
+
+
+class ByoKeyTest(_Base):
+    """A-6 BYO-key: リクエストヘッダ X-Anthropic-Key が解析関数まで届く（サーバ保存はしない）。"""
+
+    def _spy_analyze(self, seen):
+        # 本物の AI は呼ばず、渡された api_key を記録してスタブ下書きを返す。
+        def spy(image_bytes, mime_type="", *, kind="purchase", products=None, api_key=""):
+            seen["api_key"] = api_key
+            return ai_capture._stub_invoice(image_bytes, mime_type, kind, products or [])
+        return spy
+
+    def test_header_key_is_passed_to_ai(self):
+        seen = {}
+        with mock.patch.object(ai_capture, "analyze_invoice", self._spy_analyze(seen)):
+            res = self.client.post(
+                "/api/invoice-capture?kind=purchase",
+                headers={**self._h("userA"), "X-Anthropic-Key": "sk-ant-byok-test"},
+                files={"file": ("invoice.png", b"FAKE", "image/png")},
+            )
+        self.assertEqual(res.status_code, 201)
+        self.assertEqual(seen.get("api_key"), "sk-ant-byok-test")
+
+    def test_no_header_means_empty_key(self):
+        seen = {}
+        with mock.patch.object(ai_capture, "analyze_invoice", self._spy_analyze(seen)):
+            res = self._capture("userA")
+        self.assertEqual(res.status_code, 201)
+        self.assertEqual(seen.get("api_key"), "")  # 未指定なら env 任せ（テストでは空＝スタブ）
+
+
+class ResolveKeyTest(unittest.TestCase):
+    """A-6 BYO-key: _api_key は override 優先・'#' 始まりは無効・空なら env フォールバック。"""
+
+    def setUp(self):
+        self._saved = os.environ.pop("ANTHROPIC_API_KEY", None)
+
+    def tearDown(self):
+        if self._saved is not None:
+            os.environ["ANTHROPIC_API_KEY"] = self._saved
+        else:
+            os.environ.pop("ANTHROPIC_API_KEY", None)
+
+    def test_override_takes_priority(self):
+        os.environ["ANTHROPIC_API_KEY"] = "sk-env"
+        self.assertEqual(ai_capture._api_key("sk-user"), "sk-user")
+
+    def test_override_falls_back_to_env(self):
+        os.environ["ANTHROPIC_API_KEY"] = "sk-env"
+        self.assertEqual(ai_capture._api_key(""), "sk-env")
+
+    def test_hash_prefixed_override_ignored(self):
+        os.environ["ANTHROPIC_API_KEY"] = "sk-env"
+        self.assertEqual(ai_capture._api_key("# placeholder"), "sk-env")
+
+    def test_empty_everywhere_means_stub(self):
+        self.assertEqual(ai_capture._api_key(""), "")
+        self.assertFalse(ai_capture.anthropic_ready(""))
 
 
 class LinkTest(_Base):

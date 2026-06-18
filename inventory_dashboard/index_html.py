@@ -219,6 +219,16 @@ _INDEX_TEMPLATE = r"""
           <input type="file" id="invoiceImage" accept="image/*" capture="environment">
           <p class="note" id="invoiceStatus">AIが「<span id="dzKindLabel">仕入</span>」フォームに下書きを反映します。⚠の項目は確認のうえ登録してください。</p>
         </div>
+        <!-- A-6 BYO-key: 自分のAnthropicキーを入れると本物のAIで解析（既定はサンプル動作）。 -->
+        <div id="aiKeyPanel" style="margin:8px 0;padding:8px 10px;border:1px solid var(--border,#e2e2e2);border-radius:8px;background:rgba(0,0,0,0.02);">
+          <p class="note" id="aiKeyStatus" style="margin:0 0 6px;"></p>
+          <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;">
+            <input type="password" id="anthropicKeyInput" placeholder="sk-ant-... を貼り付け" autocomplete="off" spellcheck="false" style="flex:1;min-width:150px;">
+            <button type="button" id="aiKeySave">有効化</button>
+            <button type="button" id="aiKeyClear">解除</button>
+          </div>
+          <p class="note" style="margin:6px 0 0;font-size:0.82em;line-height:1.45;">🔒 キーは<strong>このブラウザにだけ</strong>保存され、解析の時だけサーバへ送られます（<strong>サーバには保存しません</strong>）。料金はあなたのAnthropicアカウントに発生します。未入力ならサンプル動作（無料）。</p>
+        </div>
         <div>
           <form id="purchaseForm" class="transaction-form active">
             <input type="hidden" name="voucher_id">
@@ -900,7 +910,11 @@ _INDEX_TEMPLATE = r"""
       try {
         const body = new FormData();
         body.append("file", file);
-        const result = await api(`/api/invoice-capture?kind=${kind}`, { method: "POST", body });
+        // BYO-key: ブラウザに保存した自分のキーがあれば、この解析リクエストにだけ添えて送る。
+        const headers = {};
+        const aiKey = getAnthropicKey();
+        if (aiKey) headers["X-Anthropic-Key"] = aiKey;
+        const result = await api(`/api/invoice-capture?kind=${kind}`, { method: "POST", body, headers });
         const d = result.draft;
         if (form.partner_name) setSelectByText(form.partner_name, d.partner_name);
         form.invoice_no.value = d.invoice_no || "";
@@ -943,6 +957,39 @@ _INDEX_TEMPLATE = r"""
         if (it.type && it.type.startsWith("image/")) { captureInvoice(it.getAsFile()); break; }
       }
     });
+
+    // A-6 BYO-key: 自分の Anthropic キーをこのブラウザにだけ保存し、解析時にヘッダで都度送る。
+    const AI_KEY_LS = "anthropic_api_key";
+    function getAnthropicKey() {
+      try { return (localStorage.getItem(AI_KEY_LS) || "").trim(); } catch (e) { return ""; }
+    }
+    function renderAiKeyStatus() {
+      const has = !!getAnthropicKey();
+      const statusEl = document.getElementById("aiKeyStatus");
+      if (statusEl) {
+        statusEl.innerHTML = has
+          ? "🟢 AI解析：<strong>あなたのキーで有効</strong>（本物のClaudeで読み取り）"
+          : "⚪ AI解析：<strong>サンプル動作中</strong>（自分のAnthropicキーを入れると本物のAIになります）";
+      }
+      const input = document.getElementById("anthropicKeyInput");
+      if (input) input.placeholder = has ? "設定済み（変更する場合は貼り直し）" : "sk-ant-... を貼り付け";
+    }
+    const aiKeySaveBtn = document.getElementById("aiKeySave");
+    if (aiKeySaveBtn) aiKeySaveBtn.addEventListener("click", () => {
+      const input = document.getElementById("anthropicKeyInput");
+      const v = (input.value || "").trim();
+      try { if (v) localStorage.setItem(AI_KEY_LS, v); } catch (e) { /* localStorage 無効でも続行 */ }
+      input.value = "";
+      renderAiKeyStatus();
+    });
+    const aiKeyClearBtn = document.getElementById("aiKeyClear");
+    if (aiKeyClearBtn) aiKeyClearBtn.addEventListener("click", () => {
+      try { localStorage.removeItem(AI_KEY_LS); } catch (e) { /* no-op */ }
+      const input = document.getElementById("anthropicKeyInput");
+      if (input) input.value = "";
+      renderAiKeyStatus();
+    });
+    renderAiKeyStatus();
 
     let currentVouchers = [];
     let vouchersExpanded = false;
