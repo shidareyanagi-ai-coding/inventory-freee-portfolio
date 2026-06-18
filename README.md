@@ -1,147 +1,107 @@
-# Inventory × Pseudo freee Portfolio
+# 在庫管理 × 需要予測 × AI証憑入力 ダッシュボード
 
-> 📌 **現在の方針（発展計画）の正本は [`docs/EVOLUTION_PLAN.md`](docs/EVOLUTION_PLAN.md) です。**
-> 全体の進め方・採用スタックは必ずこちらを参照してください（本READMEや各要件定義より優先）。
-> 方針: **Plan A（FastAPI＋Neon＋Clerk＋Python予測＝シンプル版）を先に完成 → 余力で Plan B（Next.js を上乗せ＝ハイブリッド）**。
+小規模EC・中小企業の仕入担当者を想定した、**在庫管理＋AI需要予測＋AI証憑入力**の業務アプリです。
+仕入・売上の登録から、適正在庫の判断、会計（freee）連携用データの作成までを一気通貫でデモできます。
 
-## 概要
+## 🚀 ライブデモ
 
-このポートフォリオは、在庫管理ダッシュボードと疑似freee会計ダッシュボードを連携させる業務アプリ群です。
+**👉 https://inventory-dashboard-61w8.onrender.com**
 
-目的は、小規模EC・中小企業を想定し、以下の業務フローをデモできるようにすることです。
+- サインイン（Clerk）後、**あなた専用のデモデータ（商品・2年分の販売履歴）が自動投入**され、すぐ触れます。
+- 無料ホスティング（Render）のため、**初回アクセスは起動に30〜60秒**かかることがあります（スリープからの復帰）。
+- レシート/請求書の**AI読み取り**は、既定では無料のサンプル動作です。本物のAIで試したい場合は、画面の「AI設定」欄に**自分のAnthropic APIキー**を貼ると有効になります（→ [各自APIキー方式](#-各自apiキー方式byo-key)）。
 
-```text
-仕入・売上登録
-  ↓
-在庫管理
-  ↓
-在庫元帳・適正在庫シミュレーション
-  ↓
-freee連携用データ作成
-  ↓
-疑似freee会計ダッシュボードへ送信
-  ↓
-会計取引として確認
-```
+## 📸 スクリーンショット
 
-## 想定フォルダ構成
-
-将来的には、以下のような上位フォルダ構成に整理します。
-
-```text
-inventory-freee-portfolio/
-  README.md
-  ARCHITECTURE.md
-  DEVELOPMENT_HANDOFF.md
-  DEPLOYMENT_PLAN.md
-  inventory_dashboard/
-    app.py
-    inventory.db
-    README.md
-    ROADMAP.md
-    ...
-  pseudo_freee/
-    app.py
-    pseudo_freee.db
-    README.md
-    ...
-  docs/
-    DESIGN_HANDOFF.md
-    FREEE_INTEGRATION_PLAN.md
-    screenshots/
-```
-
-## アプリの役割
-
-| フォルダ | 役割 |
+| ダッシュボード | 適正在庫シミュレーション（AI予測） |
 |---|---|
-| `inventory_dashboard` | 在庫管理、仕入・売上登録、在庫元帳、適正在庫シミュレーション、freee送信キューを担当 |
-| `pseudo_freee` | 在庫管理アプリから送信された会計データを受け取り、疑似freee取引台帳として表示 |
-| `docs` | 設計資料、デザイン受け渡し資料、スクリーンショット、連携計画を管理 |
+| ![dashboard](docs/screenshots/dashboard-overview.png) | ![forecast](docs/screenshots/forecast-simulation.png) |
 
-## 現在の状態
+> 画像は随時更新します。全画面版は [`docs/screenshots/`](docs/screenshots/) にあります。
 
-現在は `inventory_dashboard` 相当のアプリが先に実装されています。
+## ✨ 主な機能
 
-実装済みの主な機能:
+| 機能 | 内容 |
+|---|---|
+| 在庫管理 | 商品マスタ・取引先マスタ・仕入/売上登録・商品別在庫元帳・取消/訂正履歴 |
+| 適正在庫シミュレーション | 現在在庫・必要在庫・今すぐ発注量・月末判定を一覧表示（**AI予測ベース**） |
+| 需要予測（レベル2） | 3モデル（ベースライン/SARIMA/LightGBM）を**バックテスト(MAE/MAPE)で比較し、商品ごとに最良モデルを自動採用**。実績線＋予測線＋信頼区間(80%)をグラフ表示 |
+| AI証憑入力 | 仕入/売上の請求書画像 → Claude vision が下書きを生成 → 人が確認して登録（**自動登録はしない**） |
+| マルチテナント認証 | Clerk による組織単位のデータ分離（他テナントのデータは見えない設計） |
+| freee連携デモ | 送信待ちキュー・送信前レビューJSON（疑似freeeアプリへ連携） |
 
-- 商品マスタ
-- 取引先マスタ
-- 仕入明細登録
-- 売上明細登録
-- 在庫移動台帳
-- 商品別在庫元帳
-- 取消・訂正履歴
-- 今月仕入・売上集計
-- 適正在庫シミュレーション
-- freee送信待ちキュー
-- freee送信前レビューJSON
+## 🛠 技術スタック
 
-次の開発対象は `pseudo_freee` です。
+| 領域 | 採用技術 |
+|---|---|
+| 言語 / フレームワーク | Python 3.11 / FastAPI + Uvicorn |
+| データベース | **Neon (PostgreSQL)** ／ ローカルは SQLite（`DATABASE_URL` で自動切替） |
+| 認証 | **Clerk**（JWT を JWKS(RS256) で検証・マルチテナント） |
+| 画像ストレージ | **Cloudflare R2**（S3互換）／ 未設定時はローカルフォルダ（`STORAGE_*` で切替） |
+| AI（証憑読み取り） | **Anthropic Claude**（vision・structured outputs） |
+| 需要予測 | pandas / NumPy / scikit-learn / **LightGBM** / statsmodels(SARIMA) |
+| ホスティング | **Render**（Blueprint `render.yaml`） |
 
-## 今後の開発方針
-
-1. `pseudo_freee` フォルダを新規作成する
-2. 疑似freee側で会計取引を受け取るAPIを作る
-3. 在庫管理アプリの `freee_sync_queue` から疑似freeeへ送信する
-4. 疑似freee側で取引一覧・詳細確認画面を作る
-5. 将来的に本物のfreee APIへ置き換えられる構成にする
-6. GitHub公開・デプロイを見据えてDB設定、環境変数、READMEを整備する
-
-## DB方針
-
-現時点では、両アプリともSQLiteで開始して構いません。
-
-理由:
-
-- ローカルで動作確認しやすい
-- ポートフォリオのMVPとして扱いやすい
-- DBサーバーなしでデモできる
-
-ただし、本番・デプロイ前提ではPostgreSQLへの移行を想定します。
-
-将来対応:
-
-- DB接続設定を環境変数化する
-- SQLite/PostgreSQLを切り替えられる設計にする
-- マイグレーション方針を作る
-- デプロイ先のDBにPostgreSQLを使う
-
-## 取引先マスタとfreee連携の方針
-
-`inventory_dashboard` では、仕入先・得意先を `partners` マスタとして保持します。
-
-これは単なる入力補助ではなく、将来のfreee連携で重要な中間レイヤーです。
-
-- 仕入・売上入力時は、取引先をクリック/選択して明細へ紐づける
-- `purchases` / `sales` には `partner_id` と、登録時点の `partner_name` の両方を保存する
-- `partner_name` は過去帳簿の表示を安定させるためのスナップショットとして扱う
-- `partners.freee_partner_id` は将来、本物freee側の取引先IDを保存するためのマッピング欄として使う
-- 疑似freee連携でも、本物freee連携でも、送信データには `partner_master_id` と `freee_partner_id` を含められる設計にする
-
-この方針により、取引先名の表記揺れを減らし、送信前レビュー、疑似freee、将来の本物freee API連携で同じ取引先を安定して扱えるようにします。
-
-## デプロイ方針
-
-GitHub公開とクラウドデプロイを前提にします。
-
-初期:
-
-- GitHubにコード、README、スクリーンショット、設計資料を公開
-- ローカル起動手順を明記
-- サンプルデータを自動生成
-
-疑似freeeの具体的な拡張計画は `docs/PSEUDO_FREEE_PRODUCT_PLAN.md` に整理します。
-
-次段階:
-
-- Render、Railway、Fly.ioなどにデモ環境を作る
-- `inventory_dashboard` と `pseudo_freee` を別サービスとしてデプロイ
-- 疑似freeeのAPI URLを環境変数で指定する
-
-例:
+## 🧩 アーキテクチャ
 
 ```text
-INVENTORY_APP_URL=https://inventory-dashboard.example.com
-PSEUDO_FREEE_API_URL=https://pseudo-freee.example.com
+            ┌──────────────────────────────┐
+            │  ブラウザ（仕入担当者）         │
+            └──────────────┬───────────────┘
+                           │  Clerk でサインイン
+                           ▼
+        ┌──────────────────────────────────────┐
+        │  在庫アプリ  (FastAPI / Render)         │
+        │  ・在庫管理 / 需要予測 / AI証憑入力      │
+        └───┬───────────────┬──────────────┬────┘
+            │ 文字・数値      │ 画像ファイル   │ AI解析（任意）
+            ▼               ▼              ▼
+      Neon (Postgres)   Cloudflare R2   Anthropic Claude
+      台帳データ          証憑画像        ※利用者のキーで都度実行
 ```
+
+役割が違う3つの外部サービス（台帳=Neon／倉庫=R2／認証=Clerk）を、それぞれ環境変数で差し替え可能に設計しています。
+
+## 🔑 各自APIキー方式（BYO-key）
+
+公開デモでも**運営者のAI利用料が増えない**よう、AIキーは利用者が持ち込む方式にしています。
+
+- 既定は**AIオフ＝決定的なサンプル動作**（誰でも無料で一通り試せる）。
+- 利用者が画面で**自分のAnthropicキーを貼る**と本物のAI解析が有効になる。
+- そのキーは**ブラウザにのみ保存**し、解析の**都度だけサーバへ送信**、**サーバ・DB・ログには一切保存しない**。
+
+設計の核は `inventory_dashboard/ai_capture.py`（リクエスト毎にキーを受け取り、無ければスタブにフォールバック）。
+
+## 💻 ローカルでの動かし方
+
+```bash
+git clone https://github.com/87yoko-ai-engineer/inventory-freee-portfolio.git
+cd inventory-freee-portfolio
+python -m venv .venv
+# Windows: .venv\Scripts\activate   /   Mac・Linux: source .venv/bin/activate
+pip install -r requirements.txt
+
+# 環境変数（任意。未設定でも SQLite + 開発ログイン + スタブAI で動く）
+cp .env.example .env   # Windows: Copy-Item .env.example .env
+
+cd inventory_dashboard
+python app.py          # → http://127.0.0.1:8000
+```
+
+- `DATABASE_URL` 未設定なら **SQLite**、`AUTH_DEV_MODE=true` なら Clerk 無しの**開発ログイン**で動きます。
+- テスト: `pytest`（`inventory_dashboard/` 配下。SQLite で実行）。
+
+## 📌 補足・既知の制約
+
+- **疑似freeeアプリ（`pseudo_freee/`）は現在ローカル専用**（Python標準サーバ＋SQLite）で、今回のクラウド公開には含めていません。「freee送信」はデモ上、相手未公開のため穏当にエラー表示されます。
+- Clerk は **開発インスタンス**（テストキー）を利用しています（本番インスタンスは独自ドメインが必要なため将来対応）。
+- Render 無料枠のため、15分アクセスが無いとスリープ → 次アクセスで数十秒の起動待ちが発生します。
+
+## 📚 ドキュメント
+
+| 資料 | 内容 |
+|---|---|
+| [`docs/EVOLUTION_PLAN.md`](docs/EVOLUTION_PLAN.md) | 開発計画・採用スタックの検討記録 |
+| [`docs/FREEE_INTEGRATION_PLAN.md`](docs/FREEE_INTEGRATION_PLAN.md) | freee連携の設計 |
+| [`ARCHITECTURE.md`](ARCHITECTURE.md) | 構成メモ |
+| [`inventory_dashboard/ROADMAP.md`](inventory_dashboard/ROADMAP.md) | 機能ロードマップ |
