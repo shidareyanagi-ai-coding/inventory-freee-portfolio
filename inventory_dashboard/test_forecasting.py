@@ -84,13 +84,24 @@ class ForecastingTest(unittest.TestCase):
         self.assertEqual(row["required_inventory"], expected_ltd + int(product["safety_stock"]))
 
     def test_order_candidates_are_ai_based_with_stock_fields(self):
-        # 発注候補は AI シミュレーションから「現在在庫/必要在庫/今すぐ発注量」を返す（旧 basis 等は無い）。
+        # 発注候補は AI シミュレーションから「現在在庫/必要在庫/今すぐ発注量/判定」を返す（旧 basis 等は無い）。
         with app.get_conn() as conn:
             candidates = app.list_order_candidates(conn, self.org_id)
         for c in candidates:
-            self.assertEqual(set(c.keys()), {"sku", "product_name", "stock_quantity", "required_inventory", "recommended_order_quantity"})
+            self.assertEqual(
+                set(c.keys()),
+                {"sku", "product_name", "stock_quantity", "required_inventory", "recommended_order_quantity", "judgement"},
+            )
             self.assertGreater(c["recommended_order_quantity"], 0)
             self.assertEqual(c["recommended_order_quantity"], max(c["required_inventory"] - c["stock_quantity"], 0))
+
+    def test_order_candidate_for_selected_product_returns_one_even_if_not_needed(self):
+        # product_id 指定時は、発注不要の商品でも1件返す（需要予測レベル2で選択商品に連動表示する用）。
+        with app.get_conn() as conn:
+            pid = self._first_product_id(conn, self.org_id)
+            rows = app.list_order_candidates(conn, self.org_id, product_id=pid)
+        self.assertEqual(len(rows), 1)
+        self.assertIn(rows[0]["judgement"], ("発注推奨", "発注不要", "データ不足"))
 
     # --- 予測の書き込み ---------------------------------------------------
     def test_run_forecast_writes_all_tables_scoped_to_org(self):

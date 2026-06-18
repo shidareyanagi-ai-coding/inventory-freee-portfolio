@@ -1017,6 +1017,7 @@ def forecast_simulation(conn: db.Connection, organization_id: int, horizon_days:
 
         rows.append(
             {
+                "product_id": product["id"],
                 "sku": product["sku"],
                 "product_name": product["product_name"],
                 "stock_quantity": product["stock_quantity"],
@@ -1221,23 +1222,34 @@ def list_model_evaluations(conn: db.Connection, organization_id: int) -> list[di
     ).fetchall()
 
 
-def list_order_candidates(conn: db.Connection, organization_id: int) -> list[dict[str, Any]]:
-    """発注候補（今すぐ発注が必要な商品）。適正在庫シミュレーション(AI予測ベース)から
-    「今すぐ発注量 > 0」の商品を、現在在庫・必要在庫・今すぐ発注量で返す（A-6: 全画面で表記統一）。"""
+def list_order_candidates(
+    conn: db.Connection, organization_id: int, product_id: int | None = None
+) -> list[dict[str, Any]]:
+    """発注判定（適正在庫シミュレーションのAI予測ベース・現在在庫/必要在庫/今すぐ発注量/判定）。
+
+    product_id 指定時はその商品1件（発注不要でも返す。需要予測レベル2で選択商品に連動表示する用）。
+    未指定時は「今すぐ発注量 > 0」の商品を発注量の多い順で返す（A-6: 全画面で表記統一）。
+    """
     sim = forecast_simulation(conn, organization_id, 30)
-    candidates = [
+    if product_id is not None:
+        selected = [row for row in sim["rows"] if row["product_id"] == product_id]
+    else:
+        selected = sorted(
+            (row for row in sim["rows"] if row["recommended_order_quantity"] > 0),
+            key=lambda r: r["recommended_order_quantity"],
+            reverse=True,
+        )
+    return [
         {
             "sku": row["sku"],
             "product_name": row["product_name"],
             "stock_quantity": row["stock_quantity"],
             "required_inventory": row["required_inventory"],
             "recommended_order_quantity": row["recommended_order_quantity"],
+            "judgement": row["lead_time_judgement"],
         }
-        for row in sim["rows"]
-        if row["recommended_order_quantity"] > 0
+        for row in selected
     ]
-    candidates.sort(key=lambda r: r["recommended_order_quantity"], reverse=True)
-    return candidates
 
 
 # ---------------------------------------------------------------------------
@@ -1828,9 +1840,12 @@ def api_forecast_evaluations(identity: Identity = Depends(current_identity)) -> 
 
 
 @app.get("/api/forecast/order-candidates")
-def api_forecast_order_candidates(identity: Identity = Depends(current_identity)) -> list[dict[str, Any]]:
+def api_forecast_order_candidates(
+    product_id: int = 0, identity: Identity = Depends(current_identity)
+) -> list[dict[str, Any]]:
+    # product_id 指定で「選択商品1件」、0 で「発注が必要な全商品」を返す。
     with get_conn() as conn:
-        return list_order_candidates(conn, identity.organization_id)
+        return list_order_candidates(conn, identity.organization_id, product_id or None)
 
 
 # --- 証憑（仕入・売上請求書）参照系（A-5・全ロール可）-----------------------

@@ -302,7 +302,7 @@ _INDEX_TEMPLATE = r"""
       <p class="note" id="forecastMlNote">baseline / SARIMA / LightGBM をバックテスト(MAE/MAPE)で比較し、実績線＋予測線＋信頼区間(80%)を表示します。「予測バッチを実行」で再計算します。</p>
       <div class="forecast-controls">
         <label class="inline-control">商品
-          <select id="forecastProduct" onchange="loadForecastChart()"></select>
+          <select id="forecastProduct" onchange="onForecastProductChange()"></select>
         </label>
         <label class="inline-control">モデル
           <select id="forecastModel" onchange="loadForecastChart()"></select>
@@ -315,7 +315,7 @@ _INDEX_TEMPLATE = r"""
           <div id="forecastEvaluations"></div>
         </div>
         <div>
-          <h3 class="sub">発注候補（今すぐ発注が必要な商品）</h3>
+          <h3 class="sub">選択商品の発注判定</h3>
           <div id="forecastCandidates"></div>
         </div>
       </div>
@@ -544,15 +544,22 @@ _INDEX_TEMPLATE = r"""
         ]));
     }
 
+    // 上の商品ドロップダウンで選んだ商品の発注判定を表示する（グラフと商品を一致させる）。
+    function onForecastProductChange() {
+      loadForecastChart();
+      loadForecastCandidates();
+    }
     async function loadForecastCandidates() {
-      const rows = await api("/api/forecast/order-candidates");
+      const productId = document.getElementById("forecastProduct").value;
       const target = document.getElementById("forecastCandidates");
+      if (!productId) { target.innerHTML = ""; return; }
+      const rows = await api(`/api/forecast/order-candidates?product_id=${productId}`);
       if (!rows.length) {
-        target.innerHTML = '<p class="note">発注候補はありません（予測上、在庫は当面足ります）。</p>';
+        target.innerHTML = '<p class="note">この商品の予測がまだありません。「予測バッチを実行」を押してください。</p>';
         return;
       }
-      target.innerHTML = table(["商品", "現在在庫", "必要在庫", "今すぐ発注量"],
-        rows.map(r => [`${r.sku} ${r.product_name}`, r.stock_quantity, r.required_inventory, r.recommended_order_quantity]));
+      target.innerHTML = table(["商品", "現在在庫", "必要在庫", "今すぐ発注量", "判定"],
+        rows.map(r => [`${r.sku} ${r.product_name}`, r.stock_quantity, r.required_inventory, r.recommended_order_quantity, forecastJudgement(r.judgement)]));
     }
 
     async function runForecastBatch() {
