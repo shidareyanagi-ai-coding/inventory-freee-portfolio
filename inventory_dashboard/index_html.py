@@ -163,6 +163,7 @@ _INDEX_TEMPLATE = r"""
     <h1>在庫管理ダッシュボード</h1>
     <div class="user-area">
       <span class="role-badge" id="roleBadge" hidden></span>
+      <a href="/launcher" style="color:#cfe8ff;font-size:13px;text-decoration:none;white-space:nowrap;">🏠 アプリ入口</a>
       <button class="secondary" onclick="loadAll()">更新</button>
       <div id="clerk-user"></div>
     </div>

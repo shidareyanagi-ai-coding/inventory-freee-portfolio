@@ -4,6 +4,7 @@ import base64
 import hashlib
 import html
 import json
+import os
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime
@@ -14,6 +15,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 import ai_capture
+import auth
 
 try:
     # .env があれば ANTHROPIC_API_KEY 等を読み込む（無ければ何もしない）。
@@ -30,8 +32,14 @@ DB_PATH = APP_DIR / "pseudo_freee.db"
 # A-5 ステップ2: 証憑（レシート）の元画像はサーバ側のここに保存し、DBにはパスのみを持つ（.gitignore 済み）。
 # 本番(A-6)ではオブジェクトストレージ(S3互換/R2)に差し替える前提（EVOLUTION_PLAN.md「画像保存」）。
 VOUCHER_DIR = APP_DIR / "voucher_store"
-HOST = "127.0.0.1"
-PORT = 8010
+# 本番(Render等)は環境変数 PORT で待ち受けポートが渡され、外部公開のため 0.0.0.0 にバインドする。
+# ローカルは従来どおり 127.0.0.1:8010。PORT が来ているか（=クラウド上か）で自動で切り替える（A-6）。
+# 在庫アプリ(inventory_dashboard/app.py)と同じ方針＝説明しやすさのため作りを揃える。
+PORT = int(os.environ.get("PORT") or os.environ.get("PSEUDO_FREEE_PORT", "8010"))
+HOST = os.environ.get("PSEUDO_FREEE_HOST") or ("0.0.0.0" if os.environ.get("PORT") else "127.0.0.1")
+# A-6:「入口ページ＋アプリ選択」用。在庫アプリ(=入口ページの置き場所)の公開URL。
+# 設定時、疑似freee の画面上部に「← アプリ入口へ」リンクを出す（未設定なら出さない）。
+INVENTORY_APP_URL = os.environ.get("INVENTORY_APP_URL", "").strip().rstrip("/")
 
 
 DEALS_TABLE_SQL = """
@@ -1249,7 +1257,93 @@ def get_monthly_trends(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     return trends
 
 
+# A-6: Clerk サインインのブートストラップ（在庫 index_html.py の方式を踏襲）。
+# 公開キー pk_xxx の3要素目以降は frontend-api ホストの base64（末尾 '$' を除去）。
+# 生文字列(r''')で正規表現のバックスラッシュをそのまま保つ。template literal(${})は使わない。
+_PF_CLERK_BOOTSTRAP_JS = "<script>\n" + r'''(function(){
+  var CFG = window.__PF_CONFIG__ || {};
+  function feApi(pk){ var e = pk.split("_").slice(2).join("_"); try { return atob(e).replace(/\$$/, ""); } catch(_){ return ""; } }
+  function loadClerk(pk){
+    return new Promise(function(resolve, reject){
+      var host = feApi(pk);
+      if(!host){ reject(new Error("Clerk 公開キーの形式が不正です")); return; }
+      var s = document.createElement("script");
+      s.async = true; s.crossOrigin = "anonymous";
+      s.setAttribute("data-clerk-publishable-key", pk);
+      s.src = "https://" + host + "/npm/@clerk/clerk-js@5/dist/clerk.browser.js";
+      s.onload = resolve;
+      s.onerror = function(){ reject(new Error("Clerk スクリプトの読み込みに失敗しました")); };
+      document.head.appendChild(s);
+    });
+  }
+  function gate(){ document.documentElement.classList.add("pf-gated"); }
+  function ungate(){ document.documentElement.classList.remove("pf-gated"); }
+  async function boot(){
+    if(!CFG.clerkConfigured || CFG.devMode){ ungate(); return; }  // dev/未設定は素通り
+    gate();
+    await loadClerk(CFG.clerkPublishableKey);
+    await window.Clerk.load();
+    function render(){
+      if(window.Clerk.user){
+        ungate();
+        var u = document.getElementById("pf-clerk-user");
+        if(u){ u.innerHTML = ""; window.Clerk.mountUserButton(u); }
+      } else {
+        gate();
+        var g = document.getElementById("pf-clerk-signin");
+        if(g && !g.hasChildNodes()){ window.Clerk.mountSignIn(g); }
+      }
+    }
+    window.Clerk.addListener(render);
+    render();
+  }
+  boot().catch(function(e){ var el = document.getElementById("pf-gate-msg"); if(el){ el.textContent = e.message; } });
+})();''' + "\n</script>"
+
+
 def render_page(title: str, body: str) -> bytes:
+    # A-6: 在庫アプリと「同じ Clerk」でサインインゲートを掛ける（=同じログインで両アプリを使える）。
+    # サーバ側は env から公開設定だけを読み、ブラウザ側(ClerkJS)がサインインを必須化する。
+    # 疑似freee は外部システムのモックなので、画面(人が見る所)はゲートし、/api/deals(在庫からの
+    # server-to-server 送信を受ける口)は機械向け API として開けておく（in auth.py に明記）。
+    gate_config = {
+        "clerkPublishableKey": auth.clerk_publishable_key(),
+        "clerkConfigured": auth.clerk_configured(),
+        "devMode": auth.auth_dev_mode(),
+    }
+    # </script> でテンプレが壊れないよう "/" をエスケープして埋め込む（在庫 index_html と同じ防御）。
+    gate_config_json = json.dumps(gate_config, ensure_ascii=False).replace("</", "<\\/")
+    gate_head = (
+        "<script>window.__PF_CONFIG__ = " + gate_config_json + ";</script>\n"
+        "<script>(function(){var c=window.__PF_CONFIG__||{};"
+        # 本番(Clerk設定あり・devでない)は、本文が描画される前に伏せておく（未サインインの内容を一瞬も出さない）。
+        "if(c.clerkConfigured&&!c.devMode){document.documentElement.classList.add('pf-gated');}})();</script>\n"
+        "<style>\n"
+        "  html.pf-gated body > header, html.pf-gated body > main { visibility: hidden; }\n"
+        "  #pf-signin-gate { display: none; }\n"
+        "  html.pf-gated #pf-signin-gate { display: flex; position: fixed; inset: 0; z-index: 50;\n"
+        "    align-items: center; justify-content: center; background: rgba(15,23,42,.45); }\n"
+        "  #pf-signin-gate .pf-gate-card { background: #fff; border: 1px solid #d9e2ec; border-radius: 12px;\n"
+        "    padding: 24px; max-width: 460px; width: calc(100% - 32px); box-shadow: 0 18px 48px rgba(15,23,42,.22); }\n"
+        "  #pf-signin-gate h2 { margin: 0 0 6px; font-size: 18px; }\n"
+        "  #pf-signin-gate p { margin: 0 0 14px; color: #65758b; font-size: 13px; }\n"
+        "  #pf-clerk-user { display: inline-flex; align-items: center; }\n"
+        "</style>"
+    )
+    inventory_link = (
+        f'<a href="{html.escape(INVENTORY_APP_URL)}/launcher">← アプリ入口へ</a> '
+        if INVENTORY_APP_URL
+        else ""
+    )
+    gate_body = (
+        '<div id="pf-signin-gate"><div class="pf-gate-card">'
+        "<h2>疑似freee にサインイン</h2>"
+        "<p>在庫ダッシュボードと<strong>同じアカウント</strong>でサインインしてください。</p>"
+        '<div id="pf-clerk-signin"></div>'
+        '<p id="pf-gate-msg" style="color:#b91c1c;font-size:13px;"></p>'
+        "</div></div>\n"
+        + _PF_CLERK_BOOTSTRAP_JS
+    )
     page = f"""<!doctype html>
 <html lang="ja">
 <head>
@@ -1683,15 +1777,17 @@ def render_page(title: str, body: str) -> bytes:
       dl {{ grid-template-columns: 1fr; }}
     }}
   </style>
+{gate_head}
 </head>
 <body>
   <header>
     <div class="wrap topbar">
       <h1>疑似freee会計ダッシュボード</h1>
-      <nav><a href="/">取引一覧</a> <span class="label">/ API: POST /api/deals</span></nav>
+      <nav>{inventory_link}<a href="/">取引一覧</a> <span class="label">/ API: POST /api/deals</span> <span id="pf-clerk-user"></span></nav>
     </div>
   </header>
   <main class="wrap">{body}</main>
+{gate_body}
 </body>
 </html>"""
     return page.encode("utf-8")

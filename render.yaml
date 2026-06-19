@@ -1,8 +1,10 @@
-# Render Blueprint（A-6 デプロイ）: 在庫ダッシュボード(inventory_dashboard)のみ公開する。
+# Render Blueprint（A-6 デプロイ）: 在庫ダッシュボードと疑似freee を「同じ Clerk ログイン」で公開する。
 # 使い方: Render で「New + → Blueprint」→ この GitHub リポジトリを選ぶと本ファイルを自動で読む。
+#   2 つの Web サービス（inventory-dashboard / pseudo-freee）が作られる。
 #   秘密値(sync:false の項目)は Render の画面で各自入力する（このファイルには絶対に書かない）。
-# 疑似freee(pseudo_freee)は現状デプロイ非対応のため今回は公開しない。
+# 入口ページ(/launcher)で在庫⇄疑似freee を選ぶ。両サービスで同じ Clerk（公開キー/issuer）を使う＝同じログイン。
 services:
+  # --- ① 在庫管理ダッシュボード（FastAPI + 需要予測/ML） ---------------------
   - type: web
     name: inventory-dashboard
     runtime: python
@@ -33,7 +35,36 @@ services:
         sync: false
       - key: STORAGE_SECRET_ACCESS_KEY
         sync: false
+      - key: PSEUDO_FREEE_API_URL
+        sync: false               # 疑似freee の公開URL（②のURL。例 https://pseudo-freee.onrender.com）。
+                                  #   入口ページ /launcher の「疑似freee」カードのリンク先＆「freee送信」の宛先を兼ねる。
+                                  #   ② をデプロイしてURLが決まってから設定する（未設定なら freee送信は穏当に「接続できません」）。
 
       # ANTHROPIC_API_KEY は「設定しない」: BYO-key のため空のまま＝利用者が各自ブラウザで入力する。
       #   ここに鍵を入れると全員の解析が運営者(あなた)の課金になるので注意。
-      # PSEUDO_FREEE_API_URL も未設定: 疑似freee未公開。送信操作は「接続できません」と穏当に表示される。
+
+  # --- ② 疑似freee 会計（標準ライブラリ http.server + SQLite） ---------------
+  # データは Render 無料枠のため揮発（再デプロイ/スリープ復帰で消える）。起動時にマスタを再シードするので
+  #   常に綺麗な状態で見せられる。取引・レシートはデモ中に在庫からの送信や AI 取込でその場で作る方針。
+  - type: web
+    name: pseudo-freee
+    runtime: python
+    plan: free
+    region: singapore
+    buildCommand: pip install -r requirements.txt
+    startCommand: python pseudo_freee/app.py
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.9"
+      - key: APP_ENV
+        value: production         # Clerk サインインを必須化（在庫と同じログイン）
+      # 同じ Clerk インスタンスを使う＝在庫と同じアカウントで両アプリを行き来できる。
+      - key: CLERK_PUBLISHABLE_KEY
+        sync: false               # 在庫と「同じ」pk_test_...
+      - key: CLERK_ISSUER
+        sync: false               # 在庫と「同じ」https://xxxx.clerk.accounts.dev
+      - key: INVENTORY_APP_URL
+        sync: false               # 在庫アプリ(入口ページの置き場所)の公開URL。例 https://inventory-dashboard-61w8.onrender.com
+                                  #   疑似freee 画面上部の「← アプリ入口へ」リンク先になる。
+      # ANTHROPIC_API_KEY は設定しない: 未設定ならレシートAIは決定的スタブで動く（無課金デモ）。
+      # DATABASE_URL / STORAGE_* は不要（SQLite＋ローカル保存・揮発許容）。

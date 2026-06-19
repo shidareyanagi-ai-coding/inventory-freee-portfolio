@@ -48,6 +48,15 @@ class InventoryApiTest(unittest.TestCase):
         self.assertIn("text/html", res.headers["content-type"])
         self.assertIn("在庫管理ダッシュボード", res.text)
 
+    def test_launcher_page_shows_both_apps(self):
+        # A-6: 入口（アプリ選択）ページ。在庫と疑似freee の2枚カードを出す。
+        res = self.client.get("/launcher")
+        self.assertEqual(res.status_code, 200)
+        self.assertIn("text/html", res.headers["content-type"])
+        self.assertIn("業務アプリ入口", res.text)
+        self.assertIn("在庫管理ダッシュボード", res.text)
+        self.assertIn("疑似freee", res.text)
+
     def test_dashboard_returns_expected_shape(self):
         res = self.client.get("/api/dashboard")
         self.assertEqual(res.status_code, 200)

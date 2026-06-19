@@ -515,5 +515,100 @@ class PseudoFreeeVoucherTest(unittest.TestCase):
         self.assertTrue(0 < i_deals < i_trend < i_master)
 
 
+class PseudoFreeeAuthGateTest(unittest.TestCase):
+    """A-6: 在庫アプリと同じ Clerk でサインインゲートを掛ける（同じログインで両アプリ）。"""
+
+    _ENV_KEYS = ("CLERK_ISSUER", "CLERK_JWKS_URL", "CLERK_PUBLISHABLE_KEY", "APP_ENV", "AUTH_DEV_MODE")
+
+    def setUp(self) -> None:
+        self._saved = {k: os.environ.get(k) for k in self._ENV_KEYS}
+        for k in self._ENV_KEYS:
+            os.environ.pop(k, None)
+
+    def tearDown(self) -> None:
+        for k, v in self._saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def test_gate_active_when_clerk_configured_in_production(self) -> None:
+        os.environ["APP_ENV"] = "production"
+        os.environ["CLERK_ISSUER"] = "https://demo.clerk.accounts.dev"
+        os.environ["CLERK_PUBLISHABLE_KEY"] = "pk_test_ZGVtby5jbGVyay5hY2NvdW50cy5kZXYk"
+        html = app.render_page("テスト", "<p>本文</p>").decode("utf-8")
+        # 本文が出る前に伏せるプリロード＋サインインゲートが入る。
+        self.assertIn("pf-gated", html)
+        self.assertIn('id="pf-signin-gate"', html)
+        self.assertIn('"clerkConfigured": true', html)
+        self.assertIn('"devMode": false', html)
+        # 公開キーは出してよい（埋め込まれる）。秘密キーは扱っていない。
+        self.assertIn("pk_test_ZGVtby5jbGVyay5hY2NvdW50cy5kZXYk", html)
+
+    def test_dev_mode_passes_through_without_gate(self) -> None:
+        os.environ["APP_ENV"] = "development"
+        os.environ["AUTH_DEV_MODE"] = "true"
+        os.environ["CLERK_ISSUER"] = "https://demo.clerk.accounts.dev"
+        os.environ["CLERK_PUBLISHABLE_KEY"] = "pk_test_ZGVtby5jbGVyay5hY2NvdW50cy5kZXYk"
+        html = app.render_page("テスト", "<p>本文</p>").decode("utf-8")
+        # devMode=true なので、ブラウザ側スクリプトはゲートせず素通りする。
+        self.assertIn('"devMode": true', html)
+
+    def test_inventory_launcher_link_shown_when_env_set(self) -> None:
+        # INVENTORY_APP_URL は import 時に読むので、定数を一時差し替えして検証する。
+        original = app.INVENTORY_APP_URL
+        try:
+            app.INVENTORY_APP_URL = "https://inventory.example.com"
+            html = app.render_page("テスト", "<p>本文</p>").decode("utf-8")
+            self.assertIn("https://inventory.example.com/launcher", html)
+            self.assertIn("アプリ入口へ", html)
+        finally:
+            app.INVENTORY_APP_URL = original
+
+
+class PseudoFreeeProductionStartupTest(unittest.TestCase):
+    """A-6: 本番(Render)は env PORT で 0.0.0.0 待受、ローカルは 127.0.0.1:8010。
+
+    HOST/PORT は import 時に env から決まるため importlib.reload で読み直して検証する。
+    ローカル .env の PSEUDO_FREEE_HOST/PORT に左右されないよう、関連 env を本テスト内で
+    明示的に制御する（本番Renderでは PSEUDO_FREEE_HOST は無く PORT だけが渡される＝それを再現）。
+    """
+
+    _KEYS = ("PORT", "PSEUDO_FREEE_HOST", "PSEUDO_FREEE_PORT")
+
+    def setUp(self) -> None:
+        self._saved = {k: os.environ.get(k) for k in self._KEYS}
+
+    def tearDown(self) -> None:
+        import importlib
+
+        for k, v in self._saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        importlib.reload(app)  # 既定状態へ戻す（後続テストに影響させない）
+
+    def test_cloud_port_switches_host_to_all_interfaces(self) -> None:
+        import importlib
+
+        # 本番再現: PSEUDO_FREEE_HOST 無し（"" にして .env の値を無効化）＋ PORT のみ渡る。
+        os.environ["PSEUDO_FREEE_HOST"] = ""
+        os.environ["PORT"] = "10000"
+        importlib.reload(app)
+        self.assertEqual(app.PORT, 10000)
+        self.assertEqual(app.HOST, "0.0.0.0")
+
+    def test_local_defaults_to_loopback_8010(self) -> None:
+        import importlib
+
+        os.environ.pop("PORT", None)
+        os.environ["PSEUDO_FREEE_HOST"] = "127.0.0.1"
+        os.environ["PSEUDO_FREEE_PORT"] = "8010"
+        importlib.reload(app)
+        self.assertEqual(app.HOST, "127.0.0.1")
+        self.assertEqual(app.PORT, 8010)
+
+
 if __name__ == "__main__":
     unittest.main()

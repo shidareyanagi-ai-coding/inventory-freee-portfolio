@@ -23,6 +23,7 @@ import db
 import storage
 from forecasting import synthetic
 from index_html import render_index
+from launcher_html import render_launcher
 
 
 class NotFoundError(Exception):
@@ -1783,6 +1784,18 @@ def index() -> str:
         publishable_key=auth.clerk_publishable_key(),
         clerk_configured=auth.clerk_configured(),
         dev_mode=auth.auth_dev_mode(),
+    )
+
+
+@app.get("/launcher", response_class=HTMLResponse)
+def launcher() -> str:
+    """入口（アプリ選択）ページ。同じ Clerk ログインで在庫／疑似freee を選ぶ（A-6）。
+    疑似freee の公開URLは env(PSEUDO_FREEE_API_URL)。未設定なら疑似freee カードは準備中表示。"""
+    return render_launcher(
+        publishable_key=auth.clerk_publishable_key(),
+        clerk_configured=auth.clerk_configured(),
+        dev_mode=auth.auth_dev_mode(),
+        pseudo_freee_url=PSEUDO_FREEE_API_URL,
     )
 
 
