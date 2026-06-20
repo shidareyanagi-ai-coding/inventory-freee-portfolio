@@ -40,6 +40,8 @@ def sample_deal(queue_id: int = 12) -> dict:
 
 class PseudoFreeeAppTest(unittest.TestCase):
     def setUp(self) -> None:
+        # A-8: .env に DATABASE_URL があっても、このテストは必ずローカル SQLite を使う。
+        self._saved_db_url = os.environ.pop("DATABASE_URL", None)
         self.tmp = tempfile.TemporaryDirectory()
         self.original_db_path = app.DB_PATH
         app.DB_PATH = Path(self.tmp.name) / "pseudo_freee_test.db"
@@ -48,6 +50,8 @@ class PseudoFreeeAppTest(unittest.TestCase):
     def tearDown(self) -> None:
         app.DB_PATH = self.original_db_path
         self.tmp.cleanup()
+        if self._saved_db_url is not None:
+            os.environ["DATABASE_URL"] = self._saved_db_url
 
     def test_create_deal_saves_summary_lines_and_payload_json(self) -> None:
         with app.db_connection() as conn:
@@ -355,6 +359,8 @@ class PseudoFreeeVoucherTest(unittest.TestCase):
         # 鍵を外す＝決定的スタブで解析（本物AIを呼ばない・課金しない）。在庫側テストと同じ方針。
         self._saved_api_key = os.environ.get("ANTHROPIC_API_KEY")
         os.environ.pop("ANTHROPIC_API_KEY", None)
+        # A-8: .env に DATABASE_URL があっても、このテストは必ずローカル SQLite を使う。
+        self._saved_db_url = os.environ.pop("DATABASE_URL", None)
 
         self.tmp = tempfile.TemporaryDirectory()
         self.original_db_path = app.DB_PATH
@@ -369,6 +375,8 @@ class PseudoFreeeVoucherTest(unittest.TestCase):
         self.tmp.cleanup()
         if self._saved_api_key is not None:
             os.environ["ANTHROPIC_API_KEY"] = self._saved_api_key
+        if self._saved_db_url is not None:
+            os.environ["DATABASE_URL"] = self._saved_db_url
 
     def test_capture_expense_returns_draft_and_saves_voucher_without_registering(self) -> None:
         with app.db_connection() as conn:

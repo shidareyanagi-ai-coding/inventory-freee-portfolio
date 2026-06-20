@@ -5,8 +5,6 @@ import hashlib
 import html
 import json
 import os
-import sqlite3
-from contextlib import contextmanager
 from datetime import datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -16,6 +14,7 @@ from urllib.parse import parse_qs, urlparse
 
 import ai_capture
 import auth
+import db
 import storage
 
 try:
@@ -221,27 +220,18 @@ DEFAULT_MASTER_SEARCH_KEYS = {
 }
 
 
-@contextmanager
 def db_connection() -> Any:
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    try:
-        yield conn
-        conn.commit()
-    finally:
-        conn.close()
+    """DB接続を返す（A-8: db.py が DATABASE_URL で SQLite/Postgres を自動切替）。
+    DATABASE_URL が postgres:// なら Neon、無ければローカル SQLite（DB_PATH）。
+    `with db_connection() as conn:` の使い方は従来どおり（db.get_conn が境界を管理）。"""
+    return db.get_conn(DB_PATH)
 
 
-def table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
-    row = conn.execute(
-        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
-        (table_name,),
-    ).fetchone()
-    return row is not None
+def table_exists(conn: db.Connection, table_name: str) -> bool:
+    return db.table_exists(conn, table_name)
 
 
-def deal_schema_needs_migration(conn: sqlite3.Connection) -> bool:
+def deal_schema_needs_migration(conn: db.Connection) -> bool:
     if not table_exists(conn, "pseudo_freee_deals"):
         return False
     table_sql = conn.execute(
@@ -256,7 +246,9 @@ def deal_schema_needs_migration(conn: sqlite3.Connection) -> bool:
     )
 
 
-def migrate_deals_schema(conn: sqlite3.Connection) -> None:
+def migrate_deals_schema(conn: db.Connection) -> None:
+    if conn.postgres:
+        return  # Postgres は新規DBで現行スキーマを作る＝SQLite時代の旧スキーマ移行は不要
     if not deal_schema_needs_migration(conn):
         return
 
@@ -306,7 +298,9 @@ def migrate_deals_schema(conn: sqlite3.Connection) -> None:
     conn.execute("PRAGMA foreign_keys = ON")
 
 
-def ensure_master_schema(conn: sqlite3.Connection) -> None:
+def ensure_master_schema(conn: db.Connection) -> None:
+    if conn.postgres:
+        return  # Postgres は現行スキーマで全列が揃う＝SQLite向けの後付け列追加は不要
     if table_exists(conn, "pseudo_freee_payees"):
         payee_columns = {row["name"] for row in conn.execute("PRAGMA table_info(pseudo_freee_payees)").fetchall()}
         if "search_key" not in payee_columns:
@@ -324,8 +318,10 @@ def ensure_master_schema(conn: sqlite3.Connection) -> None:
             conn.execute("ALTER TABLE pseudo_freee_account_items ADD COLUMN search_key TEXT NOT NULL DEFAULT ''")
 
 
-def ensure_deals_columns(conn: sqlite3.Connection) -> None:
+def ensure_deals_columns(conn: db.Connection) -> None:
     """既存DBに後付けした列を補う（payment_method / content_hash）。データは保持する。"""
+    if conn.postgres:
+        return  # Postgres は現行スキーマで全列が揃う＝SQLite向けの後付け列追加は不要
     if table_exists(conn, "pseudo_freee_deals"):
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(pseudo_freee_deals)").fetchall()}
         if "payment_method" not in columns:
@@ -336,7 +332,7 @@ def ensure_deals_columns(conn: sqlite3.Connection) -> None:
             conn.execute("ALTER TABLE pseudo_freee_vouchers ADD COLUMN content_hash TEXT NOT NULL DEFAULT ''")
 
 
-def backfill_voucher_hashes(conn: sqlite3.Connection) -> None:
+def backfill_voucher_hashes(conn: db.Connection) -> None:
     """content_hash が空の既存証憑に、保存済み画像からハッシュを計算して埋める。
 
     重複検知を「列を足す前に保存した証憑」にも効かせるための後付け処理（冪等）。
@@ -369,15 +365,16 @@ def default_search_key_for_master(name: str) -> str:
     return DEFAULT_MASTER_SEARCH_KEYS.get(name, "")
 
 
-def seed_master_data(conn: sqlite3.Connection) -> None:
+def seed_master_data(conn: db.Connection) -> None:
     conn.executemany(
-        "INSERT OR IGNORE INTO pseudo_freee_payees (payee_name) VALUES (?)",
+        "INSERT INTO pseudo_freee_payees (payee_name) VALUES (?) ON CONFLICT DO NOTHING",
         [(name,) for name in DEFAULT_PAYEES],
     )
     conn.executemany(
         """
-        INSERT OR IGNORE INTO pseudo_freee_account_items (account_item_name, default_tax_category)
+        INSERT INTO pseudo_freee_account_items (account_item_name, default_tax_category)
         VALUES (?, ?)
+        ON CONFLICT DO NOTHING
         """,
         [(name, default_tax_for_account_item(name)) for name in DEFAULT_ACCOUNT_ITEMS],
     )
@@ -406,31 +403,34 @@ def seed_master_data(conn: sqlite3.Connection) -> None:
         [(default_search_key_for_master(name), name) for name in DEFAULT_MASTER_SEARCH_KEYS],
     )
     conn.executemany(
-        "INSERT OR IGNORE INTO pseudo_freee_tax_categories (tax_category) VALUES (?)",
+        "INSERT INTO pseudo_freee_tax_categories (tax_category) VALUES (?) ON CONFLICT DO NOTHING",
         [(name,) for name in DEFAULT_TAX_CATEGORIES],
     )
     conn.execute(
         """
-        INSERT OR IGNORE INTO pseudo_freee_payees (payee_name)
+        INSERT INTO pseudo_freee_payees (payee_name)
         SELECT DISTINCT partner_name
         FROM pseudo_freee_deals
         WHERE partner_name != ''
+        ON CONFLICT DO NOTHING
         """
     )
     conn.execute(
         """
-        INSERT OR IGNORE INTO pseudo_freee_account_items (account_item_name)
+        INSERT INTO pseudo_freee_account_items (account_item_name)
         SELECT DISTINCT account_item_name
         FROM pseudo_freee_deals
         WHERE account_item_name != ''
+        ON CONFLICT DO NOTHING
         """
     )
     conn.execute(
         """
-        INSERT OR IGNORE INTO pseudo_freee_tax_categories (tax_category)
+        INSERT INTO pseudo_freee_tax_categories (tax_category)
         SELECT DISTINCT tax_category
         FROM pseudo_freee_deals
         WHERE tax_category != ''
+        ON CONFLICT DO NOTHING
         """
     )
     conn.executemany(
@@ -453,15 +453,15 @@ def seed_master_data(conn: sqlite3.Connection) -> None:
 
 def init_db() -> None:
     with db_connection() as conn:
-        migrate_deals_schema(conn)
-        conn.executescript(SCHEMA_SQL)
-        ensure_master_schema(conn)
-        ensure_deals_columns(conn)
-        backfill_voucher_hashes(conn)
-        seed_master_data(conn)
+        migrate_deals_schema(conn)    # SQLite の旧スキーマのみ移行（Postgres では何もしない）
+        db.create_schema(conn)        # 方言別スキーマ（CREATE TABLE IF NOT EXISTS で冪等）
+        ensure_master_schema(conn)    # SQLite の旧DBに不足列を追加（Postgres では何もしない）
+        ensure_deals_columns(conn)    # 同上
+        backfill_voucher_hashes(conn) # 画像からハッシュ補完（両方言）
+        seed_master_data(conn)        # マスタ投入（両方言・ON CONFLICT DO NOTHING）
 
 
-def row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+def row_to_dict(row: dict[str, Any]) -> dict[str, Any]:
     return {key: row[key] for key in row.keys()}
 
 
@@ -501,29 +501,30 @@ def required_text(value: Any, field_name: str) -> str:
 
 
 def remember_expense_masters(
-    conn: sqlite3.Connection,
+    conn: db.Connection,
     payee_name: str,
     account_item_name: str,
     tax_category: str,
 ) -> None:
     if payee_name:
-        conn.execute("INSERT OR IGNORE INTO pseudo_freee_payees (payee_name) VALUES (?)", (payee_name,))
+        conn.execute("INSERT INTO pseudo_freee_payees (payee_name) VALUES (?) ON CONFLICT DO NOTHING", (payee_name,))
     if account_item_name:
         conn.execute(
             """
-            INSERT OR IGNORE INTO pseudo_freee_account_items (account_item_name, default_tax_category)
+            INSERT INTO pseudo_freee_account_items (account_item_name, default_tax_category)
             VALUES (?, ?)
+            ON CONFLICT DO NOTHING
             """,
             (account_item_name, tax_category or "課税仕入 10%"),
         )
     if tax_category:
         conn.execute(
-            "INSERT OR IGNORE INTO pseudo_freee_tax_categories (tax_category) VALUES (?)",
+            "INSERT INTO pseudo_freee_tax_categories (tax_category) VALUES (?) ON CONFLICT DO NOTHING",
             (tax_category,),
         )
 
 
-def list_expense_masters(conn: sqlite3.Connection) -> dict[str, Any]:
+def list_expense_masters(conn: db.Connection) -> dict[str, Any]:
     payee_rows = conn.execute(
         """
         SELECT payee_name, search_key
@@ -555,7 +556,7 @@ def list_expense_masters(conn: sqlite3.Connection) -> dict[str, Any]:
     }
 
 
-def create_expense_master(conn: sqlite3.Connection, data: dict[str, Any]) -> dict[str, Any]:
+def create_expense_master(conn: db.Connection, data: dict[str, Any]) -> dict[str, Any]:
     master_type = str(data.get("master_type", "") or "").strip()
     name = required_text(data.get("name"), "name")
     search_key = str(data.get("search_key", "") or "").strip()
@@ -582,11 +583,11 @@ def create_expense_master(conn: sqlite3.Connection, data: dict[str, Any]) -> dic
             (name, default_tax_category, search_key),
         )
         conn.execute(
-            "INSERT OR IGNORE INTO pseudo_freee_tax_categories (tax_category) VALUES (?)",
+            "INSERT INTO pseudo_freee_tax_categories (tax_category) VALUES (?) ON CONFLICT DO NOTHING",
             (default_tax_category,),
         )
     elif master_type == "tax_category":
-        conn.execute("INSERT OR IGNORE INTO pseudo_freee_tax_categories (tax_category) VALUES (?)", (name,))
+        conn.execute("INSERT INTO pseudo_freee_tax_categories (tax_category) VALUES (?) ON CONFLICT DO NOTHING", (name,))
     else:
         raise ValueError("master_type must be payee, account_item, or tax_category")
     return {"ok": True, "master_type": master_type, "name": name, "search_key": search_key}
@@ -653,7 +654,7 @@ def normalize_deal_request(data: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def create_deal(conn: sqlite3.Connection, data: dict[str, Any]) -> tuple[int, bool]:
+def create_deal(conn: db.Connection, data: dict[str, Any]) -> tuple[int, bool]:
     deal = normalize_deal_request(data)
     existing = conn.execute(
         """
@@ -666,7 +667,8 @@ def create_deal(conn: sqlite3.Connection, data: dict[str, Any]) -> tuple[int, bo
     if existing:
         return int(existing["id"]), False
 
-    cursor = conn.execute(
+    deal_id = db.insert_returning_id(
+        conn,
         """
         INSERT INTO pseudo_freee_deals (
             queue_id, source_app, source_type, source_id, deal_type,
@@ -695,7 +697,6 @@ def create_deal(conn: sqlite3.Connection, data: dict[str, Any]) -> tuple[int, bo
             deal["payload_json"],
         ),
     )
-    deal_id = int(cursor.lastrowid)
     conn.executemany(
         """
         INSERT INTO pseudo_freee_deal_lines (
@@ -722,7 +723,7 @@ def create_deal(conn: sqlite3.Connection, data: dict[str, Any]) -> tuple[int, bo
     return deal_id, True
 
 
-def create_manual_expense(conn: sqlite3.Connection, data: dict[str, Any]) -> dict[str, Any]:
+def create_manual_expense(conn: db.Connection, data: dict[str, Any]) -> dict[str, Any]:
     issue_date = required_text(data.get("issue_date"), "issue_date")
     partner_name = required_text(data.get("partner_name"), "partner_name")
     account_item_name = required_text(data.get("account_item_name"), "account_item_name")
@@ -768,7 +769,8 @@ def create_manual_expense(conn: sqlite3.Connection, data: dict[str, Any]) -> dic
         },
     }
 
-    cursor = conn.execute(
+    deal_id = db.insert_returning_id(
+        conn,
         """
         INSERT INTO pseudo_freee_deals (
             queue_id, source_app, source_type, source_id, deal_type,
@@ -798,7 +800,6 @@ def create_manual_expense(conn: sqlite3.Connection, data: dict[str, Any]) -> dic
             json.dumps(payload, ensure_ascii=False, indent=2),
         ),
     )
-    deal_id = int(cursor.lastrowid)
     conn.execute(
         """
         INSERT INTO pseudo_freee_deal_lines (
@@ -815,7 +816,7 @@ def create_manual_expense(conn: sqlite3.Connection, data: dict[str, Any]) -> dic
     return {"ok": True, "pseudo_freee_deal_id": deal_id}
 
 
-def delete_deal(conn: sqlite3.Connection, deal_id: int) -> bool:
+def delete_deal(conn: db.Connection, deal_id: int) -> bool:
     """取引を削除する（明細も削除）。手入力経費のみ。存在しない/手入力以外なら False。
 
     在庫連携の取引（仕入/売上）は在庫ダッシュボードが唯一の正のため、ここでは削除しない
@@ -836,7 +837,7 @@ def delete_deal(conn: sqlite3.Connection, deal_id: int) -> bool:
     return True
 
 
-def update_manual_expense(conn: sqlite3.Connection, deal_id: int, data: dict[str, Any]) -> dict[str, Any]:
+def update_manual_expense(conn: db.Connection, deal_id: int, data: dict[str, Any]) -> dict[str, Any]:
     """手入力経費の取引を更新する（手入力経費のみ。在庫連携の取引は編集不可）。"""
     existing = conn.execute("SELECT * FROM pseudo_freee_deals WHERE id = ?", (deal_id,)).fetchone()
     if not existing:
@@ -947,7 +948,7 @@ def store_voucher_image(file_name: str, data: bytes) -> str:
 
 
 def create_voucher(
-    conn: sqlite3.Connection,
+    conn: db.Connection,
     *,
     file_name: str,
     mime_type: str,
@@ -957,7 +958,8 @@ def create_voucher(
 ) -> int:
     """証憑を保存する（AI下書きのみ。user_corrected_json は空＝未登録のまま）。"""
     storage_path = store_voucher_image(file_name, image_bytes)
-    cursor = conn.execute(
+    return db.insert_returning_id(
+        conn,
         """
         INSERT INTO pseudo_freee_vouchers
             (file_name, storage_path, mime_type, content_hash, ai_extracted_json, confidence)
@@ -972,11 +974,10 @@ def create_voucher(
             float(draft.get("overall_confidence", 0) or 0),
         ),
     )
-    return int(cursor.lastrowid)
 
 
 def capture_expense(
-    conn: sqlite3.Connection,
+    conn: db.Connection,
     *,
     file_name: str,
     mime_type: str,
@@ -1017,7 +1018,7 @@ def capture_expense(
     }
 
 
-def _voucher_row(conn: sqlite3.Connection, voucher_id: int) -> dict[str, Any] | None:
+def _voucher_row(conn: db.Connection, voucher_id: int) -> dict[str, Any] | None:
     row = conn.execute(
         "SELECT * FROM pseudo_freee_vouchers WHERE id = ?", (voucher_id,)
     ).fetchone()
@@ -1048,20 +1049,20 @@ def _voucher_to_dict(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def list_vouchers(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+def list_vouchers(conn: db.Connection) -> list[dict[str, Any]]:
     rows = conn.execute(
         "SELECT * FROM pseudo_freee_vouchers ORDER BY id DESC"
     ).fetchall()
     return [_voucher_to_dict(row_to_dict(row)) for row in rows]
 
 
-def voucher_detail(conn: sqlite3.Connection, voucher_id: int) -> dict[str, Any] | None:
+def voucher_detail(conn: db.Connection, voucher_id: int) -> dict[str, Any] | None:
     row = _voucher_row(conn, voucher_id)
     return _voucher_to_dict(row) if row else None
 
 
 def link_voucher_to_deal(
-    conn: sqlite3.Connection,
+    conn: db.Connection,
     voucher_id: int,
     deal_id: int,
     registered_fields: dict[str, Any] | None = None,
@@ -1077,7 +1078,7 @@ def link_voucher_to_deal(
     )
 
 
-def _maybe_link_voucher(conn: sqlite3.Connection, data: dict[str, Any], deal_id: int) -> None:
+def _maybe_link_voucher(conn: db.Connection, data: dict[str, Any], deal_id: int) -> None:
     raw = data.get("voucher_id")
     if not raw:
         return
@@ -1093,7 +1094,7 @@ def _maybe_link_voucher(conn: sqlite3.Connection, data: dict[str, Any], deal_id:
     )
 
 
-def delete_voucher(conn: sqlite3.Connection, voucher_id: int) -> bool:
+def delete_voucher(conn: db.Connection, voucher_id: int) -> bool:
     """証憑を削除する（DB行＋保存画像）。存在しなければ False。"""
     row = _voucher_row(conn, voucher_id)
     if not row:
@@ -1103,7 +1104,7 @@ def delete_voucher(conn: sqlite3.Connection, voucher_id: int) -> bool:
     return True
 
 
-def load_voucher_image(conn: sqlite3.Connection, voucher_id: int) -> tuple[bytes, str] | None:
+def load_voucher_image(conn: db.Connection, voucher_id: int) -> tuple[bytes, str] | None:
     """証憑の元画像バイト列と MIME を返す。無ければ None。"""
     row = _voucher_row(conn, voucher_id)
     if not row:
@@ -1125,7 +1126,7 @@ def deal_filters_from_query(query: str) -> dict[str, str]:
     }
 
 
-def list_deals(conn: sqlite3.Connection, filters: dict[str, str] | None = None) -> list[dict[str, Any]]:
+def list_deals(conn: db.Connection, filters: dict[str, str] | None = None) -> list[dict[str, Any]]:
     filters = filters or {}
     clauses: list[str] = []
     values: list[Any] = []
@@ -1157,7 +1158,7 @@ def list_deals(conn: sqlite3.Connection, filters: dict[str, str] | None = None) 
     return [row_to_dict(row) for row in rows]
 
 
-def get_deal(conn: sqlite3.Connection, deal_id: int) -> dict[str, Any] | None:
+def get_deal(conn: db.Connection, deal_id: int) -> dict[str, Any] | None:
     row = conn.execute("SELECT * FROM pseudo_freee_deals WHERE id = ?", (deal_id,)).fetchone()
     if not row:
         return None
@@ -1175,7 +1176,7 @@ def get_deal(conn: sqlite3.Connection, deal_id: int) -> dict[str, Any] | None:
     return deal
 
 
-def get_summary(conn: sqlite3.Connection) -> dict[str, Any]:
+def get_summary(conn: db.Connection) -> dict[str, Any]:
     month = datetime.now().strftime("%Y-%m")
     today = datetime.now().strftime("%Y-%m-%d")
     row = conn.execute(
@@ -1218,7 +1219,7 @@ def get_summary(conn: sqlite3.Connection) -> dict[str, Any]:
     }
 
 
-def get_monthly_trends(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+def get_monthly_trends(conn: db.Connection) -> list[dict[str, Any]]:
     rows = conn.execute(
         """
         SELECT
