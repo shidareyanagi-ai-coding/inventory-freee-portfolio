@@ -16,6 +16,7 @@ from urllib.parse import parse_qs, urlparse
 
 import ai_capture
 import auth
+import storage
 
 try:
     # .env があれば ANTHROPIC_API_KEY 等を読み込む（無ければ何もしない）。
@@ -346,10 +347,10 @@ def backfill_voucher_hashes(conn: sqlite3.Connection) -> None:
         "SELECT id, storage_path FROM pseudo_freee_vouchers WHERE content_hash = '' AND storage_path != ''"
     ).fetchall()
     for row in rows:
-        path = VOUCHER_DIR / row["storage_path"]
         try:
-            if path.exists():
-                digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            data = storage.read_bytes(VOUCHER_DIR, row["storage_path"])  # A-8: R2/ローカルを自動判定
+            if data is not None:
+                digest = hashlib.sha256(data).hexdigest()
                 conn.execute(
                     "UPDATE pseudo_freee_vouchers SET content_hash = ? WHERE id = ?", (digest, row["id"])
                 )
@@ -934,15 +935,14 @@ def _safe_filename(name: str) -> str:
 
 
 def store_voucher_image(file_name: str, data: bytes) -> str:
-    """元画像をサーバ側に保存し、VOUCHER_DIR からの相対パスを返す（DBにはこれだけ持つ）。
+    """元画像を保存し、key（相対パス）を返す（DBにはこれだけ持つ）。
 
     内容ハッシュをファイル名に含めて重複保存を避ける。
+    A-8: 実際の保存先は storage が決める（env で R2 / ローカルフォルダを自動切替）。
     """
     digest = hashlib.sha256(data).hexdigest()[:16]
     rel = f"{digest}_{_safe_filename(file_name)}"
-    path = VOUCHER_DIR / rel
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(data)
+    storage.save_bytes(VOUCHER_DIR, rel, data)
     return rel
 
 
@@ -1098,12 +1098,7 @@ def delete_voucher(conn: sqlite3.Connection, voucher_id: int) -> bool:
     row = _voucher_row(conn, voucher_id)
     if not row:
         return False
-    path = VOUCHER_DIR / row["storage_path"]
-    try:
-        if path.exists():
-            path.unlink()
-    except OSError:
-        pass  # 画像が消せなくても DB 行の削除は進める
+    storage.delete(VOUCHER_DIR, row["storage_path"])  # A-8: 画像が消せなくても DB 行の削除は進める
     conn.execute("DELETE FROM pseudo_freee_vouchers WHERE id = ?", (voucher_id,))
     return True
 
@@ -1113,10 +1108,10 @@ def load_voucher_image(conn: sqlite3.Connection, voucher_id: int) -> tuple[bytes
     row = _voucher_row(conn, voucher_id)
     if not row:
         return None
-    path = VOUCHER_DIR / row["storage_path"]
-    if not path.exists():
+    data = storage.read_bytes(VOUCHER_DIR, row["storage_path"])  # A-8: R2/ローカルを自動判定
+    if data is None:
         return None
-    return path.read_bytes(), (row["mime_type"] or "application/octet-stream")
+    return data, (row["mime_type"] or "application/octet-stream")
 
 
 def deal_filters_from_query(query: str) -> dict[str, str]:

@@ -223,6 +223,10 @@ pseudo_freee: http://127.0.0.1:8010
 
 将来的にはPostgreSQL移行を想定する。
 
+> 🔄 **A-8 で永続化に着手**: 公開版（Render 無料枠）はディスクが揮発しデータが消えるため、
+> 在庫アプリと同じく **Neon（Postgres）＋ R2（画像）** へ移行する。詳細・作業計画は
+> [`PSEUDO_FREEE_PERSISTENCE_REQUIREMENTS.md`](PSEUDO_FREEE_PERSISTENCE_REQUIREMENTS.md) を参照。
+
 ### 6.3 API連携
 
 `inventory_dashboard` 側は、疑似freeeのAPI URLを環境変数で持つ。
