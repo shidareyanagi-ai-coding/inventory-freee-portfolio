@@ -60,12 +60,19 @@ DEFAULT_TAX_CATEGORIES = (
 )
 
 
-def _api_key() -> str:
-    """サーバ側のみ。`.env` の行末コメント混入を防ぐため '#' 始まりは未設定扱い。"""
-    value = os.environ.get("ANTHROPIC_API_KEY", "").strip()
-    if value.startswith("#"):
-        return ""
-    return value
+def _clean_key(value: str) -> str:
+    """前後空白を除去。`.env` の行末コメント混入を防ぐため '#' 始まりは未設定扱い（auth._env と同じ防御）。"""
+    value = (value or "").strip()
+    return "" if value.startswith("#") else value
+
+
+def _api_key(override: str = "") -> str:
+    """使う API キーを決める。override（リクエストごとに利用者が貼ったキー）が最優先、無ければ env。
+
+    BYO-key（A-8・各自APIキー）: 公開デモは server 側 env を空にし、利用者が解析の都度ヘッダで
+    キーを渡す。キーはサーバに保存・記録しない（受け取ってその場で使うだけ）。在庫と同じ方針。
+    """
+    return _clean_key(override) or _clean_key(os.environ.get("ANTHROPIC_API_KEY", ""))
 
 
 def _model() -> str:
@@ -74,9 +81,10 @@ def _model() -> str:
     return value or "claude-haiku-4-5"
 
 
-def anthropic_ready() -> bool:
-    """実 Claude vision を呼べる状態か（鍵あり かつ ライブラリ導入済み）。"""
-    if not _api_key():
+def anthropic_ready(api_key: str = "") -> bool:
+    """実 Claude vision を呼べる状態か（鍵あり かつ ライブラリ導入済み）。
+    api_key を渡すとそのキーで判定（server 側 env が空でも、利用者キーで有効になる）。"""
+    if not _api_key(api_key):
         return False
     try:
         import anthropic  # noqa: F401
@@ -164,11 +172,12 @@ def _stub_analyze(
 # 実 Claude vision（鍵があるときだけ）
 # ---------------------------------------------------------------------------
 def _analyze_with_anthropic(
-    image_bytes: bytes, mime_type: str, account_items: tuple[str, ...], tax_categories: tuple[str, ...]
+    image_bytes: bytes, mime_type: str, account_items: tuple[str, ...], tax_categories: tuple[str, ...],
+    api_key: str = ""
 ) -> dict[str, Any]:
     import anthropic
 
-    client = anthropic.Anthropic(api_key=_api_key())
+    client = anthropic.Anthropic(api_key=_api_key(api_key))
     model = _model()
     image_b64 = base64.standard_b64encode(image_bytes).decode("ascii")
     media_type = mime_type if mime_type in {"image/png", "image/jpeg", "image/gif", "image/webp"} else "image/jpeg"
@@ -238,16 +247,18 @@ def analyze_voucher(
     *,
     account_items: list[str] | tuple[str, ...] | None = None,
     tax_categories: list[str] | tuple[str, ...] | None = None,
+    api_key: str = "",
 ) -> dict[str, Any]:
     """証憑画像から経費伝票の下書き(構造化JSON)を返す。副作用なし（登録しない）。
 
     鍵+ライブラリがあれば実 Claude vision、無ければ決定的スタブ。戻り値の "source" で見分けられる。
     account_items / tax_categories に疑似freee のマスタを渡すと、その候補から選ばせる。
+    api_key: 利用者が都度渡すキー（BYO-key）。空なら env、それも無ければスタブ。サーバに保存しない。
     """
     if not image_bytes:
         raise ValueError("画像がありません。")
     items = tuple(account_items) if account_items else DEFAULT_ACCOUNT_ITEMS
     taxes = tuple(tax_categories) if tax_categories else DEFAULT_TAX_CATEGORIES
-    if anthropic_ready():
-        return _analyze_with_anthropic(image_bytes, mime_type, items, taxes)
+    if anthropic_ready(api_key):
+        return _analyze_with_anthropic(image_bytes, mime_type, items, taxes, api_key)
     return _stub_analyze(image_bytes, mime_type, items, taxes)

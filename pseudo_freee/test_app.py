@@ -618,5 +618,79 @@ class PseudoFreeeProductionStartupTest(unittest.TestCase):
         self.assertEqual(app.PORT, 8010)
 
 
+class PseudoFreeeByoKeyTest(unittest.TestCase):
+    """A-8: BYO-key — 利用者のキーを解析にだけ使い、サーバに保存・記録しない（在庫と同じ方針）。"""
+
+    def setUp(self) -> None:
+        self._saved_key = os.environ.pop("ANTHROPIC_API_KEY", None)
+        self._saved_db = os.environ.pop("DATABASE_URL", None)
+        self.tmp = tempfile.TemporaryDirectory()
+        self.original_db_path = app.DB_PATH
+        self.original_voucher_dir = app.VOUCHER_DIR
+        app.DB_PATH = Path(self.tmp.name) / "t.db"
+        app.VOUCHER_DIR = Path(self.tmp.name) / "vs"
+        app.init_db()
+
+    def tearDown(self) -> None:
+        app.DB_PATH = self.original_db_path
+        app.VOUCHER_DIR = self.original_voucher_dir
+        self.tmp.cleanup()
+        if self._saved_key is not None:
+            os.environ["ANTHROPIC_API_KEY"] = self._saved_key
+        if self._saved_db is not None:
+            os.environ["DATABASE_URL"] = self._saved_db
+
+    def test_api_key_override_takes_priority(self) -> None:
+        import ai_capture
+
+        self.assertEqual(ai_capture._api_key("sk-ant-override"), "sk-ant-override")
+        os.environ["ANTHROPIC_API_KEY"] = "sk-ant-env"
+        try:
+            self.assertEqual(ai_capture._api_key("sk-ant-override"), "sk-ant-override")  # 利用者キー優先
+            self.assertEqual(ai_capture._api_key(""), "sk-ant-env")                       # 無ければ env
+        finally:
+            os.environ.pop("ANTHROPIC_API_KEY", None)
+
+    def test_capture_expense_forwards_api_key_to_analyzer(self) -> None:
+        import ai_capture
+
+        seen = {}
+        original = ai_capture.analyze_voucher
+
+        def fake(image_bytes, mime_type="", *, account_items=None, tax_categories=None, api_key=""):
+            seen["api_key"] = api_key
+            return original(image_bytes, mime_type, account_items=account_items, tax_categories=tax_categories)
+
+        ai_capture.analyze_voucher = fake
+        try:
+            with app.db_connection() as conn:
+                app.capture_expense(
+                    conn, file_name="r.png", mime_type="image/png", image_bytes=b"x", api_key="sk-ant-user"
+                )
+        finally:
+            ai_capture.analyze_voucher = original
+        self.assertEqual(seen.get("api_key"), "sk-ant-user")
+
+    def test_api_key_is_not_stored_on_voucher(self) -> None:
+        import ai_capture
+
+        # 解析はスタブにモック（ダミー鍵で実APIを叩かない）。鍵を渡しても証憑に残らないことを見る。
+        original = ai_capture.analyze_voucher
+
+        def fake(image_bytes, mime_type="", *, account_items=None, tax_categories=None, api_key=""):
+            return original(image_bytes, mime_type, account_items=account_items, tax_categories=tax_categories)
+
+        ai_capture.analyze_voucher = fake
+        try:
+            with app.db_connection() as conn:
+                res = app.capture_expense(
+                    conn, file_name="r.png", mime_type="image/png", image_bytes=b"y", api_key="sk-ant-secret"
+                )
+                row = app._voucher_row(conn, res["voucher_id"])
+        finally:
+            ai_capture.analyze_voucher = original
+        self.assertNotIn("sk-ant-secret", str(row))  # 鍵は証憑に残らない
+
+
 if __name__ == "__main__":
     unittest.main()

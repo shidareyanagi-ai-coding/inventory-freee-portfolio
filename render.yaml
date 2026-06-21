@@ -66,5 +66,18 @@ services:
       - key: INVENTORY_APP_URL
         sync: false               # 在庫アプリ(入口ページの置き場所)の公開URL。例 https://inventory-dashboard-61w8.onrender.com
                                   #   疑似freee 画面上部の「← アプリ入口へ」リンク先になる。
-      # ANTHROPIC_API_KEY は設定しない: 未設定ならレシートAIは決定的スタブで動く（無課金デモ）。
-      # DATABASE_URL / STORAGE_* は不要（SQLite＋ローカル保存・揮発許容）。
+      # ANTHROPIC_API_KEY は設定しない（BYO-key）: 未設定なら決定的スタブで動き、利用者が画面で
+      #   自分のキーを貼ると実 Claude vision で読み取る（キーはブラウザのみ・サーバに保存しない）。在庫と同方針。
+      # A-8 永続化: DATABASE_URL（疑似freee専用 Neon）と STORAGE_*（R2・在庫と同値）を画面で設定する。
+      - key: DATABASE_URL
+        sync: false               # 疑似freee専用の Neon DB（例 .../pseudo_freee?sslmode=require）。在庫とは別DB。
+      - key: STORAGE_ENDPOINT
+        sync: false               # R2（在庫と同じ値でOK。画像キーは pseudo-freee/ 接頭辞で分離）
+      - key: STORAGE_BUCKET
+        sync: false
+      - key: STORAGE_ACCESS_KEY_ID
+        sync: false
+      - key: STORAGE_SECRET_ACCESS_KEY
+        sync: false
+      - key: STORAGE_REGION
+        value: auto

@@ -982,10 +982,12 @@ def capture_expense(
     file_name: str,
     mime_type: str,
     image_bytes: bytes,
+    api_key: str = "",
 ) -> dict[str, Any]:
     """レシート画像 → AI下書き（登録しない）。画像と抽出結果を証憑として保存する。
 
     勘定科目・税区分は疑似freee のマスタ候補から選ばせる。
+    api_key: 利用者が都度渡すキー（BYO-key）。解析にだけ使い、保存・記録はしない。
     """
     masters = list_expense_masters(conn)
     draft = ai_capture.analyze_voucher(
@@ -993,6 +995,7 @@ def capture_expense(
         mime_type,
         account_items=masters["account_items"],
         tax_categories=masters["tax_categories"],
+        api_key=api_key,
     )
     # 重複検知: 同じ画像（内容ハッシュ）の証憑が既にあるか。あれば警告に使う（保存は止めない）。
     content_hash = hashlib.sha256(image_bytes).hexdigest()
@@ -1617,6 +1620,12 @@ def render_page(title: str, body: str) -> bytes:
       background: #f5f8ff;
     }}
     .ai-capture h3 {{ margin: 0; font-size: 14px; color: #24438f; }}
+    .ai-key-panel {{ display: grid; gap: 6px; padding: 8px 10px; border: 1px solid #dbe3f5; border-radius: 8px; background: #f7f9ff; }}
+    .ai-key-status {{ margin: 0; font-size: 12px; color: var(--muted); }}
+    .ai-key-row {{ display: flex; gap: 6px; flex-wrap: wrap; }}
+    .ai-key-row input {{ flex: 1; min-width: 140px; }}
+    .ai-key-row button {{ width: auto; padding: 7px 12px; white-space: nowrap; }}
+    .ai-key-note {{ margin: 0; font-size: 11px; color: #8a93a3; line-height: 1.5; }}
     .dropzone {{
       border: 2px dashed #9bb4f0;
       border-radius: 8px;
@@ -1961,6 +1970,15 @@ def render_index(filters: dict[str, str] | None = None) -> bytes:
           <h2>経費入力</h2>
           <div class="ai-capture">
             <h3>📷 レシートをAIで読み取る</h3>
+            <div class="ai-key-panel" id="ai-key-panel">
+              <p class="ai-key-status" id="ai-key-status"></p>
+              <div class="ai-key-row">
+                <input type="password" id="ai-key-input" placeholder="sk-ant-... を貼り付け" autocomplete="off" spellcheck="false">
+                <button type="button" id="ai-key-save">有効化</button>
+                <button type="button" id="ai-key-clear">解除</button>
+              </div>
+              <p class="ai-key-note">キーはこのブラウザにだけ保存され、解析時にだけ送信します（サーバには保存しません）。未入力ならお試しモード（固定サンプル）になります。</p>
+            </div>
             <div class="dropzone" id="ai-dropzone" tabindex="0">
               画像を選択 / カメラで撮影 / ここにドラッグ＆ドロップ / 貼り付け(Ctrl+V)
               <input type="file" id="ai-file" accept="image/*" capture="environment" hidden>
@@ -2207,6 +2225,34 @@ def render_index(filters: dict[str, str] | None = None) -> bytes:
         const aiPreviewImg = document.getElementById("ai-preview-img");
         const aiPreviewMeta = document.getElementById("ai-preview-meta");
         const voucherIdInput = document.getElementById("voucher-id-input");
+
+        // BYO-key（A-8）: 利用者の Anthropic キーはこのブラウザ(localStorage)にだけ保存し、
+        // 解析の都度ヘッダで送る。サーバには保存しない（在庫アプリと同じ方針）。
+        const AI_KEY_LS = "anthropic_api_key";
+        function getAnthropicKey() {{
+          try {{ return (localStorage.getItem(AI_KEY_LS) || "").trim(); }} catch (e) {{ return ""; }}
+        }}
+        const aiKeyInput = document.getElementById("ai-key-input");
+        const aiKeyStatus = document.getElementById("ai-key-status");
+        function renderAiKeyStatus() {{
+          const has = !!getAnthropicKey();
+          if (aiKeyStatus) aiKeyStatus.textContent = has
+            ? "✅ あなたのキーで実AI（Claude）が有効です。"
+            : "🔑 Anthropic キーを貼ると実際にレシートを読み取ります（未入力はお試しモード）。";
+        }}
+        const aiKeySaveBtn = document.getElementById("ai-key-save");
+        if (aiKeySaveBtn) aiKeySaveBtn.addEventListener("click", () => {{
+          const v = ((aiKeyInput && aiKeyInput.value) || "").trim();
+          try {{ if (v) localStorage.setItem(AI_KEY_LS, v); }} catch (e) {{}}
+          if (aiKeyInput) aiKeyInput.value = "";
+          renderAiKeyStatus();
+        }});
+        const aiKeyClearBtn = document.getElementById("ai-key-clear");
+        if (aiKeyClearBtn) aiKeyClearBtn.addEventListener("click", () => {{
+          try {{ localStorage.removeItem(AI_KEY_LS); }} catch (e) {{}}
+          renderAiKeyStatus();
+        }});
+        renderAiKeyStatus();
         const voucherList = document.getElementById("voucher-list");
         const receiptPreviewImg = document.getElementById("receipt-preview-img");
         const receiptPreviewEmpty = document.getElementById("receipt-preview-empty");
@@ -2330,9 +2376,12 @@ def render_index(filters: dict[str, str] | None = None) -> bytes:
           }}
           const base64 = dataUrl.includes(",") ? dataUrl.split(",")[1] : dataUrl;
           try {{
+            const captureHeaders = {{ "Content-Type": "application/json" }};
+            const aiKey = getAnthropicKey();  // BYO-key: あれば解析時だけヘッダで送る（保存しない）。
+            if (aiKey) captureHeaders["X-Anthropic-Key"] = aiKey;
             const res = await fetch("/api/expense-capture", {{
               method: "POST",
-              headers: {{ "Content-Type": "application/json" }},
+              headers: captureHeaders,
               body: JSON.stringify({{
                 file_name: file.name || "receipt",
                 mime_type: file.type || "image/jpeg",
@@ -2757,12 +2806,15 @@ class PseudoFreeeHandler(BaseHTTPRequestHandler):
                     raise ValueError("invalid image_base64") from exc
                 if not image_bytes:
                     raise ValueError("画像がありません。")
+                # BYO-key: 利用者が貼った自分の Anthropic キーをヘッダで受け取り、解析にだけ使う（保存しない）。
+                api_key = self.headers.get("X-Anthropic-Key", "") or ""
                 with db_connection() as conn:
                     result = capture_expense(
                         conn,
                         file_name=str(data.get("file_name", "") or ""),
                         mime_type=str(data.get("mime_type", "") or ""),
                         image_bytes=image_bytes,
+                        api_key=api_key,
                     )
                 self.respond_json(result, HTTPStatus.CREATED)
             elif parsed.path == "/api/expense-masters":
