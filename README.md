@@ -23,11 +23,15 @@
 
 ## 📸 スクリーンショット
 
-| ダッシュボード | 適正在庫シミュレーション（AI予測） |
+| 入口ページ（統一ログイン後のアプリ選択） | 疑似freee 会計（レシートAI入力・BYO-key・KPI） |
+|---|---|
+| ![launcher](docs/screenshots/launcher.png) | ![pseudo-freee](docs/screenshots/pseudo-freee.png) |
+
+| 在庫ダッシュボード | 適正在庫シミュレーション（AI予測） |
 |---|---|
 | ![dashboard](docs/screenshots/dashboard-overview.png) | ![forecast](docs/screenshots/forecast-simulation.png) |
 
-> 入口ページ・疑似freee 会計のスクショは随時追加します。全画面版は [`docs/screenshots/`](docs/screenshots/) にあります。
+> 全画面版は [`docs/screenshots/`](docs/screenshots/) にあります。
 
 ## ✨ 主な機能
 
