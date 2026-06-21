@@ -47,6 +47,59 @@ class InventoryAppTest(unittest.TestCase):
             (self.org_id,),
         ).fetchone()
 
+    def test_import_sales_history_feeds_forecast(self):
+        # A-9: 売上履歴CSV取込 → 予測が読む sales×movement として入り、需要として読める。
+        from forecasting import data as fdata
+
+        csv = (
+            "date,sku,product_name,quantity,unit_price\n"
+            "2026-03-01,SKU-REAL-1,実商品1,4,1200\n"
+            "2026-03-02,SKU-REAL-1,実商品1,6,1200\n"
+            "2026-03-05,SKU-REAL-2,実商品2,2,800\n"
+        )
+        with app.get_conn() as conn:
+            summary = app.import_sales_history(conn, self.org_id, csv)
+            prod = conn.execute(
+                "SELECT id FROM products WHERE organization_id = ? AND sku = 'SKU-REAL-1'", (self.org_id,)
+            ).fetchone()
+            series = fdata.load_demand_series(conn, self.org_id, prod["id"])
+        self.assertEqual(summary["imported"], 3)
+        self.assertEqual(summary["created_products"], 2)
+        self.assertEqual(summary["skipped"], 0)
+        self.assertEqual(float(series.sum()), 10.0)  # 4 + 6 が需要として読める
+
+    def test_import_sales_history_skips_invalid_rows(self):
+        csv = (
+            "date,sku,product_name,quantity,unit_price\n"
+            "2026-03-01,SKU-X,商品X,3,100\n"     # ok
+            "bad-date,SKU-X,,1,100\n"            # 日付不正
+            "2026-03-02,,商品Y,1,100\n"          # sku 空
+            "2026-03-03,SKU-X,商品X,-2,100\n"    # 数量不正
+        )
+        with app.get_conn() as conn:
+            summary = app.import_sales_history(conn, self.org_id, csv)
+        self.assertEqual(summary["imported"], 1)
+        self.assertEqual(summary["skipped"], 3)
+        self.assertEqual(len(summary["errors"]), 3)
+
+    def test_clear_organization_data_empties_but_keeps_account(self):
+        # A-9 クリーンスタート: 業務データは全消去・組織(アカウント)は残る。
+        with app.get_conn() as conn:
+            before = conn.execute(
+                "SELECT COUNT(*) AS c FROM products WHERE organization_id = ?", (self.org_id,)
+            ).fetchone()["c"]
+            self.assertGreater(before, 0)  # seed 済み
+            app.db.clear_organization_data(conn, self.org_id)
+            for table in ("products", "sales", "purchases", "inventory_movements", "freee_sync_queue", "forecasts"):
+                count = conn.execute(
+                    f"SELECT COUNT(*) AS c FROM {table} WHERE organization_id = ?", (self.org_id,)
+                ).fetchone()["c"]
+                self.assertEqual(count, 0, f"{table} は空になるべき")
+            org_count = conn.execute(
+                "SELECT COUNT(*) AS c FROM organizations WHERE id = ?", (self.org_id,)
+            ).fetchone()["c"]
+            self.assertEqual(org_count, 1)  # アカウントは残る
+
     def test_purchase_increases_stock_and_creates_freee_queue(self):
         with app.get_conn() as conn:
             product = self._first_product(conn)

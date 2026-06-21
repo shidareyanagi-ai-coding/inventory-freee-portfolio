@@ -666,6 +666,21 @@ def reset_domain_tables(conn: _Connection) -> None:
             conn.execute(f"DROP TABLE IF EXISTS {table}")
 
 
+# 1 組織分の業務データだけを消す対象（organizations / memberships は残す＝アカウント・ログインは維持）。
+# DOMAIN_TABLES（子→親の順）からその2つを除いたもの。FK 安全のためこの順で DELETE する。
+CLEARABLE_TABLES = tuple(t for t in DOMAIN_TABLES if t not in ("organizations", "memberships"))
+
+
+def clear_organization_data(conn: _Connection, organization_id: int) -> None:
+    """指定組織の業務データ（商品・取引・履歴・予測・証憑など）を全削除する（A-9 クリーンスタート）。
+
+    organizations / memberships は残すので、アカウントとログインは維持される。
+    各組織が自分の organization_id 配下にのみ実行する想定なので、本番でも安全（DROP しない・他テナント不可）。
+    """
+    for table in CLEARABLE_TABLES:
+        conn.execute(f"DELETE FROM {table} WHERE organization_id = ?", (organization_id,))
+
+
 def insert_returning_id(conn: _Connection, sql: str, params: Sequence[Any]) -> int:
     """INSERT して採番された id を返す（lastrowid と RETURNING の差を吸収）。"""
     if conn.postgres:

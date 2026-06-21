@@ -331,6 +331,24 @@ _INDEX_TEMPLATE = r"""
         <pre id="preview">キューの「確認」を押すと、freee送信用の中間データを表示します。</pre>
       </div>
     </section>
+    <section class="panel" id="realDataSection">
+      <h2>🗂 実データ運用（CSV取込・クリーンスタート）</h2>
+      <p style="color:var(--muted);font-size:13px;margin:0 0 12px;">デモではなく、実際の過去データで使うための機能です。</p>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:16px;">
+        <div style="border:1px solid var(--line);border-radius:8px;padding:14px;">
+          <h3 style="margin:0 0 6px;font-size:14px;">① 過去の売上を CSV で一括取込</h3>
+          <p style="color:var(--muted);font-size:12px;margin:0 0 10px;">列: <code>date,sku,product_name,quantity,unit_price</code>（1行目に列名）。取込後、下の「需要予測レベル2」で <b>予測バッチを実行</b> すると実データで予測します。</p>
+          <input type="file" id="salesCsvFile" accept=".csv,text/csv" style="display:block;margin-bottom:8px;">
+          <button type="button" id="salesCsvImportBtn" class="secondary">CSV を取り込む</button>
+          <p id="salesCsvResult" style="color:var(--muted);font-size:12px;margin:8px 0 0;"></p>
+        </div>
+        <div style="border:1px solid #f3beb7;border-radius:8px;padding:14px;background:#fff7f6;">
+          <h3 style="margin:0 0 6px;font-size:14px;color:var(--danger);">② デモデータを全消去（クリーンスタート）</h3>
+          <p style="color:var(--muted);font-size:12px;margin:0 0 10px;">この組織の商品・取引・履歴・予測・証憑を <b>すべて消去</b> します（アカウントとログインは残ります）。実データだけで始めたいときに。</p>
+          <button type="button" id="clearDataBtn" style="background:var(--danger);color:#fff;border:none;">デモデータを全消去</button>
+        </div>
+      </div>
+    </section>
   </main>
   <script>
     const yen = new Intl.NumberFormat("ja-JP", { style: "currency", currency: "JPY", maximumFractionDigits: 0 });
@@ -996,6 +1014,45 @@ _INDEX_TEMPLATE = r"""
       renderAiKeyStatus();
     });
     renderAiKeyStatus();
+
+    // A-9 実運用化: 売上履歴CSVの一括取込 と クリーンスタート（デモ全消去）。
+    const salesCsvImportBtn = document.getElementById("salesCsvImportBtn");
+    if (salesCsvImportBtn) salesCsvImportBtn.addEventListener("click", async () => {
+      const fileInput = document.getElementById("salesCsvFile");
+      const resultEl = document.getElementById("salesCsvResult");
+      const file = fileInput && fileInput.files && fileInput.files[0];
+      if (!file) { resultEl.textContent = "CSVファイルを選んでください。"; return; }
+      resultEl.textContent = "取込中…";
+      try {
+        const csv = await file.text();
+        const r = await api("/api/import/sales-history", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ csv })
+        });
+        let msg = `取込 ${r.imported}件・新規商品 ${r.created_products}件・スキップ ${r.skipped}件。`;
+        if (r.errors && r.errors.length) {
+          msg += " 例: " + r.errors.slice(0, 3).map(e => `${e.line}行目(${e.error})`).join(" / ");
+        }
+        msg += " → 下の「需要予測レベル2」で『予測バッチを実行』すると実データ予測になります。";
+        resultEl.textContent = msg;
+        await loadAll();
+      } catch (e) {
+        resultEl.textContent = "取込に失敗しました: " + e.message;
+      }
+    });
+
+    const clearDataBtn = document.getElementById("clearDataBtn");
+    if (clearDataBtn) clearDataBtn.addEventListener("click", async () => {
+      if (!confirm("この組織の商品・取引・履歴・予測・証憑をすべて消去します。\nアカウントとログインは残ります。\n元に戻せません。よろしいですか？")) return;
+      try {
+        await api("/api/org/clear-data", { method: "POST" });
+        document.getElementById("message").textContent = "データを全消去しました。実データで始められます。";
+        await loadAll();
+      } catch (e) {
+        document.getElementById("message").textContent = "消去に失敗しました: " + e.message;
+      }
+    });
 
     let currentVouchers = [];
     let vouchersExpanded = false;

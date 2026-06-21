@@ -1916,6 +1916,122 @@ def api_audit_logs(identity: Identity = Depends(require_roles("admin"))) -> list
         return list_audit_logs(conn, identity.organization_id)
 
 
+# A-9 実運用化: 過去の売上履歴を CSV から一括取込する（需要予測のための履歴を用意する）。
+# CSV 列: date, sku, product_name, quantity, unit_price（ヘッダ必須・大文字小文字/空白は無視）。
+#   - 既存の商品は sku で照合、未知の sku は商品を新規作成（product_name / sales_unit_price を採用）。
+#   - 各行を sales＋inventory_movements(sale) として「履歴」投入する（在庫検証・freee送信はしない＝過去データ）。
+#     予測の forecasting.data.load_demand_series は sales×movement を読むので、取込後に実データで予測が効く。
+#   - 商品ごとに初期在庫(=取込売上の合計)を最古日の前日に入れ、在庫が負にならないようにする。
+def import_sales_history(conn: db.Connection, organization_id: int, csv_text: str) -> dict[str, Any]:
+    import csv as _csv
+    import io as _io
+
+    reader = _csv.DictReader(_io.StringIO(csv_text))
+    if not reader.fieldnames:
+        raise ValueError("CSV にヘッダ行がありません。1行目に列名（date,sku,product_name,quantity,unit_price）を入れてください。")
+    norm = {(name or "").strip().lower(): name for name in reader.fieldnames}
+    for required in ("date", "sku", "quantity"):
+        if required not in norm:
+            raise ValueError(f"CSV に必須列 '{required}' がありません（列: date,sku,product_name,quantity,unit_price）。")
+
+    def cell(row: dict[str, Any], key: str) -> str:
+        src = norm.get(key)
+        return (row.get(src) or "").strip() if src else ""
+
+    products = {
+        row["sku"]: row["id"]
+        for row in conn.execute(
+            "SELECT id, sku FROM products WHERE organization_id = ?", (organization_id,)
+        ).fetchall()
+    }
+    totals: dict[int, dict[str, Any]] = {}  # product_id -> {"qty": 合計, "earliest": 最古日}
+    summary: dict[str, Any] = {"imported": 0, "created_products": 0, "skipped": 0, "errors": []}
+
+    for line_no, raw in enumerate(reader, start=2):  # 2行目=最初のデータ行
+        try:
+            d = cell(raw, "date")
+            sku = cell(raw, "sku")
+            name = cell(raw, "product_name") or sku
+            qty_s = cell(raw, "quantity")
+            price_s = cell(raw, "unit_price")
+            if not d and not sku and not qty_s:
+                continue  # 空行は無視
+            date.fromisoformat(d)  # 日付検証（YYYY-MM-DD でなければ例外）
+            if not sku:
+                raise ValueError("sku が空です")
+            quantity = int(round(float(qty_s)))
+            if quantity <= 0:
+                raise ValueError("quantity は正の数にしてください")
+            unit_price = float(price_s) if price_s else 0.0
+            if unit_price < 0:
+                raise ValueError("unit_price は0以上にしてください")
+
+            product_id = products.get(sku)
+            if product_id is None:
+                product_id = db.insert_returning_id(
+                    conn,
+                    """
+                    INSERT INTO products (
+                        organization_id, sku, product_name, category, supplier_name,
+                        purchase_unit_price, sales_unit_price, tax_rate, lead_time_days,
+                        safety_stock, reorder_point, min_order_quantity
+                    ) VALUES (?, ?, ?, '', '', 0, ?, 10, 7, 0, 0, 1)
+                    """,
+                    (organization_id, sku, name, unit_price),
+                )
+                products[sku] = product_id
+                summary["created_products"] += 1
+
+            sale_id = db.insert_returning_id(
+                conn,
+                """
+                INSERT INTO sales (
+                    organization_id, product_id, partner_name, invoice_no, transaction_date,
+                    quantity, unit_price, tax_rate, external_accounting_status
+                ) VALUES (?, ?, 'CSV取込', ?, ?, ?, ?, 10, 'imported')
+                """,
+                (organization_id, product_id, f"CSV-{d}-{line_no}", d, quantity, unit_price),
+            )
+            conn.execute(
+                """
+                INSERT INTO inventory_movements (
+                    organization_id, product_id, movement_type, source_type, source_id,
+                    movement_date, quantity_delta, unit_price, note
+                ) VALUES (?, ?, 'sale', 'sale', ?, ?, ?, ?, 'CSV取込')
+                """,
+                (organization_id, product_id, sale_id, d, -quantity, unit_price),
+            )
+            t = totals.setdefault(product_id, {"qty": 0, "earliest": d})
+            t["qty"] += quantity
+            if d < t["earliest"]:
+                t["earliest"] = d
+            summary["imported"] += 1
+        except Exception as exc:  # noqa: BLE001 - 行単位のエラーは記録してスキップ（全体は止めない）
+            summary["skipped"] += 1
+            if len(summary["errors"]) < 50:
+                summary["errors"].append({"line": line_no, "error": str(exc)})
+
+    # 商品ごとに初期在庫(=取込売上の合計)を最古日の前日に入れ、履歴期間中ずっと在庫が負にならないようにする。
+    for product_id, t in totals.items():
+        has_initial = conn.execute(
+            "SELECT 1 FROM inventory_movements WHERE organization_id = ? AND product_id = ? AND movement_type = 'initial_stock'",
+            (organization_id, product_id),
+        ).fetchone()
+        if has_initial:
+            continue
+        stock_date = (date.fromisoformat(t["earliest"]) - timedelta(days=1)).isoformat()
+        conn.execute(
+            """
+            INSERT INTO inventory_movements (
+                organization_id, product_id, movement_type, source_type, source_id,
+                movement_date, quantity_delta, unit_price, note
+            ) VALUES (?, ?, 'initial_stock', 'import', ?, ?, ?, 0, 'CSV取込 初期在庫')
+            """,
+            (organization_id, product_id, product_id, stock_date, t["qty"]),
+        )
+    return summary
+
+
 # --- 更新系 API（成功時 201 Created・viewer は 403）-------------------------
 @app.post("/api/forecast/run")
 def api_forecast_run(horizon_days: int = 30, identity: Identity = WRITER) -> dict[str, Any]:
@@ -1926,6 +2042,30 @@ def api_forecast_run(horizon_days: int = 30, identity: Identity = WRITER) -> dic
         return forecast_service.run_forecast(
             conn, identity.organization_id, horizon_days=horizon_days, actor_user_id=identity.user_id
         )
+
+
+@app.post("/api/import/sales-history", status_code=201)
+def api_import_sales_history(data: dict[str, Any] = Depends(parse_json_body), identity: Identity = WRITER) -> dict[str, Any]:
+    """A-9: 過去の売上履歴 CSV を一括取込する（admin/staff）。取込後に「予測バッチを実行」で実データ予測。"""
+    csv_text = str(data.get("csv", "") or "")
+    if not csv_text.strip():
+        raise ValueError("csv が空です。CSV の内容を送ってください。")
+    with get_conn() as conn:
+        summary = import_sales_history(conn, identity.organization_id, csv_text)
+        record_audit(
+            conn, identity.organization_id, identity.user_id, "import.sales_history", "import", "",
+            {"imported": summary["imported"], "created_products": summary["created_products"], "skipped": summary["skipped"]},
+        )
+        return {"ok": True, **summary}
+
+
+@app.post("/api/org/clear-data", status_code=201)
+def api_clear_org_data(identity: Identity = Depends(require_roles("admin"))) -> dict[str, Any]:
+    """A-9 クリーンスタート: 自組織の業務データを全消去する（admin のみ）。アカウント・ログインは残る。"""
+    with get_conn() as conn:
+        db.clear_organization_data(conn, identity.organization_id)
+        record_audit(conn, identity.organization_id, identity.user_id, "org.clear_data", "organization", identity.organization_id, {})
+        return {"ok": True, "cleared": True}
 
 
 @app.post("/api/products", status_code=201)
