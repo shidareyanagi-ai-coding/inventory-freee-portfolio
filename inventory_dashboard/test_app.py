@@ -100,6 +100,35 @@ class InventoryAppTest(unittest.TestCase):
             ).fetchone()["c"]
             self.assertEqual(org_count, 1)  # アカウントは残る
 
+    def test_clear_then_import_full_cycle_and_stale_ledger_contract(self):
+        # A-9 実運用フロー: デモ商品で元帳を開く→クリーンスタート→CSV取込（新id採番）。
+        # 取込自体は必ず成功する。一方、削除済みの「旧 product_id」で元帳を引くと 404 になる
+        # ＝フロントは loadAll で旧 id を参照してはいけない（index_html.py の loadAll ガードの根拠）。
+        csv = (
+            "date,sku,product_name,quantity,unit_price\n"
+            "2025-09-01,REAL-PEN,リアル ボールペン,5,120\n"
+            "2025-09-02,REAL-PEN,リアル ボールペン,8,120\n"
+            "2025-09-01,REAL-NOTE,リアル ノート,2,300\n"
+            "2025-09-02,REAL-NOTE,リアル ノート,3,300\n"
+        )
+        with app.get_conn() as conn:
+            old_id = self._first_product(conn)["id"]  # ユーザが元帳で開いていたデモ商品
+            app.db.clear_organization_data(conn, self.org_id)
+            summary = app.import_sales_history(conn, self.org_id, csv)
+            self.assertGreater(summary["imported"], 0)
+            self.assertEqual(summary["created_products"], 2)  # REAL-PEN / REAL-NOTE
+            self.assertEqual(summary["skipped"], 0)
+            new_products = conn.execute(
+                "SELECT id FROM products WHERE organization_id = ? ORDER BY id", (self.org_id,)
+            ).fetchall()
+            # 旧 id は消えている＝この id で元帳を引くと "product not found"（フロントが避けるべき呼び出し）。
+            with self.assertRaises(app.NotFoundError):
+                app.product_ledger(conn, self.org_id, old_id)
+            # 新 id では元帳・予測系が問題なく描画できる（取込後の画面が成立する）。
+            for p in new_products:
+                self.assertIn("ledger", app.product_ledger(conn, self.org_id, p["id"]))
+                self.assertIn("actual", app.forecast_series(conn, self.org_id, p["id"]))
+
     def test_purchase_increases_stock_and_creates_freee_queue(self):
         with app.get_conn() as conn:
             product = self._first_product(conn)

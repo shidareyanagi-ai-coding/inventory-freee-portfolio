@@ -36,6 +36,10 @@
 |---|---|
 | ![dashboard](docs/screenshots/dashboard-overview.png) | ![forecast](docs/screenshots/forecast-simulation.png) |
 
+**実データ運用（過去売上CSVの一括取込・デモ全消去でクリーンスタート → 実データで需要予測）**
+
+![real-data-operations](docs/screenshots/real-data-operations.png)
+
 > 全画面版は [`docs/screenshots/`](docs/screenshots/) にあります。
 
 ## ✨ 主な機能

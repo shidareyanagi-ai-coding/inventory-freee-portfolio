@@ -393,10 +393,21 @@ _INDEX_TEMPLATE = r"""
       renderSelects(data.products);
       await loadForecastML(data.products);
       await loadPartners();
-      if (currentLedgerProductId) {
+      // 選択中の元帳商品が今も存在するかを、いま取得した一覧で確認する。
+      // クリーンスタート・商品削除・CSV再取込（id 再採番）で旧 id が消えていると、
+      // /api/products/{旧id}/ledger が 404「product not found」になり loadAll 全体が失敗するため。
+      const ledgerExists = currentLedgerProductId != null
+        && data.products.some(p => String(p.id) === String(currentLedgerProductId));
+      if (ledgerExists) {
         await loadLedger(currentLedgerProductId);
-      } else if (data.products.length && !document.getElementById("ledger").innerHTML) {
-        await loadLedger(data.products[0].id);
+      } else if (data.products.length) {
+        await loadLedger(data.products[0].id);  // 旧選択は破棄し、先頭商品の元帳を表示
+      } else {
+        // 商品ゼロ（クリーンスタート直後など）：元帳表示を初期化する
+        currentLedgerProductId = null;
+        currentLedgerData = null;
+        document.getElementById("ledger").innerHTML = "";
+        document.getElementById("ledgerTitle").textContent = "在庫元帳";
       }
       const queue = await api("/api/freee-sync-queue");
       renderQueue(queue);
@@ -1023,22 +1034,30 @@ _INDEX_TEMPLATE = r"""
       const file = fileInput && fileInput.files && fileInput.files[0];
       if (!file) { resultEl.textContent = "CSVファイルを選んでください。"; return; }
       resultEl.textContent = "取込中…";
+      let r;
       try {
         const csv = await file.text();
-        const r = await api("/api/import/sales-history", {
+        r = await api("/api/import/sales-history", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ csv })
         });
-        let msg = `取込 ${r.imported}件・新規商品 ${r.created_products}件・スキップ ${r.skipped}件。`;
-        if (r.errors && r.errors.length) {
-          msg += " 例: " + r.errors.slice(0, 3).map(e => `${e.line}行目(${e.error})`).join(" / ");
-        }
-        msg += " → 下の「需要予測レベル2」で『予測バッチを実行』すると実データ予測になります。";
-        resultEl.textContent = msg;
-        await loadAll();
       } catch (e) {
         resultEl.textContent = "取込に失敗しました: " + e.message;
+        return;
+      }
+      // ここに来たら取込API自体は成功（DBに入っている）。以降の画面再描画が失敗しても「取込失敗」とは出さない。
+      let msg = `取込 ${r.imported}件・新規商品 ${r.created_products}件・スキップ ${r.skipped}件。`;
+      if (r.errors && r.errors.length) {
+        msg += " 例: " + r.errors.slice(0, 3).map(e => `${e.line}行目(${e.error})`).join(" / ");
+      }
+      msg += " → 下の「需要予測レベル2」で『予測バッチを実行』すると実データ予測になります。";
+      resultEl.textContent = msg;
+      try {
+        await loadAll();
+      } catch (e) {
+        // 取込は成功済み。再描画だけ失敗した場合は、その旨を別表示（取込成功は覆さない）。
+        resultEl.textContent = msg + "（画面の再読込に失敗しました。ページを再読み込みしてください: " + e.message + "）";
       }
     });
 
