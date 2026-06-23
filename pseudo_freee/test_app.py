@@ -692,5 +692,339 @@ class PseudoFreeeByoKeyTest(unittest.TestCase):
         self.assertNotIn("sk-ant-secret", str(row))  # 鍵は証憑に残らない
 
 
+class PseudoFreeeBookkeepingTest(unittest.TestCase):
+    """複式簿記（試算表・BS・PL・三分法の売上原価）— DOUBLE_ENTRY_BOOKKEEPING_PLAN.md Phase A。"""
+
+    def setUp(self) -> None:
+        self._saved_db_url = os.environ.pop("DATABASE_URL", None)
+        self.tmp = tempfile.TemporaryDirectory()
+        self.original_db_path = app.DB_PATH
+        app.DB_PATH = Path(self.tmp.name) / "pseudo_freee_test.db"
+        app.init_db()
+
+    def tearDown(self) -> None:
+        app.DB_PATH = self.original_db_path
+        self.tmp.cleanup()
+        if self._saved_db_url is not None:
+            os.environ["DATABASE_URL"] = self._saved_db_url
+
+    def _add_sample_deals(self) -> None:
+        """掛売上・現金仕入・手入力経費を 1 件ずつ入れる（残高に偏りを作る）。"""
+        with app.db_connection() as conn:
+            app.create_deal(
+                conn,
+                {
+                    "queue_id": 1, "source_type": "sale", "source_id": 1,
+                    "payload": {
+                        "type": "income", "issue_date": "2026-03-10", "due_date": "2026-04-30",
+                        "partner_name": "青山ECストア",
+                        "details": [{"amount": 500000, "account_item_name": "売上高", "quantity": 1, "unit_price": 500000}],
+                    },
+                },
+            )
+            app.create_deal(
+                conn,
+                {
+                    "queue_id": 2, "source_type": "purchase", "source_id": 2,
+                    "payload": {
+                        "type": "expense", "issue_date": "2026-03-05", "due_date": "",
+                        "partner_name": "東京サプライ",
+                        "details": [{"amount": 200000, "account_item_name": "仕入高", "quantity": 1, "unit_price": 200000}],
+                    },
+                },
+            )
+            app.create_manual_expense(
+                conn,
+                {"issue_date": "2026-03-15", "partner_name": "日本郵便", "account_item_name": "通信費",
+                 "amount": 3000, "payment_method": "現金"},
+            )
+
+    def _entries(self, deal: dict) -> tuple[str, str, float, float]:
+        entries = app.derive_journal_entries(deal)
+        debit = sum(e["amount"] for e in entries if e["side"] == "借")
+        credit = sum(e["amount"] for e in entries if e["side"] == "貸")
+        debit_account = next(e["account"] for e in entries if e["side"] == "借")
+        credit_account = next(e["account"] for e in entries if e["side"] == "貸")
+        return debit_account, credit_account, debit, credit
+
+    def test_journal_entries_balanced(self) -> None:
+        # 各取引タイプで 借方合計 == 貸方合計、かつ正しい相手科目に展開される。
+        cases = [
+            # (deal, 期待借方, 期待貸方)
+            ({"deal_type": "income", "source_type": "sale", "due_date": "2026-04-30", "amount": 500000}, "売掛金", "売上高"),
+            ({"deal_type": "income", "source_type": "sale", "due_date": "", "amount": 500000}, "現金", "売上高"),
+            ({"deal_type": "expense", "source_type": "purchase", "due_date": "2026-04-30", "amount": 200000}, "仕入高", "買掛金"),
+            ({"deal_type": "expense", "source_type": "purchase", "due_date": "", "amount": 200000}, "仕入高", "現金"),
+            ({"deal_type": "expense", "source_type": "manual_expense", "payment_method": "未払金", "account_item_name": "通信費", "amount": 3000}, "通信費", "未払金"),
+            ({"deal_type": "expense", "source_type": "manual_expense", "payment_method": "現金", "account_item_name": "消耗品費", "amount": 1500}, "消耗品費", "現金"),
+        ]
+        for deal, expect_debit, expect_credit in cases:
+            debit_account, credit_account, debit, credit = self._entries(deal)
+            self.assertAlmostEqual(debit, credit, msg=f"unbalanced: {deal}")
+            self.assertEqual(debit_account, expect_debit, msg=f"debit account: {deal}")
+            self.assertEqual(credit_account, expect_credit, msg=f"credit account: {deal}")
+
+    def test_opening_balance_balances(self) -> None:
+        with app.db_connection() as conn:
+            rows = app.opening_balance_rows(conn)
+        debit = sum(float(r["amount"]) for r in rows if r["side"] == "借")
+        credit = sum(float(r["amount"]) for r in rows if r["side"] == "貸")
+        self.assertGreater(debit, 0)
+        self.assertAlmostEqual(debit, credit)
+
+    def test_trial_balance_debit_equals_credit(self) -> None:
+        # 取引が無くても（決算整理のみ）、入れても、貸借が一致する。
+        with app.db_connection() as conn:
+            empty = app.calculate_trial_balance(conn)
+        self.assertTrue(empty["balanced"])
+        self.assertAlmostEqual(empty["debit_total"], empty["credit_total"])
+
+        self._add_sample_deals()
+        with app.db_connection() as conn:
+            trial = app.calculate_trial_balance(conn)
+        self.assertTrue(trial["balanced"])
+        self.assertAlmostEqual(trial["debit_total"], trial["credit_total"])
+        # 決算整理後は仕入高は売上原価へ振り替えられ、試算表に残らない。
+        self.assertNotIn("仕入高", [r["account"] for r in trial["rows"]])
+
+    def test_balance_sheet_balances(self) -> None:
+        self._add_sample_deals()
+        with app.db_connection() as conn:
+            sheet = app.calculate_balance_sheet(conn)
+        self.assertTrue(sheet["balanced"])
+        self.assertAlmostEqual(sheet["asset_total"], sheet["liabilities_equity_total"])
+
+    def test_net_income_flows_to_equity(self) -> None:
+        self._add_sample_deals()
+        with app.db_connection() as conn:
+            income = app.calculate_income_statement(conn)
+            sheet = app.calculate_balance_sheet(conn)
+        # PL の当期純利益が BS 純資産に独立行として現れ、資産＝負債＋純資産が保たれる。
+        equity_accounts = {row["account"]: row["amount"] for row in sheet["equity"]}
+        self.assertIn("当期純利益", equity_accounts)
+        self.assertAlmostEqual(equity_accounts["当期純利益"], income["net_income"])
+        self.assertAlmostEqual(sheet["asset_total"], sheet["liabilities_equity_total"])
+
+    def test_cogs_three_split(self) -> None:
+        # 売上原価 = 期首商品 + 当期仕入 − 期末商品（三分法）。
+        self._add_sample_deals()
+        with app.db_connection() as conn:
+            beginning = app.opening_inventory_amount(conn)
+            purchases = app.current_period_purchases(conn)
+            ending = app.closing_inventory_physical_amount(conn)
+            income = app.calculate_income_statement(conn)
+            balances = app.account_balances(conn)
+        self.assertAlmostEqual(income["cogs"], beginning + purchases - ending)
+        # 決算整理後: 仕入高は 0、商品は期末棚卸高になる。
+        self.assertAlmostEqual(balances.get("仕入高", 0.0), 0.0)
+        self.assertAlmostEqual(balances.get("商品", 0.0), ending)
+
+    def test_closing_inventory_override_changes_cogs_and_inventory(self) -> None:
+        # 期末棚卸高を手入力で上書きすると、売上原価と BS の商品が連動する。
+        self._add_sample_deals()
+        with app.db_connection() as conn:
+            conn.execute(
+                "UPDATE pseudo_freee_closing_inventory SET physical_amount = ? WHERE period = ?",
+                (120000, app.DEFAULT_CLOSING_INVENTORY[0]),
+            )
+        with app.db_connection() as conn:
+            income = app.calculate_income_statement(conn)
+            sheet = app.calculate_balance_sheet(conn)
+            beginning = app.opening_inventory_amount(conn)
+            purchases = app.current_period_purchases(conn)
+        self.assertAlmostEqual(income["cogs"], beginning + purchases - 120000)
+        inventory_amount = next(row["amount"] for row in sheet["assets"] if row["account"] == "商品")
+        self.assertAlmostEqual(inventory_amount, 120000)
+        self.assertTrue(sheet["balanced"])
+
+    def test_statements_page_renders(self) -> None:
+        self._add_sample_deals()
+        html = app.render_statements().decode("utf-8")
+        self.assertIn("決算書（試算表・貸借対照表・損益計算書）", html)
+        self.assertIn("損益計算書", html)
+        self.assertIn("貸借対照表", html)
+        self.assertIn("試算表", html)
+        self.assertIn("売上原価の計算（三分法）", html)
+        self.assertIn("貸借一致 ✓", html)
+
+    def test_structural_accounts_excluded_from_expense_combo(self) -> None:
+        # BS科目（現金・売掛金…）と売上高/売上原価/減価償却費は経費の勘定候補から外す。費用科目は残す。
+        with app.db_connection() as conn:
+            masters = app.list_expense_masters(conn)
+        self.assertIn("消耗品費", masters["account_items"])
+        self.assertIn("仕入高", masters["account_items"])
+        for hidden in ("現金", "普通預金", "売掛金", "買掛金", "資本金", "売上高", "売上原価", "減価償却費", "減価償却累計額"):
+            self.assertNotIn(hidden, masters["account_items"])
+
+    def test_depreciation_indirect_method(self) -> None:
+        # 減価償却（定額法・間接法）: 決算整理仕訳に 借)減価償却費 / 貸)減価償却累計額。
+        self._add_sample_deals()
+        with app.db_connection() as conn:
+            journal = app.closing_journal(conn)
+            sheet = app.calculate_balance_sheet(conn)
+            income = app.calculate_income_statement(conn)
+            dep = app.depreciation_amount(conn)
+        dep_txn = next((t for t in journal if "減価償却" in t["description"]), None)
+        self.assertIsNotNone(dep_txn)
+        debit = next(e for e in dep_txn["entries"] if e["side"] == "借")
+        credit = next(e for e in dep_txn["entries"] if e["side"] == "貸")
+        self.assertEqual(debit["account"], "減価償却費")
+        self.assertEqual(credit["account"], "減価償却累計額")
+        # 間接法: 累計額は資産のマイナス（評価勘定）として BS 資産にマイナス表示。
+        accumulated = next(x["amount"] for x in sheet["assets"] if x["account"] == "減価償却累計額")
+        self.assertAlmostEqual(accumulated, -dep)
+        # 減価償却費は PL の費用に入り、当期純利益を押し下げる。BS は一致を保つ。
+        self.assertIn("減価償却費", [x["account"] for x in income["other_expenses"]])
+        self.assertTrue(sheet["balanced"])
+
+    def test_save_closing_procedure_updates_inventory_and_depreciation(self) -> None:
+        self._add_sample_deals()
+        with app.db_connection() as conn:
+            app.save_closing_procedure(conn, {"period": "202603", "physical_amount": 120000, "depreciation_amount": 50000})
+        with app.db_connection() as conn:
+            beginning = app.opening_inventory_amount(conn)
+            purchases = app.current_period_purchases(conn)
+            income = app.calculate_income_statement(conn)
+            sheet = app.calculate_balance_sheet(conn)
+        self.assertAlmostEqual(app_inventory := next(x["amount"] for x in sheet["assets"] if x["account"] == "商品"), 120000)
+        self.assertAlmostEqual(next(x["amount"] for x in sheet["assets"] if x["account"] == "減価償却累計額"), -50000)
+        self.assertAlmostEqual(income["cogs"], beginning + purchases - 120000)
+        self.assertTrue(sheet["balanced"])
+
+    def test_save_closing_procedure_rejects_negative(self) -> None:
+        with app.db_connection() as conn:
+            with self.assertRaises(ValueError):
+                app.save_closing_procedure(conn, {"period": "202603", "physical_amount": -1, "depreciation_amount": 0})
+
+    def test_journal_transactions_each_balanced(self) -> None:
+        # 仕訳帳: 開始記入＋期中取引＋決算整理。どの取引も借方合計＝貸方合計。
+        self._add_sample_deals()
+        with app.db_connection() as conn:
+            transactions = app.journal_transactions(conn)
+        kinds = {t["kind"] for t in transactions}
+        self.assertEqual(kinds, {"opening", "deal", "closing"})
+        for txn in transactions:
+            debit = sum(e["amount"] for e in txn["entries"] if e["side"] == "借")
+            credit = sum(e["amount"] for e in txn["entries"] if e["side"] == "貸")
+            self.assertAlmostEqual(debit, credit, msg=f"unbalanced txn: {txn['description']}")
+
+    def test_general_ledger_matches_account_balances(self) -> None:
+        # 総勘定元帳の各科目の最終残高（借方プラス符号）は account_balances と一致し、総和は 0。
+        self._add_sample_deals()
+        with app.db_connection() as conn:
+            ledger = app.general_ledger(conn)
+            balances = app.account_balances(conn)
+        total = 0.0
+        for account in ledger:
+            self.assertAlmostEqual(account["balance"], balances[account["account"]], msg=account["account"])
+            total += account["balance"]
+        self.assertAlmostEqual(total, 0.0)
+
+    def test_statements_page_has_three_view_tabs_and_print(self) -> None:
+        self._add_sample_deals()
+        html = app.render_statements().decode("utf-8")
+        # 3つのビュータブ。
+        for marker in ('data-view-btn="statements"', 'data-view-btn="journal"', 'data-view-btn="ledger"'):
+            self.assertIn(marker, html)
+        # 各ビューのコンテナ。
+        for marker in ('data-view="statements"', 'data-view="journal"', 'data-view="ledger"'):
+            self.assertIn(marker, html)
+        for marker in ("決算手続き（入力）", "決算整理仕訳", "仕訳帳", "総勘定元帳", "window.print()", "減価償却費"):
+            self.assertIn(marker, html)
+        self.assertIn('action="/closing"', html)
+        # 総勘定元帳: 勘定科目セレクタ＋相手勘定の列。
+        self.assertIn('id="ledger-account"', html)
+        self.assertIn("相手勘定", html)
+        self.assertIn("data-ledger-account=", html)
+
+    def test_statements_active_view_controls_initial_visibility(self) -> None:
+        self._add_sample_deals()
+        for view in ("statements", "journal", "ledger"):
+            html = app.render_statements(view).decode("utf-8")
+            self.assertIn(f'window.__STMT_VIEW__ = "{view}";', html)
+        # 不正な値は決算書にフォールバック。
+        self.assertIn('window.__STMT_VIEW__ = "statements";', app.render_statements("bogus").decode("utf-8"))
+
+    def test_general_ledger_includes_counter_account(self) -> None:
+        # 現金の元帳に、相手勘定（仕入の相手＝仕入高 や 売上の相手＝売上高）が入る。諸口も使われる。
+        self._add_sample_deals()
+        with app.db_connection() as conn:
+            ledger = {a["account"]: a for a in app.general_ledger(conn)}
+        counters = {row["counter"] for row in ledger["現金"]["rows"]}
+        # 期首（諸口）＋ 現金仕入の相手（仕入高）＋ 手入力経費の相手（通信費）。
+        self.assertIn("諸口", counters)
+        self.assertIn("仕入高", counters)
+
+    def test_ledger_month_filter_and_carry_forward(self) -> None:
+        # 2か月にまたがる現金売上。月で絞ると、その月の記入＋月初の前月繰越が出る。
+        with app.db_connection() as conn:
+            app.create_deal(conn, {"queue_id": 1, "source_type": "sale", "source_id": 1, "payload": {
+                "type": "income", "issue_date": "2026-03-10", "due_date": "", "partner_name": "現金客",
+                "details": [{"amount": 100000, "account_item_name": "売上高", "quantity": 1, "unit_price": 100000}]}})
+            app.create_deal(conn, {"queue_id": 2, "source_type": "sale", "source_id": 2, "payload": {
+                "type": "income", "issue_date": "2026-04-12", "due_date": "", "partner_name": "現金客",
+                "details": [{"amount": 50000, "account_item_name": "売上高", "quantity": 1, "unit_price": 50000}]}})
+        with app.db_connection() as conn:
+            periods = app.ledger_periods(conn)
+            full = {a["account"]: a for a in app.general_ledger(conn)}
+            april = {a["account"]: a for a in app.general_ledger(conn, "2026-04")}
+        self.assertIn("2026-03", periods)
+        self.assertIn("2026-04", periods)
+        self.assertIn("決算", periods)
+        # 4月の現金: 月初繰越（期首30万＋3月10万＝40万）＋4月の+5万 → 残高45万。
+        cash = april["現金"]
+        self.assertAlmostEqual(cash["carry_forward"], 400000)
+        self.assertEqual(len(cash["rows"]), 1)
+        self.assertAlmostEqual(cash["balance"], 450000)
+        # 全期間では繰越行は無し（期首から積む）。
+        self.assertIsNone(full["現金"]["carry_forward"])
+        # 4月に動きのない科目（備品）はその月の元帳に出ない。
+        self.assertNotIn("備品", april)
+
+    def test_statements_ledger_has_month_selector(self) -> None:
+        self._add_sample_deals()
+        html = app.render_statements("ledger").decode("utf-8")
+        self.assertIn('id="ledger-month"', html)
+        self.assertIn("全期間", html)
+        # _add_sample_deals は 2026-03。月の選択肢に出る。
+        self.assertIn(">2026-03<", html)
+        # 月指定で初期表示・繰越が出る。
+        html_april = app.render_statements("ledger", "2026-03").decode("utf-8")
+        self.assertIn("前月繰越", html_april)
+
+    def test_edit_target_rules(self) -> None:
+        self.assertEqual(app._edit_target("deal", "manual_expense", 5), ("/deals/5/edit", "編集"))
+        self.assertEqual(app._edit_target("deal", "purchase", 7)[0], "")  # 在庫連携は編集不可
+        self.assertEqual(app._edit_target("deal", "sale", 7)[1], "在庫側で管理")
+        self.assertEqual(app._edit_target("closing", None, None)[0], "/statements?view=statements#closing-form")
+        self.assertEqual(app._edit_target("opening", None, None), ("", ""))
+
+    def test_journal_and_ledger_have_edit_links(self) -> None:
+        self._add_sample_deals()
+        with app.db_connection() as conn:
+            manual_id = app.list_deals(conn, {"source_type": "manual_expense"})[0]["id"]
+        journal_html = app.render_statements("journal").decode("utf-8")
+        self.assertIn(f"/deals/{manual_id}/edit", journal_html)  # 手入力経費は編集できる
+        self.assertIn("在庫側で管理", journal_html)               # 在庫連携は編集不可ラベル
+        self.assertIn("決算手続きで編集", journal_html)            # 決算整理は決算手続きへ
+        self.assertIn('<th class="no-print">操作</th>', journal_html)
+        ledger_html = app.render_statements("ledger").decode("utf-8")
+        self.assertIn(f"/deals/{manual_id}/edit", ledger_html)
+        self.assertIn("在庫側で管理", ledger_html)
+        # 決算手続きフォームへのアンカー先が存在する。
+        self.assertIn('id="closing-form"', app.render_statements("statements").decode("utf-8"))
+
+    def test_index_shows_statements_buttons(self) -> None:
+        with app.db_connection() as conn:
+            app.create_manual_expense(
+                conn, {"issue_date": "2026-06-13", "partner_name": "日本橋文具", "account_item_name": "消耗品費", "amount": 3300}
+            )
+        html = app.render_index().decode("utf-8")
+        self.assertIn("決算書を表示", html)
+        self.assertIn("仕訳帳を表示", html)
+        self.assertIn("総勘定元帳を表示", html)
+        self.assertIn('href="/statements?view=ledger"', html)
+
+
 if __name__ == "__main__":
     unittest.main()
