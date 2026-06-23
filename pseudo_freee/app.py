@@ -399,7 +399,17 @@ def migrate_deals_schema(conn: db.Connection) -> None:
 
 def ensure_master_schema(conn: db.Connection) -> None:
     if conn.postgres:
-        return  # Postgres は現行スキーマで全列が揃う＝SQLite向けの後付け列追加は不要
+        # 既存の Postgres DB（A-8 で作成済）には Phase A の科目分類3列が無い。
+        # CREATE TABLE IF NOT EXISTS は既存テーブルに列を足さないため、ここで補う（冪等・非破壊）。
+        # 既存行は DEFAULT '' で埋まり、分類値は seed_account_classification が UPDATE する。
+        # 既存列(default_tax_category/search_key)は A-8 で揃っているので触らない（'課税仕入 10%' の
+        # '%' を params 無し execute に渡すと psycopg が誤解する恐れもあり、'' 既定の3列だけに限定）。
+        if table_exists(conn, "pseudo_freee_account_items"):
+            for column in ("account_category", "statement", "normal_balance"):
+                conn.execute(
+                    f"ALTER TABLE pseudo_freee_account_items ADD COLUMN IF NOT EXISTS {column} TEXT NOT NULL DEFAULT ''"
+                )
+        return
     if table_exists(conn, "pseudo_freee_payees"):
         payee_columns = {row["name"] for row in conn.execute("PRAGMA table_info(pseudo_freee_payees)").fetchall()}
         if "search_key" not in payee_columns:
