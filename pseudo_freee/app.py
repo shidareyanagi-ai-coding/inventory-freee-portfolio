@@ -103,6 +103,9 @@ CREATE TABLE IF NOT EXISTS pseudo_freee_account_items (
     account_item_name TEXT NOT NULL UNIQUE,
     default_tax_category TEXT NOT NULL DEFAULT '課税仕入 10%',
     search_key TEXT NOT NULL DEFAULT '',
+    account_category TEXT NOT NULL DEFAULT '',
+    statement TEXT NOT NULL DEFAULT '',
+    normal_balance TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -220,6 +223,102 @@ DEFAULT_MASTER_SEARCH_KEYS = {
 }
 
 
+# ---------------------------------------------------------------------------
+# 複式簿記（簿記3級レベルの 試算表 / BS / PL）— DOUBLE_ENTRY_BOOKKEEPING_PLAN.md Phase A
+# ---------------------------------------------------------------------------
+# 設計の要点（ユーザ承認済）:
+#   - 税込経理（仮払/仮受消費税は作らない。deal.amount をそのまま計上）。
+#   - 仕訳はオンザフライ導出（専用の仕訳テーブルは持たず、pseudo_freee_deals を唯一の正として
+#     レポート時に derive_journal_entries で借方/貸方へ展開する）。
+#   - 三分法で売上原価（期首商品 + 当期仕入 − 期末商品）。期末商品は pseudo_freee_closing_inventory。
+#   - 単一テナント・単一期間（全 deal を集計する 1社の帳簿）。
+ASSET, LIABILITY, EQUITY, REVENUE, EXPENSE = "資産", "負債", "純資産", "収益", "費用"
+BS, PL = "BS", "PL"
+DEBIT, CREDIT = "借", "貸"
+
+# 勘定科目の分類表（科目名 → (区分, 計上先, 通常残高)）。挿入順は試算表/BS/PL の表示順を兼ねる。
+# ここに無い科目（利用者が手入力経費で増やした勘定など）は「費用(PL・借方)」として扱う（_classify）。
+ACCOUNT_CLASSIFICATION: dict[str, tuple[str, str, str]] = {
+    # 資産（借方が通常残高）
+    "現金": (ASSET, BS, DEBIT),
+    "普通預金": (ASSET, BS, DEBIT),
+    "売掛金": (ASSET, BS, DEBIT),
+    "未収金": (ASSET, BS, DEBIT),
+    "商品": (ASSET, BS, DEBIT),
+    "建物": (ASSET, BS, DEBIT),
+    "備品": (ASSET, BS, DEBIT),
+    # 減価償却累計額は評価勘定（資産のマイナス＝貸方残高）。BS で備品の控除として表示する。
+    "減価償却累計額": (ASSET, BS, CREDIT),
+    # 負債（貸方が通常残高）
+    "買掛金": (LIABILITY, BS, CREDIT),
+    "未払金": (LIABILITY, BS, CREDIT),
+    # 純資産
+    "資本金": (EQUITY, BS, CREDIT),
+    "繰越利益剰余金": (EQUITY, BS, CREDIT),
+    # 収益
+    "売上高": (REVENUE, PL, CREDIT),
+    # 費用（売上原価は決算整理で導出。仕入高は期中に積み、決算で売上原価へ振り替えて 0 になる）
+    "売上原価": (EXPENSE, PL, DEBIT),
+    "仕入高": (EXPENSE, PL, DEBIT),
+    "減価償却費": (EXPENSE, PL, DEBIT),
+    "消耗品費": (EXPENSE, PL, DEBIT),
+    "旅費交通費": (EXPENSE, PL, DEBIT),
+    "通信費": (EXPENSE, PL, DEBIT),
+    "荷造運賃": (EXPENSE, PL, DEBIT),
+    "支払手数料": (EXPENSE, PL, DEBIT),
+    "広告宣伝費": (EXPENSE, PL, DEBIT),
+    "会議費": (EXPENSE, PL, DEBIT),
+    "接待交際費": (EXPENSE, PL, DEBIT),
+    "水道光熱費": (EXPENSE, PL, DEBIT),
+    "地代家賃": (EXPENSE, PL, DEBIT),
+    "新聞図書費": (EXPENSE, PL, DEBIT),
+    "修繕費": (EXPENSE, PL, DEBIT),
+    "雑費": (EXPENSE, PL, DEBIT),
+}
+
+# 簿記の構造科目（BS科目・売上高・売上原価）。マスタには載せるが手入力経費の勘定候補からは外す
+# （現金や売掛金を経費の勘定として選べてしまうのを防ぐ）。売上原価は決算で導出するので候補にしない。
+NON_EXPENSE_ACCOUNT_ITEMS = {
+    "現金", "普通預金", "売掛金", "未収金", "商品", "建物", "備品", "減価償却累計額",
+    "買掛金", "未払金", "資本金", "繰越利益剰余金", "売上高", "売上原価", "減価償却費",
+}
+
+# 期首残高（BS科目のみ）。借合計 = 貸合計 になるデモ値。`商品` は期首商品棚卸高を兼ねる。
+#   借: 現金30万 + 普通預金120万 + 売掛金50万 + 商品40万 + 備品20万 = 260万
+#   貸: 買掛金30万 + 資本金200万 + 繰越利益剰余金30万 = 260万
+DEFAULT_OPENING_BALANCES: list[tuple[str, float, str]] = [
+    ("現金", 300000, DEBIT),
+    ("普通預金", 1200000, DEBIT),
+    ("売掛金", 500000, DEBIT),
+    ("商品", 400000, DEBIT),
+    ("備品", 200000, DEBIT),
+    ("買掛金", 300000, CREDIT),
+    ("資本金", 2000000, CREDIT),
+    ("繰越利益剰余金", 300000, CREDIT),
+]
+
+# 期末棚卸（Phase A は seed のデモ値。Phase B で在庫アプリの実評価額に置き換える）。
+# (期, 帳簿棚卸高, 実地棚卸高)。Phase A は帳簿=実地（棚卸減耗 0）。
+DEFAULT_CLOSING_INVENTORY: tuple[str, float, float] = ("202603", 350000, 350000)
+
+# 減価償却（定額法・間接法）。期首の `備品` を耐用年数で割った額を 減価償却費／減価償却累計額 に計上。
+DEPRECIABLE_ASSET = "備品"
+DEPRECIATION_USEFUL_LIFE_YEARS = 5
+# 決算整理の入力デフォルト (期, 減価償却費)。¥200,000 ÷ 5年 = ¥40,000。決算手続き画面で上書き可。
+DEFAULT_CLOSING_SETTINGS: tuple[str, float] = ("202603", 40000)
+
+
+def classify_account(account_item_name: str) -> tuple[str, str, str]:
+    """科目名 → (区分, 計上先, 通常残高)。未知の科目は費用(PL・借方)とみなす。"""
+    return ACCOUNT_CLASSIFICATION.get(account_item_name, (EXPENSE, PL, DEBIT))
+
+
+def account_order_index(account_item_name: str) -> int:
+    """試算表/BS/PL の表示順（ACCOUNT_CLASSIFICATION の定義順。未知の科目は末尾）。"""
+    keys = list(ACCOUNT_CLASSIFICATION.keys())
+    return keys.index(account_item_name) if account_item_name in keys else len(keys)
+
+
 def db_connection() -> Any:
     """DB接続を返す（A-8: db.py が DATABASE_URL で SQLite/Postgres を自動切替）。
     DATABASE_URL が postgres:// なら Neon、無ければローカル SQLite（DB_PATH）。
@@ -316,6 +415,12 @@ def ensure_master_schema(conn: db.Connection) -> None:
             )
         if "search_key" not in account_columns:
             conn.execute("ALTER TABLE pseudo_freee_account_items ADD COLUMN search_key TEXT NOT NULL DEFAULT ''")
+        # 複式簿記: 勘定科目の分類列（区分/計上先/通常残高）。値は seed_master_data で埋める。
+        for column in ("account_category", "statement", "normal_balance"):
+            if column not in account_columns:
+                conn.execute(
+                    f"ALTER TABLE pseudo_freee_account_items ADD COLUMN {column} TEXT NOT NULL DEFAULT ''"
+                )
 
 
 def ensure_deals_columns(conn: db.Connection) -> None:
@@ -449,6 +554,62 @@ def seed_master_data(conn: db.Connection) -> None:
         """,
         [(default_search_key_for_master(name), name) for name in DEFAULT_MASTER_SEARCH_KEYS],
     )
+    seed_account_classification(conn)
+
+
+def seed_account_classification(conn: db.Connection) -> None:
+    """複式簿記の科目分類を投入する（BS科目を追加 ＋ 全科目に区分/計上先/通常残高を付与）。
+
+    手順は既存の search_key 更新と同形:
+      ① 分類表にある科目を INSERT ... ON CONFLICT DO NOTHING（BS科目＝現金/売掛金… を足す）。
+      ② account_category が未設定の行に分類を UPDATE（既存の経費科目にも後付けで付く）。
+    """
+    conn.executemany(
+        "INSERT INTO pseudo_freee_account_items (account_item_name, default_tax_category) "
+        "VALUES (?, ?) ON CONFLICT DO NOTHING",
+        # BS科目・売上高・売上原価は税区分を持たない（税込経理＝計上に税区分を使わない）。
+        [(name, "対象外") for name in ACCOUNT_CLASSIFICATION],
+    )
+    conn.executemany(
+        """
+        UPDATE pseudo_freee_account_items
+        SET account_category = ?, statement = ?, normal_balance = ?
+        WHERE account_item_name = ? AND account_category = ''
+        """,
+        [
+            (category, statement, normal, name)
+            for name, (category, statement, normal) in ACCOUNT_CLASSIFICATION.items()
+        ],
+    )
+
+
+def seed_opening_balances(conn: db.Connection) -> None:
+    """期首残高のデモ値を投入する（借合計=貸合計）。既にあれば変更しない。"""
+    conn.executemany(
+        "INSERT INTO pseudo_freee_opening_balances (account_item_name, amount, side) "
+        "VALUES (?, ?, ?) ON CONFLICT DO NOTHING",
+        [(name, amount, side) for name, amount, side in DEFAULT_OPENING_BALANCES],
+    )
+
+
+def seed_closing_inventory(conn: db.Connection) -> None:
+    """期末棚卸のデモ値を投入する（Phase A 用。Phase B で在庫アプリの実値に置き換わる）。"""
+    period, book_amount, physical_amount = DEFAULT_CLOSING_INVENTORY
+    conn.execute(
+        "INSERT INTO pseudo_freee_closing_inventory (period, book_amount, physical_amount) "
+        "VALUES (?, ?, ?) ON CONFLICT DO NOTHING",
+        (period, book_amount, physical_amount),
+    )
+
+
+def seed_closing_settings(conn: db.Connection) -> None:
+    """決算整理の入力デフォルト（減価償却費）を投入する。決算手続き画面で上書き可。"""
+    period, depreciation_amount = DEFAULT_CLOSING_SETTINGS
+    conn.execute(
+        "INSERT INTO pseudo_freee_closing_settings (period, depreciation_amount) "
+        "VALUES (?, ?) ON CONFLICT DO NOTHING",
+        (period, depreciation_amount),
+    )
 
 
 def init_db() -> None:
@@ -458,7 +619,10 @@ def init_db() -> None:
         ensure_master_schema(conn)    # SQLite の旧DBに不足列を追加（Postgres では何もしない）
         ensure_deals_columns(conn)    # 同上
         backfill_voucher_hashes(conn) # 画像からハッシュ補完（両方言）
-        seed_master_data(conn)        # マスタ投入（両方言・ON CONFLICT DO NOTHING）
+        seed_master_data(conn)        # マスタ投入＋科目分類（両方言・ON CONFLICT DO NOTHING）
+        seed_opening_balances(conn)   # 複式簿記: 期首残高のデモ値（ON CONFLICT DO NOTHING）
+        seed_closing_inventory(conn)  # 複式簿記: 期末棚卸のデモ値（Phase A）
+        seed_closing_settings(conn)   # 複式簿記: 決算整理の入力デフォルト（減価償却費）
 
 
 def row_to_dict(row: dict[str, Any]) -> dict[str, Any]:
@@ -533,12 +697,18 @@ def list_expense_masters(conn: db.Connection) -> dict[str, Any]:
         """
     ).fetchall()
     payees = [row["payee_name"] for row in payee_rows]
+    # 複式簿記の構造科目（現金/売掛金/売上高/売上原価…）は経費入力の勘定候補から外す
+    # （手入力経費は費用科目のみ。BS科目を経費として選べてしまうのを防ぐ）。
+    exclude = list(NON_EXPENSE_ACCOUNT_ITEMS)
+    placeholders = ", ".join("?" for _ in exclude)
     account_item_rows = conn.execute(
-        """
+        f"""
         SELECT account_item_name, default_tax_category, search_key
         FROM pseudo_freee_account_items
+        WHERE account_item_name NOT IN ({placeholders})
         ORDER BY account_item_name
-        """
+        """,
+        exclude,
     ).fetchall()
     account_items = [row["account_item_name"] for row in account_item_rows]
     tax_categories = [
@@ -1256,6 +1426,459 @@ def get_monthly_trends(conn: db.Connection) -> list[dict[str, Any]]:
     return trends
 
 
+# ---------------------------------------------------------------------------
+# 複式簿記の計算器（試算表 / PL / BS）— DOUBLE_ENTRY_BOOKKEEPING_PLAN.md Phase A A5
+# ---------------------------------------------------------------------------
+# 残高は「借方プラス符号」で持つ（借方残高は正、貸方残高は負）。最後に通常残高の向きで
+# 借方/貸方の列に振り分ける。期首一致＋各 deal 一致＋決算整理一致 ⇒ 試算表一致 ⇒ BS一致。
+_BALANCE_EPSILON = 0.005  # 表示で 0 とみなす閾値（float 誤差・端数）
+_BALANCE_TOLERANCE = 1.0  # 貸借一致の判定（plan: abs(借−貸) < 1）
+
+
+def opening_balance_rows(conn: db.Connection) -> list[dict[str, Any]]:
+    return [
+        row_to_dict(row)
+        for row in conn.execute(
+            "SELECT account_item_name, amount, side FROM pseudo_freee_opening_balances ORDER BY id"
+        ).fetchall()
+    ]
+
+
+def closing_inventory_current(conn: db.Connection) -> dict[str, Any] | None:
+    """期末棚卸の最新行（単一期間なので最大 period を採用）。無ければ None。"""
+    row = conn.execute(
+        """
+        SELECT period, book_amount, physical_amount
+        FROM pseudo_freee_closing_inventory
+        ORDER BY period DESC
+        LIMIT 1
+        """
+    ).fetchone()
+    return row_to_dict(row) if row else None
+
+
+def closing_inventory_physical_amount(conn: db.Connection) -> float:
+    """期末商品棚卸高（実地）。三分法の売上原価・BS の `商品` に使う。無ければ 0。"""
+    row = closing_inventory_current(conn)
+    return float(row["physical_amount"]) if row else 0.0
+
+
+def current_closing_period(conn: db.Connection) -> str:
+    """決算手続きの対象期（単一期間）。期末棚卸の最新 period、無ければデフォルト。"""
+    row = closing_inventory_current(conn)
+    return str(row["period"]) if row else DEFAULT_CLOSING_INVENTORY[0]
+
+
+def depreciation_amount(conn: db.Connection) -> float:
+    """当期の減価償却費（決算手続きで確定／上書きした額）。無ければ 0。"""
+    row = conn.execute(
+        "SELECT depreciation_amount FROM pseudo_freee_closing_settings ORDER BY period DESC LIMIT 1"
+    ).fetchone()
+    return float(row["depreciation_amount"]) if row else 0.0
+
+
+def suggested_depreciation(conn: db.Connection) -> float:
+    """定額法の目安額（期首 `備品` ÷ 耐用年数・残存価額0）。決算手続き画面の初期表示に使う。"""
+    asset_cost = next(
+        (float(row["amount"]) for row in opening_balance_rows(conn) if row["account_item_name"] == DEPRECIABLE_ASSET),
+        0.0,
+    )
+    if DEPRECIATION_USEFUL_LIFE_YEARS <= 0:
+        return 0.0
+    return round(asset_cost / DEPRECIATION_USEFUL_LIFE_YEARS)
+
+
+def save_closing_procedure(conn: db.Connection, data: dict[str, Any]) -> dict[str, Any]:
+    """決算手続きの入力を保存する（期末商品棚卸高＝実地・減価償却費）。
+
+    Phase A は手入力（帳簿=実地＝棚卸減耗0）。period は対象期（既定＝現在の単一期間）。
+    """
+    period = str(data.get("period", "") or "").strip() or current_closing_period(conn)
+    physical_amount = to_float(data.get("physical_amount"))
+    depreciation = to_float(data.get("depreciation_amount"))
+    if physical_amount < 0 or depreciation < 0:
+        raise ValueError("金額は0以上で入力してください。")
+    # 期末棚卸（Phase A は 帳簿=実地）。
+    conn.execute(
+        """
+        INSERT INTO pseudo_freee_closing_inventory (period, book_amount, physical_amount)
+        VALUES (?, ?, ?)
+        ON CONFLICT(period) DO UPDATE SET
+            book_amount = excluded.book_amount,
+            physical_amount = excluded.physical_amount
+        """,
+        (period, physical_amount, physical_amount),
+    )
+    # 減価償却費。
+    conn.execute(
+        """
+        INSERT INTO pseudo_freee_closing_settings (period, depreciation_amount)
+        VALUES (?, ?)
+        ON CONFLICT(period) DO UPDATE SET depreciation_amount = excluded.depreciation_amount
+        """,
+        (period, depreciation),
+    )
+    return {"ok": True, "period": period, "physical_amount": physical_amount, "depreciation_amount": depreciation}
+
+
+def _settlement_account(deal: dict[str, Any]) -> str:
+    """相手（決済）科目を決める。payment_method 優先、無ければ due_date 有無で 掛/現金。"""
+    payment_method = str(deal.get("payment_method", "") or "").strip()
+    if payment_method in {"現金", "普通預金", "未払金"}:
+        return payment_method
+    # 在庫由来(purchase/sale)は payment_method 空 → due_date 有無で判定（既存の receivable/payable と同基準）。
+    is_income = deal.get("deal_type") == "income"
+    if str(deal.get("due_date", "") or "").strip():
+        return "売掛金" if is_income else "買掛金"
+    return "現金"
+
+
+def derive_journal_entries(deal: dict[str, Any]) -> list[dict[str, Any]]:
+    """1 取引 → 借方/貸方の仕訳行（税込・オンザフライ導出）。専用テーブルは持たない。"""
+    amount = float(deal.get("amount") or 0)
+    if abs(amount) < _BALANCE_EPSILON:
+        return []
+    settlement = _settlement_account(deal)
+    if deal.get("deal_type") == "income":
+        # 売上: (借) 決済科目〔売掛金/現金〕 / (貸) 売上高
+        return [
+            {"account": settlement, "side": DEBIT, "amount": amount},
+            {"account": "売上高", "side": CREDIT, "amount": amount},
+        ]
+    # 支出: 在庫仕入は仕入高、手入力経費はその勘定科目。(貸) 決済科目〔買掛金/現金/普通預金/未払金〕。
+    debit_account = "仕入高" if deal.get("source_type") == "purchase" else str(deal.get("account_item_name") or "雑費")
+    return [
+        {"account": debit_account, "side": DEBIT, "amount": amount},
+        {"account": settlement, "side": CREDIT, "amount": amount},
+    ]
+
+
+def _apply(balances: dict[str, float], account: str, side: str, amount: float) -> None:
+    balances[account] = balances.get(account, 0.0) + (amount if side == DEBIT else -amount)
+
+
+def current_period_purchases(conn: db.Connection) -> float:
+    """当期仕入高（期中の `仕入高` 借方合計）。決算整理（三分法）と決算ページの内訳に使う。"""
+    total = 0.0
+    for deal in list_deals(conn):
+        for entry in derive_journal_entries(deal):
+            if entry["account"] == "仕入高" and entry["side"] == DEBIT:
+                total += entry["amount"]
+    return total
+
+
+def opening_inventory_amount(conn: db.Connection) -> float:
+    """期首商品棚卸高（期首残高の `商品`）。無ければ 0。"""
+    return next(
+        (float(row["amount"]) for row in opening_balance_rows(conn) if row["account_item_name"] == "商品"),
+        0.0,
+    )
+
+
+def closing_journal(conn: db.Connection) -> list[dict[str, Any]]:
+    """決算整理仕訳を (摘要, 借方/貸方行) のリストで返す（仕訳は物理生成しない＝オンザフライ）。
+
+    三分法（売上原価 = 期首商品 + 当期仕入 − 期末商品）を 3 本、減価償却（定額法・間接法）を 1 本。
+    各仕訳が貸借一致するので、畳み込んでも試算表の貸借合計は崩れない。決算ページの「決算整理仕訳」
+    表示と account_balances の③が**同じ関数**を参照する（食い違いを作らない）。
+    """
+    beginning_inventory = opening_inventory_amount(conn)
+    current_purchases = current_period_purchases(conn)  # 当期仕入高（期中の `仕入高` 借方合計）
+    ending_inventory = closing_inventory_physical_amount(conn)
+    depreciation = depreciation_amount(conn)
+    journal: list[dict[str, Any]] = []
+    if abs(beginning_inventory) > _BALANCE_EPSILON:  # 期首商品 → 売上原価
+        journal.append({"description": "期首商品を売上原価へ振替", "entries": [
+            {"account": "売上原価", "side": DEBIT, "amount": beginning_inventory},
+            {"account": "商品", "side": CREDIT, "amount": beginning_inventory}]})
+    if abs(current_purchases) > _BALANCE_EPSILON:  # 当期仕入 → 売上原価（仕入高は 0 になる）
+        journal.append({"description": "当期仕入を売上原価へ振替", "entries": [
+            {"account": "売上原価", "side": DEBIT, "amount": current_purchases},
+            {"account": "仕入高", "side": CREDIT, "amount": current_purchases}]})
+    if abs(ending_inventory) > _BALANCE_EPSILON:  # 期末商品を計上（売上原価から控除）
+        journal.append({"description": "期末商品を計上（売上原価から控除）", "entries": [
+            {"account": "商品", "side": DEBIT, "amount": ending_inventory},
+            {"account": "売上原価", "side": CREDIT, "amount": ending_inventory}]})
+    if abs(depreciation) > _BALANCE_EPSILON:  # 減価償却（定額法・間接法）
+        journal.append({"description": "減価償却費の計上（定額法・間接法）", "entries": [
+            {"account": "減価償却費", "side": DEBIT, "amount": depreciation},
+            {"account": "減価償却累計額", "side": CREDIT, "amount": depreciation}]})
+    return journal
+
+
+def closing_adjustments(conn: db.Connection) -> list[tuple[str, str, float]]:
+    """決算整理仕訳を (科目, 借/貸, 金額) に平坦化（account_balances の③で畳み込む）。"""
+    return [
+        (entry["account"], entry["side"], entry["amount"])
+        for txn in closing_journal(conn)
+        for entry in txn["entries"]
+    ]
+
+
+def account_balances(conn: db.Connection) -> dict[str, float]:
+    """全科目の残高（借方プラス符号）。①期首残高 ②期中 deal ③決算整理 の順に畳み込む。"""
+    balances: dict[str, float] = {}
+    for row in opening_balance_rows(conn):  # ① 期首残高を通常残高の向きで読む
+        _apply(balances, row["account_item_name"], str(row["side"] or DEBIT), float(row["amount"]))
+    for deal in list_deals(conn):  # ② 期中の取引を仕訳に展開して畳み込む
+        for entry in derive_journal_entries(deal):
+            _apply(balances, entry["account"], entry["side"], entry["amount"])
+    for account, side, amount in closing_adjustments(conn):  # ③ 決算整理（三分法）
+        _apply(balances, account, side, amount)
+    return balances
+
+
+def calculate_trial_balance(conn: db.Connection) -> dict[str, Any]:
+    """決算整理後の残高試算表。各科目を通常残高の向きで借方/貸方へ振り分ける。"""
+    balances = account_balances(conn)
+    rows: list[dict[str, Any]] = []
+    debit_total = credit_total = 0.0
+    for account in sorted(balances, key=account_order_index):
+        balance = balances[account]
+        if abs(balance) < _BALANCE_EPSILON:
+            continue  # 残高 0 の科目（決算後の仕入高など）は載せない
+        category, statement, normal = classify_account(account)
+        debit = balance if normal == DEBIT else 0.0
+        credit = -balance if normal == CREDIT else 0.0
+        debit_total += debit
+        credit_total += credit
+        rows.append(
+            {"account": account, "category": category, "statement": statement, "debit": debit, "credit": credit}
+        )
+    return {
+        "rows": rows,
+        "debit_total": debit_total,
+        "credit_total": credit_total,
+        "balanced": abs(debit_total - credit_total) < _BALANCE_TOLERANCE,
+    }
+
+
+def calculate_income_statement(conn: db.Connection) -> dict[str, Any]:
+    """損益計算書。売上高 − 売上原価 − その他費用 = 当期純利益。"""
+    balances = account_balances(conn)
+    sales = -balances.get("売上高", 0.0)   # 収益は貸方残高（負）→ 符号反転で正の売上高
+    cogs = balances.get("売上原価", 0.0)    # 費用は借方残高（正）
+    other_expenses: list[dict[str, Any]] = []
+    other_total = 0.0
+    for account in sorted(balances, key=account_order_index):
+        if classify_account(account)[0] != EXPENSE or account in ("売上原価", "仕入高"):
+            continue
+        balance = balances[account]
+        if abs(balance) < _BALANCE_EPSILON:
+            continue
+        other_expenses.append({"account": account, "amount": balance})
+        other_total += balance
+    gross_profit = sales - cogs
+    net_income = sales - cogs - other_total
+    return {
+        "sales": sales,
+        "cogs": cogs,
+        "gross_profit": gross_profit,
+        "other_expenses": other_expenses,
+        "other_total": other_total,
+        "net_income": net_income,
+    }
+
+
+def calculate_balance_sheet(conn: db.Connection) -> dict[str, Any]:
+    """貸借対照表。資産 = 負債 + 純資産（資本金 + 繰越利益剰余金 + 当期純利益）。"""
+    balances = account_balances(conn)
+    net_income = calculate_income_statement(conn)["net_income"]
+    assets: list[dict[str, Any]] = []
+    liabilities: list[dict[str, Any]] = []
+    equity: list[dict[str, Any]] = []
+    asset_total = liability_total = equity_total = 0.0
+    for account in sorted(balances, key=account_order_index):
+        category, statement, _normal = classify_account(account)
+        if statement != BS:
+            continue
+        balance = balances[account]
+        if category == ASSET:
+            amount = balance  # 資産は借方残高（正）
+        else:
+            amount = -balance  # 負債・純資産は貸方残高（負）→ 符号反転
+        if abs(amount) < _BALANCE_EPSILON:
+            continue
+        if category == ASSET:
+            assets.append({"account": account, "amount": amount})
+            asset_total += amount
+        elif category == LIABILITY:
+            liabilities.append({"account": account, "amount": amount})
+            liability_total += amount
+        elif category == EQUITY:
+            equity.append({"account": account, "amount": amount})
+            equity_total += amount
+    # 当期純利益を純資産に独立行で加える（繰越利益剰余金へ振り替える前の表示＝PL の利益が BS に流れる）。
+    equity.append({"account": "当期純利益", "amount": net_income})
+    equity_total += net_income
+    liabilities_equity_total = liability_total + equity_total
+    return {
+        "assets": assets,
+        "liabilities": liabilities,
+        "equity": equity,
+        "asset_total": asset_total,
+        "liability_total": liability_total,
+        "equity_total": equity_total,
+        "liabilities_equity_total": liabilities_equity_total,
+        "net_income": net_income,
+        "balanced": abs(asset_total - liabilities_equity_total) < _BALANCE_TOLERANCE,
+    }
+
+
+def _deal_journal_description(deal: dict[str, Any]) -> str:
+    partner = deal.get("partner_name") or "—"
+    return f"{source_type_label(deal['source_type'])}：{partner}"
+
+
+def _edit_target(kind: str, source_type: str | None, deal_id: int | None) -> tuple[str, str]:
+    """仕訳/元帳の行の編集導線 (href, ラベル)。href が空なら編集不可（ラベルだけ表示）。
+
+    手入力経費＝既存の編集フォーム、決算整理＝決算手続きフォーム、在庫連携＝在庫側が正で編集不可、
+    期首残高＝今回は編集対象外。
+    """
+    if kind == "deal":
+        if source_type == "manual_expense":
+            return (f"/deals/{deal_id}/edit", "編集")
+        return ("", "在庫側で管理")
+    if kind == "closing":
+        return ("/statements?view=statements#closing-form", "決算手続きで編集")
+    return ("", "")  # opening（期首残高は今回は編集対象外）
+
+
+def _edit_cell(kind: str, source_type: str | None, deal_id: int | None) -> str:
+    """編集導線を 1 セル分の HTML に（印刷時は隠す）。"""
+    href, label = _edit_target(kind, source_type, deal_id)
+    if not label:
+        return ""
+    if href:
+        return f'<a href="{href}">{label}</a>'
+    return f'<span class="label">{label}</span>'
+
+
+def journal_transactions(conn: db.Connection) -> list[dict[str, Any]]:
+    """仕訳帳：開始記入（期首残高）＋ 期中取引 ＋ 決算整理仕訳 を時系列で返す。
+
+    各取引は {date, description, kind, deal_id?, entries:[{account, side, amount}]}。
+    """
+    transactions: list[dict[str, Any]] = []
+
+    opening_entries = [
+        {"account": row["account_item_name"], "side": str(row["side"] or DEBIT), "amount": float(row["amount"])}
+        for row in opening_balance_rows(conn)
+    ]
+    if opening_entries:
+        transactions.append(
+            {"date": "期首", "description": "前期繰越（開始記入）", "kind": "opening", "entries": opening_entries}
+        )
+
+    deals = sorted(list_deals(conn), key=lambda d: (d.get("issue_date") or "", d.get("id") or 0))
+    for deal in deals:
+        entries = derive_journal_entries(deal)
+        if not entries:
+            continue
+        transactions.append(
+            {
+                "date": deal.get("issue_date") or "",
+                "description": _deal_journal_description(deal),
+                "kind": "deal",
+                "deal_id": deal.get("id"),
+                "source_type": deal.get("source_type"),
+                "entries": entries,
+            }
+        )
+
+    for txn in closing_journal(conn):
+        transactions.append(
+            {"date": "決算", "description": txn["description"], "kind": "closing", "entries": txn["entries"]}
+        )
+    return transactions
+
+
+def _counter_account(txn: dict[str, Any], entry: dict[str, Any]) -> str:
+    """ある仕訳行から見た相手勘定。反対側が1科目ならその名、複数なら『諸口』。"""
+    opposite = [e for e in txn["entries"] if e["side"] != entry["side"]]
+    if not opposite:
+        return ""
+    if len(opposite) == 1:
+        return opposite[0]["account"]
+    return "諸口"
+
+
+def _transaction_bucket(txn: dict[str, Any]) -> str:
+    """元帳の月フィルタ用のバケツ。期首＝繰越、決算整理＝決算、取引＝その発生月(YYYY-MM)。"""
+    if txn["kind"] == "opening":
+        return "期首"
+    if txn["kind"] == "closing":
+        return "決算"
+    date = str(txn.get("date") or "")
+    return date[:7] if len(date) >= 7 else "その他"
+
+
+def ledger_periods(conn: db.Connection) -> list[str]:
+    """総勘定元帳の月セレクタ候補。取引のある月（昇順）＋『決算』。期首は繰越に含めるので出さない。"""
+    buckets: list[str] = []
+    for txn in journal_transactions(conn):
+        bucket = _transaction_bucket(txn)
+        if bucket != "期首" and bucket not in buckets:
+            buckets.append(bucket)
+    months = sorted(b for b in buckets if b not in ("決算", "その他"))
+    tail = [b for b in ("その他", "決算") if b in buckets]
+    return months + tail
+
+
+def general_ledger(conn: db.Connection, month: str = "") -> list[dict[str, Any]]:
+    """総勘定元帳：仕訳帳の各行を科目ごとに集計し、記入順に残高（借方プラス符号）を積む。
+
+    各記入に相手勘定（複数なら『諸口』）を付ける。month を指定するとその月（'YYYY-MM' か '決算'）の
+    記入だけに絞り、月初の繰越（carry_forward）を付ける。動きのない科目はその月では返さない。
+    """
+    postings: dict[str, list[dict[str, Any]]] = {}
+    for txn in journal_transactions(conn):
+        bucket = _transaction_bucket(txn)
+        for entry in txn["entries"]:
+            postings.setdefault(entry["account"], []).append(
+                {
+                    "date": txn["date"],
+                    "description": txn["description"],
+                    "counter": _counter_account(txn, entry),
+                    "side": entry["side"],
+                    "amount": entry["amount"],
+                    "bucket": bucket,
+                    "kind": txn["kind"],
+                    "source_type": txn.get("source_type"),
+                    "deal_id": txn.get("deal_id"),
+                }
+            )
+    ledger: list[dict[str, Any]] = []
+    for account in sorted(postings, key=account_order_index):
+        category, _statement, normal = classify_account(account)
+        running = 0.0
+        all_rows: list[dict[str, Any]] = []
+        for posting in postings[account]:
+            running += posting["amount"] if posting["side"] == DEBIT else -posting["amount"]
+            all_rows.append({**posting, "balance": running})
+        if month:
+            shown = [row for row in all_rows if row["bucket"] == month]
+            if not shown:
+                continue  # その月に動きのない科目は出さない
+            first_index = all_rows.index(shown[0])
+            carry = all_rows[first_index - 1]["balance"] if first_index > 0 else 0.0
+            ledger.append(
+                {
+                    "account": account, "category": category, "normal_balance": normal,
+                    "rows": shown, "carry_forward": carry, "balance": shown[-1]["balance"],
+                }
+            )
+        else:
+            ledger.append(
+                {
+                    "account": account, "category": category, "normal_balance": normal,
+                    "rows": all_rows, "carry_forward": None, "balance": running,
+                }
+            )
+    return ledger
+
+
 # A-6: Clerk サインインのブートストラップ（在庫 index_html.py の方式を踏襲）。
 # 公開キー pk_xxx の3要素目以降は frontend-api ホストの base64（末尾 '$' を除去）。
 # 生文字列(r''')で正規表現のバックスラッシュをそのまま保つ。template literal(${})は使わない。
@@ -1788,7 +2411,7 @@ def render_page(title: str, body: str) -> bytes:
   <header>
     <div class="wrap topbar">
       <h1>疑似freee会計ダッシュボード</h1>
-      <nav>{inventory_link}<a href="/">取引一覧</a> <span class="label">/ API: POST /api/deals</span> <span id="pf-clerk-user"></span></nav>
+      <nav>{inventory_link}<a href="/">取引一覧</a> <a href="/statements">決算</a> <span class="label">/ API: POST /api/deals</span> <span id="pf-clerk-user"></span></nav>
     </div>
   </header>
   <main class="wrap">{body}</main>
@@ -1836,6 +2459,8 @@ def render_index(filters: dict[str, str] | None = None) -> bytes:
         summary = get_summary(conn)
         trends = get_monthly_trends(conn)
         masters = list_expense_masters(conn)
+        income = calculate_income_statement(conn)
+        sheet = calculate_balance_sheet(conn)
 
     rows = ""
     for deal in deals:
@@ -1955,6 +2580,15 @@ def render_index(filters: dict[str, str] | None = None) -> bytes:
     )
 
     body = f"""
+      <section class="card" style="border-color:#c7d7ff;background:#f5f8ff;margin-bottom:20px;">
+        <h2 style="margin:0 0 4px;">📒 複式簿記の帳簿・決算書</h2>
+        <div class="label">この取引一覧を借方/貸方の仕訳に自動展開して作成します（三分法・減価償却の決算手続き＋印刷対応）。当期純利益 <strong>{yen(income["net_income"])}</strong> ／ 貸借対照表 {_balance_badge(sheet["balanced"])}</div>
+        <div style="display:flex;flex-wrap:wrap;gap:10px;margin-top:12px;">
+          <a href="/statements?view=statements" style="display:inline-block;background:var(--accent);color:#fff;font-weight:700;padding:10px 18px;border-radius:6px;">📄 決算書を表示</a>
+          <a href="/statements?view=journal" style="display:inline-block;background:#fff;color:var(--accent);border:1px solid var(--accent);font-weight:700;padding:10px 18px;border-radius:6px;">📒 仕訳帳を表示</a>
+          <a href="/statements?view=ledger" style="display:inline-block;background:#fff;color:var(--accent);border:1px solid var(--accent);font-weight:700;padding:10px 18px;border-radius:6px;">📚 総勘定元帳を表示</a>
+        </div>
+      </section>
       <section class="kpis">
         <div class="card"><div class="label">対象月</div><div class="value">{html.escape(summary["month"])}</div></div>
         <div class="card"><div class="label">今月売上</div><div class="value">{yen(summary["income_total"])}</div></div>
@@ -2527,6 +3161,401 @@ def render_index(filters: dict[str, str] | None = None) -> bytes:
     return render_page("疑似freee会計ダッシュボード", body)
 
 
+def _balance_badge(balanced: bool) -> str:
+    return (
+        '<span class="badge income">貸借一致 ✓</span>'
+        if balanced
+        else '<span class="badge expense">不一致 ✗</span>'
+    )
+
+
+# 決算ページの印刷対応。印刷時はヘッダ/入力フォーム/ボタン(.no-print)を隠し、帳票だけを出す。
+# 並のCSSなので { } を含む → f-string とぶつからないよう独立した素の文字列にする。
+_STATEMENTS_PRINT_CSS = """
+<style>
+  .stmt-bar { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; justify-content: space-between; margin-bottom: 16px; }
+  .stmt-tabs { display: flex; gap: 8px; flex-wrap: wrap; }
+  .tab-btn { width: auto; padding: 9px 18px; white-space: nowrap; background: #fff; color: var(--accent); border: 1px solid var(--accent); font-weight: 700; }
+  .tab-btn.active { background: var(--accent); color: #fff; }
+  .print-btn { width: auto; padding: 9px 16px; white-space: nowrap; background: #fff; color: var(--text); border: 1px solid var(--line); font-weight: 700; }
+  .ledger-account h3 { margin: 0 0 6px; font-size: 15px; }
+  .ledger-pick { display: flex; gap: 10px; align-items: end; flex-wrap: wrap; margin-bottom: 14px; }
+  .ledger-pick label { min-width: 240px; }
+  .closing-form { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; align-items: end; }
+  .closing-form .full { grid-column: 1 / -1; }
+  .je-debit { color: var(--expense); }
+  .je-credit { color: var(--income); }
+  @media (max-width: 760px) { .closing-form { grid-template-columns: 1fr; } }
+  @media print {
+    header, nav, .no-print { display: none !important; }
+    main { padding: 0 !important; width: 100% !important; }
+    /* 長い表（仕訳帳など）がページをまたげるよう overflow を解除する。
+       base の table{overflow:hidden} のままだと印刷時に1ページ目で切れてしまう。 */
+    .card { border: 1px solid #ccc !important; box-shadow: none !important; overflow: visible !important; }
+    table { overflow: visible !important; }
+    thead { display: table-header-group; }   /* 各ページの先頭で見出し行を繰り返す */
+    tr { break-inside: avoid; }              /* 行の途中で改ページしない */
+    [hidden] { display: none !important; }
+    a { color: #000 !important; text-decoration: none !important; }
+    body { background: #fff !important; }
+  }
+</style>
+"""
+
+# 決算ページのビュー切替（決算書/仕訳帳/総勘定元帳タブ＋元帳の勘定科目セレクタ）。
+# { } を含むので f-string とは独立した素の文字列にする。初期ビューは window.__STMT_VIEW__ から読む。
+_STATEMENTS_VIEW_JS = """
+<script>
+(function(){
+  var initial = window.__STMT_VIEW__ || "statements";
+  var buttons = Array.prototype.slice.call(document.querySelectorAll("[data-view-btn]"));
+  var views = Array.prototype.slice.call(document.querySelectorAll("[data-view]"));
+  function show(name){
+    views.forEach(function(v){ v.hidden = v.getAttribute("data-view") !== name; });
+    buttons.forEach(function(b){ b.classList.toggle("active", b.getAttribute("data-view-btn") === name); });
+  }
+  buttons.forEach(function(b){ b.addEventListener("click", function(){ show(b.getAttribute("data-view-btn")); }); });
+  show(initial);
+
+  var sel = document.getElementById("ledger-account");
+  var ledgers = Array.prototype.slice.call(document.querySelectorAll("[data-ledger-account]"));
+  function showLedger(account){
+    ledgers.forEach(function(t){ t.hidden = t.getAttribute("data-ledger-account") !== account; });
+  }
+  if(sel){
+    sel.addEventListener("change", function(){ showLedger(sel.value); });
+    if(sel.value){ showLedger(sel.value); }
+  }
+})();
+</script>
+"""
+
+
+def _journal_line_rows(transactions: list[dict[str, Any]]) -> str:
+    """仕訳帳の行。1 取引の各行を 1 行ずつ（借方 or 貸方）。先頭行にだけ日付・摘要を出す。"""
+    rows = ""
+    for txn in transactions:
+        kind_class = {"opening": "manual", "closing": "expense"}.get(txn["kind"], "income")
+        edit_html = _edit_cell(txn["kind"], txn.get("source_type"), txn.get("deal_id"))
+        first = True
+        for entry in txn["entries"]:
+            date_cell = html.escape(str(txn["date"])) if first else ""
+            if first:
+                desc = html.escape(txn["description"])
+                if txn.get("deal_id"):
+                    desc = f'<a href="/deals/{txn["deal_id"]}">{desc}</a>'
+                badge = f'<span class="badge {kind_class}">{ {"opening":"開始","closing":"決算","deal":"取引"}[txn["kind"]] }</span> '
+                desc_cell = badge + desc
+                op_cell = edit_html
+            else:
+                desc_cell = ""
+                op_cell = ""
+            if entry["side"] == DEBIT:
+                debit_cell = f'<span class="je-debit">{html.escape(entry["account"])}</span>'
+                debit_amt, credit_cell, credit_amt = yen(entry["amount"]), "", ""
+            else:
+                credit_cell = f'<span class="je-credit">{html.escape(entry["account"])}</span>'
+                credit_amt, debit_cell, debit_amt = yen(entry["amount"]), "", ""
+            rows += (
+                f"<tr><td>{date_cell}</td><td>{desc_cell}</td>"
+                f"<td>{debit_cell}</td><td class='num'>{debit_amt}</td>"
+                f"<td>{credit_cell}</td><td class='num'>{credit_amt}</td>"
+                f"<td class='no-print'>{op_cell}</td></tr>"
+            )
+            first = False
+    return rows
+
+
+def _ledger_account_html(account: dict[str, Any], *, hidden: bool) -> str:
+    """総勘定元帳の 1 科目分（前期繰越込みの記入＋相手勘定＋走り残高）。
+
+    hidden=True なら表示を畳む（選択された 1 科目だけを出すための初期状態）。
+    """
+    rows = ""
+    carry = account.get("carry_forward")
+    if carry is not None:  # 月で絞ったときの月初繰越
+        carry_side = "借" if carry >= 0 else "貸"
+        rows += (
+            "<tr><td>繰越</td><td>前月繰越</td><td></td>"
+            f"<td class='num'></td><td class='num'></td>"
+            f"<td class='num'>{carry_side} {yen(abs(carry))}</td><td class='no-print'></td></tr>"
+        )
+    for posting in account["rows"]:
+        debit = yen(posting["amount"]) if posting["side"] == DEBIT else ""
+        credit = yen(posting["amount"]) if posting["side"] == CREDIT else ""
+        running = posting["balance"]
+        side = "借" if running >= 0 else "貸"
+        op_cell = _edit_cell(posting.get("kind", ""), posting.get("source_type"), posting.get("deal_id"))
+        rows += (
+            f"<tr><td>{html.escape(str(posting['date']))}</td>"
+            f"<td>{html.escape(posting['description'])}</td>"
+            f"<td>{html.escape(posting.get('counter', ''))}</td>"
+            f"<td class='num'>{debit}</td><td class='num'>{credit}</td>"
+            f"<td class='num'>{side} {yen(abs(running))}</td>"
+            f"<td class='no-print'>{op_cell}</td></tr>"
+        )
+    final_side = "借" if account["balance"] >= 0 else "貸"
+    hidden_attr = " hidden" if hidden else ""
+    return f"""
+      <div class="ledger-account" data-ledger-account="{html.escape(account["account"], quote=True)}"{hidden_attr}>
+        <h3>{html.escape(account["account"])} <span class="label">（{html.escape(account["category"])}・残高 {final_side} {yen(abs(account["balance"]))}）</span></h3>
+        <table>
+          <thead><tr><th>日付</th><th>摘要</th><th>相手勘定</th><th class="num">借方</th><th class="num">貸方</th><th class="num">残高</th><th class="no-print">操作</th></tr></thead>
+          <tbody>{rows}</tbody>
+        </table>
+      </div>"""
+
+
+def render_statements(active_view: str = "statements", month: str = "") -> bytes:
+    """決算ページ。3つのビュー（決算書／仕訳帳／総勘定元帳）をタブで切り替える。印刷可。
+
+    active_view: 初期表示するビュー（ダッシュボードのボタンから ?view= で深いリンクできる）。
+    month: 総勘定元帳の月フィルタ（'YYYY-MM' か '決算'。空＝全期間）。
+    総勘定元帳は勘定科目セレクタで選んだ 1 科目の動き（相手勘定つき）を表示する。
+    """
+    if active_view not in {"statements", "journal", "ledger"}:
+        active_view = "statements"
+    with db_connection() as conn:
+        trial = calculate_trial_balance(conn)
+        income = calculate_income_statement(conn)
+        sheet = calculate_balance_sheet(conn)
+        beginning_inventory = opening_inventory_amount(conn)
+        current_purchases = current_period_purchases(conn)
+        closing_inv = closing_inventory_current(conn)
+        depreciation = depreciation_amount(conn)
+        suggested = suggested_depreciation(conn)
+        asset_cost = next(
+            (float(r["amount"]) for r in opening_balance_rows(conn) if r["account_item_name"] == DEPRECIABLE_ASSET),
+            0.0,
+        )
+        period = current_closing_period(conn)
+        closing_j = closing_journal(conn)
+        transactions = journal_transactions(conn)
+        periods = ledger_periods(conn)
+        if month and month not in periods:
+            month = ""  # 不正な月は全期間に戻す
+        ledger = general_ledger(conn, month)
+    ending_inventory = float(closing_inv["physical_amount"]) if closing_inv else 0.0
+
+    def view_hidden(name: str) -> str:
+        return "" if name == active_view else " hidden"
+
+    # --- 決算整理仕訳（押した結果としての仕訳。closing_journal が唯一の正） ---
+    closing_je_rows = ""
+    for txn in closing_j:
+        debit = next((e for e in txn["entries"] if e["side"] == DEBIT), None)
+        credit = next((e for e in txn["entries"] if e["side"] == CREDIT), None)
+        closing_je_rows += f"""
+        <tr>
+          <td>{html.escape(txn["description"])}</td>
+          <td class="je-debit">{html.escape(debit["account"]) if debit else ""}</td>
+          <td class="num">{yen(debit["amount"]) if debit else ""}</td>
+          <td class="je-credit">{html.escape(credit["account"]) if credit else ""}</td>
+          <td class="num">{yen(credit["amount"]) if credit else ""}</td>
+        </tr>"""
+
+    # --- 試算表（決算整理後・残高試算表） ---
+    tb_rows = "".join(
+        f"""
+        <tr>
+          <td>{html.escape(row["account"])}</td>
+          <td>{html.escape(row["category"])}</td>
+          <td class="num">{yen(row["debit"]) if row["debit"] else ""}</td>
+          <td class="num">{yen(row["credit"]) if row["credit"] else ""}</td>
+        </tr>"""
+        for row in trial["rows"]
+    )
+
+    # --- 貸借対照表（勘定式: 左=資産 / 右=負債・純資産） ---
+    left = sheet["assets"]
+    right = sheet["liabilities"] + sheet["equity"]
+    bs_rows = ""
+    for index in range(max(len(left), len(right))):
+        la = left[index] if index < len(left) else None
+        ra = right[index] if index < len(right) else None
+        bs_rows += f"""
+        <tr>
+          <td>{html.escape(la["account"]) if la else ""}</td>
+          <td class="num">{yen(la["amount"]) if la else ""}</td>
+          <td>{html.escape(ra["account"]) if ra else ""}</td>
+          <td class="num">{yen(ra["amount"]) if ra else ""}</td>
+        </tr>"""
+
+    # --- 損益計算書 ---
+    other_expense_rows = "".join(
+        f"""
+        <tr>
+          <td style="padding-left:24px;">{html.escape(item["account"])}</td>
+          <td class="num">{yen(item["amount"])}</td>
+        </tr>"""
+        for item in income["other_expenses"]
+    )
+
+    journal_rows = _journal_line_rows(transactions)
+    ledger_html = "".join(
+        _ledger_account_html(account, hidden=(index != 0)) for index, account in enumerate(ledger)
+    )
+    ledger_options = "".join(
+        f'<option value="{html.escape(account["account"], quote=True)}">'
+        f'{html.escape(account["account"])}（{html.escape(account["category"])}）</option>'
+        for account in ledger
+    )
+    month_options = "".join(
+        f'<option value="{html.escape(p, quote=True)}"{" selected" if p == month else ""}>'
+        f'{html.escape("決算整理" if p == "決算" else p)}</option>'
+        for p in periods
+    )
+    depreciation_hint = (
+        f"目安（定額法）: 取得原価 {yen(asset_cost)} ÷ 耐用年数 {DEPRECIATION_USEFUL_LIFE_YEARS}年 = {yen(suggested)}/年"
+        if asset_cost
+        else f"目安（定額法）: 期首に償却対象の{DEPRECIABLE_ASSET}がありません"
+    )
+
+    body = f"""
+      {_STATEMENTS_PRINT_CSS}
+      <div class="stmt-bar">
+        <div class="stmt-tabs no-print">
+          <button type="button" class="tab-btn" data-view-btn="statements">📄 決算書</button>
+          <button type="button" class="tab-btn" data-view-btn="journal">📒 仕訳帳</button>
+          <button type="button" class="tab-btn" data-view-btn="ledger">📚 総勘定元帳</button>
+        </div>
+        <div class="stmt-actions no-print">
+          <a href="/">取引一覧へ戻る</a>
+          <button type="button" class="print-btn" onclick="window.print()">🖨 印刷 / PDF保存</button>
+        </div>
+      </div>
+
+      <div data-view="statements"{view_hidden("statements")}>
+        <div class="toolbar"><h2>決算書（試算表・貸借対照表・損益計算書）</h2></div>
+        <p class="label" style="margin:0 0 16px;">
+          税込経理・三分法・単一期間。すべての取引を借方/貸方の仕訳に自動展開し、決算整理（三分法の
+          売上原価・減価償却）を加えて作成しています。対象期: {html.escape(period)}。
+        </p>
+
+        <section class="card no-print" id="closing-form">
+          <div class="toolbar"><h2>決算手続き（入力）</h2></div>
+          <form class="closing-form" method="post" action="/closing">
+            <input type="hidden" name="period" value="{html.escape(period, quote=True)}">
+            <label>期末商品棚卸高（実地）
+              <input class="no-spinner" inputmode="decimal" name="physical_amount" value="{ending_inventory:.0f}">
+            </label>
+            <label>減価償却費（当期）
+              <input class="no-spinner" inputmode="decimal" name="depreciation_amount" value="{depreciation:.0f}">
+            </label>
+            <p class="label full" style="margin:0;">{depreciation_hint}。Phase A は手入力です（帳簿=実地＝棚卸減耗0）。</p>
+            <button type="submit">決算整理を反映する</button>
+            <button type="button" disabled title="Phase B で在庫ダッシュボードの期末評価額を取り込みます">在庫DBから反映（Phase B）</button>
+          </form>
+        </section>
+
+        <section class="card">
+          <div class="toolbar"><h2>決算整理仕訳</h2></div>
+          <table>
+            <thead><tr><th>摘要</th><th>借方科目</th><th class="num">借方</th><th>貸方科目</th><th class="num">貸方</th></tr></thead>
+            <tbody>{closing_je_rows or '<tr><td colspan="5">決算整理はありません。</td></tr>'}</tbody>
+          </table>
+          <table style="margin-top:12px;">
+            <thead><tr><th colspan="2">売上原価の計算（三分法）</th></tr></thead>
+            <tbody>
+              <tr><td>期首商品棚卸高</td><td class="num">{yen(beginning_inventory)}</td></tr>
+              <tr><td>＋ 当期仕入高</td><td class="num">{yen(current_purchases)}</td></tr>
+              <tr><td>－ 期末商品棚卸高</td><td class="num">{yen(ending_inventory)}</td></tr>
+              <tr><th>＝ 売上原価</th><th class="num">{yen(income["cogs"])}</th></tr>
+            </tbody>
+          </table>
+        </section>
+
+        <section class="card">
+          <div class="toolbar"><h2>損益計算書（PL）</h2></div>
+          <table>
+            <tbody>
+              <tr><td>売上高</td><td class="num">{yen(income["sales"])}</td></tr>
+              <tr><td>売上原価</td><td class="num">{yen(income["cogs"])}</td></tr>
+              <tr><th>売上総利益（粗利）</th><th class="num">{yen(income["gross_profit"])}</th></tr>
+              <tr><td>販売費及び一般管理費</td><td class="num">{yen(income["other_total"])}</td></tr>
+              {other_expense_rows}
+              <tr><th>当期純利益</th><th class="num">{yen(income["net_income"])}</th></tr>
+            </tbody>
+          </table>
+        </section>
+
+        <section class="card">
+          <div class="toolbar">
+            <h2>貸借対照表（BS）</h2>
+            {_balance_badge(sheet["balanced"])}
+          </div>
+          <table>
+            <thead>
+              <tr><th>資産</th><th class="num">金額</th><th>負債・純資産</th><th class="num">金額</th></tr>
+            </thead>
+            <tbody>
+              {bs_rows}
+              <tr>
+                <th>資産合計</th><th class="num">{yen(sheet["asset_total"])}</th>
+                <th>負債・純資産合計</th><th class="num">{yen(sheet["liabilities_equity_total"])}</th>
+              </tr>
+            </tbody>
+          </table>
+          <p class="label" style="margin:10px 0 0;">当期純利益 {yen(sheet["net_income"])} を純資産に独立行で計上しています（PL の利益が BS に流れます）。減価償却累計額は備品のマイナス（評価勘定）として資産に表示します。</p>
+        </section>
+
+        <section class="card">
+          <div class="toolbar">
+            <h2>試算表（決算整理後・残高試算表）</h2>
+            {_balance_badge(trial["balanced"])}
+          </div>
+          <table>
+            <thead>
+              <tr><th>勘定科目</th><th>区分</th><th class="num">借方</th><th class="num">貸方</th></tr>
+            </thead>
+            <tbody>
+              {tb_rows or '<tr><td colspan="4">残高のある勘定科目がありません。</td></tr>'}
+              <tr>
+                <th>合計</th><th></th>
+                <th class="num">{yen(trial["debit_total"])}</th>
+                <th class="num">{yen(trial["credit_total"])}</th>
+              </tr>
+            </tbody>
+          </table>
+        </section>
+      </div>
+
+      <div data-view="journal"{view_hidden("journal")}>
+        <div class="toolbar"><h2>仕訳帳</h2><span class="label">開始記入＋期中取引＋決算整理を時系列で</span></div>
+        <section class="card">
+          <p class="label no-print" style="margin:0 0 10px;">各仕訳の「操作」から元の伝票を編集できます（手入力経費・決算整理。在庫連携の仕入/売上は在庫アプリが正のため編集不可）。</p>
+          <table>
+            <thead><tr><th>日付</th><th>摘要</th><th>借方科目</th><th class="num">借方</th><th>貸方科目</th><th class="num">貸方</th><th class="no-print">操作</th></tr></thead>
+            <tbody>{journal_rows or '<tr><td colspan="7">仕訳がありません。</td></tr>'}</tbody>
+          </table>
+        </section>
+      </div>
+
+      <div data-view="ledger"{view_hidden("ledger")}>
+        <div class="toolbar"><h2>総勘定元帳</h2><span class="label">月と勘定科目を選ぶと、その月の動き（相手勘定つき）が出ます</span></div>
+        <div class="ledger-pick no-print">
+          <label>月
+            <select id="ledger-month" onchange="location.href='/statements?view=ledger&amp;month='+encodeURIComponent(this.value)">
+              <option value="">全期間</option>
+              {month_options}
+            </select>
+          </label>
+          <label>勘定科目
+            <select id="ledger-account">{ledger_options}</select>
+          </label>
+          <span class="label">{("対象: " + ("決算整理" if month == "決算" else month) + "（月初に前月繰越を表示）") if month else "全期間（期首の前期繰越から表示）"}</span>
+        </div>
+        <section class="card">
+          {ledger_html or '<p class="label">この条件で記入のある勘定科目がありません。</p>'}
+        </section>
+      </div>
+
+      <script>window.__STMT_VIEW__ = "{active_view}";</script>
+      {_STATEMENTS_VIEW_JS}
+    """
+    return render_page("決算（試算表・BS・PL）", body)
+
+
 def render_detail(deal_id: int) -> bytes | None:
     with db_connection() as conn:
         deal = get_deal(conn, deal_id)
@@ -2718,6 +3747,21 @@ class PseudoFreeeHandler(BaseHTTPRequestHandler):
         try:
             if parsed.path in {"/", "/deals"}:
                 self.respond_html(render_index(deal_filters_from_query(parsed.query)))
+            elif parsed.path == "/statements":
+                query = parse_qs(parsed.query)
+                view = query.get("view", [""])[0]
+                month = query.get("month", [""])[0]
+                self.respond_html(render_statements(view, month))
+            elif parsed.path == "/api/statements":
+                with db_connection() as conn:
+                    self.respond_json(
+                        {
+                            "ok": True,
+                            "trial_balance": calculate_trial_balance(conn),
+                            "income_statement": calculate_income_statement(conn),
+                            "balance_sheet": calculate_balance_sheet(conn),
+                        }
+                    )
             elif parsed.path.startswith("/deals/") and parsed.path.endswith("/edit"):
                 deal_id = to_int(parsed.path[len("/deals/"):-len("/edit")], "deal_id")
                 body = render_edit_deal(deal_id)
@@ -2832,6 +3876,12 @@ class PseudoFreeeHandler(BaseHTTPRequestHandler):
                 with db_connection() as conn:
                     create_expense_master(conn, data)
                 self.redirect("/")
+            elif parsed.path == "/closing":
+                # 決算手続き（期末商品棚卸高・減価償却費）の保存→決算ページへ戻る。
+                data = self.read_form()
+                with db_connection() as conn:
+                    save_closing_procedure(conn, data)
+                self.redirect("/statements")
             elif parsed.path.startswith("/deals/") and parsed.path.endswith("/delete"):
                 deal_id = to_int(parsed.path[len("/deals/"):-len("/delete")], "deal_id")
                 with db_connection() as conn:
