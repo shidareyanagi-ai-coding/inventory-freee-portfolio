@@ -452,6 +452,46 @@ class InventoryAppTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 app.cancel_inventory_movement(conn, self.org_id, {"movement_id": movement["id"], "reason": "再取消"})
 
+    # --- 仕入の入庫基準（日付の一本化）と取消日の整合 ---
+
+    def test_freee_payload_uses_received_date_as_issue_date(self):
+        # 仕入は入庫基準: freee の issue_date は入庫日(received_date)。在庫元帳の日付とも一致する。
+        with app.get_conn() as conn:
+            product = self._first_product(conn)
+            result = app.create_purchase(conn, self.org_id, {
+                "product_id": product["id"], "partner_name": "テスト仕入先",
+                "invoice_no": "INV-DATE", "transaction_date": "2026-05-20",
+                "received_date": "2026-05-22", "quantity": 1, "unit_price": 1000,
+            })
+            payload = app.build_freee_payload(conn, self.org_id, "purchase", result["purchase_id"])
+            movement_date = conn.execute(
+                "SELECT movement_date FROM inventory_movements WHERE source_type = 'purchase' AND source_id = ?",
+                (result["purchase_id"],),
+            ).fetchone()["movement_date"]
+        self.assertEqual(payload["issue_date"], "2026-05-22")   # freee も入庫日
+        self.assertEqual(movement_date, "2026-05-22")            # 在庫元帳も入庫日＝一致
+
+    def test_cancel_uses_original_date_not_today(self):
+        # 取消行は元取引の日付で相殺する（today ではない）＝元と同じ月で相殺され月次が合う。
+        with app.get_conn() as conn:
+            product = self._first_product(conn)
+            result = app.create_purchase(conn, self.org_id, {
+                "product_id": product["id"], "partner_name": "テスト仕入先",
+                "invoice_no": "INV-CANCEL-DATE", "transaction_date": "2026-05-20",
+                "received_date": "2026-05-22", "quantity": 1, "unit_price": 1000,
+            })
+            original = conn.execute(
+                "SELECT * FROM inventory_movements WHERE source_type = 'purchase' AND source_id = ?",
+                (result["purchase_id"],),
+            ).fetchone()
+            app.cancel_inventory_movement(conn, self.org_id, {"movement_id": original["id"], "reason": "誤発注"})
+            correction_date = conn.execute(
+                "SELECT movement_date FROM inventory_movements WHERE movement_type = 'purchase_cancel' AND source_id = ?",
+                (original["id"],),
+            ).fetchone()["movement_date"]
+        self.assertEqual(correction_date, original["movement_date"])  # 元と同じ日付
+        self.assertEqual(correction_date, "2026-05-22")
+
     # --- Phase C: 送信済みの取消を疑似freee へ伝播（reverse-and-repost）---
 
     def _create_and_send_purchase(self, conn, invoice_no, deal_id=201):

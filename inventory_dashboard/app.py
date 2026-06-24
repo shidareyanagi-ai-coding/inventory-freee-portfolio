@@ -884,7 +884,9 @@ def build_freee_payload(conn: db.Connection, organization_id: int, source_type: 
         amount = round(row["quantity"] * row["unit_price"] * (1 + row["tax_rate"] / 100))
         return {
             "api_target": "freee_accounting_deal",
-            "issue_date": row["transaction_date"],
+            # 仕入は入庫基準で計上する＝計上日は入庫日(received_date)。在庫元帳の movement_date も
+            # received_date なので、これで疑似freee と在庫が同じ日付になる（仕入日/入庫日の二重化を解消）。
+            "issue_date": row["received_date"],
             "due_date": row["due_date"],
             "type": "expense",
             "partner_name": row["partner_name"],
@@ -1606,7 +1608,10 @@ def cancel_inventory_movement(conn: db.Connection, organization_id: int, data: d
             original["product_id"],
             movement_type,
             movement_id,
-            date.today().isoformat(),
+            # 取消は「元取引の日付」で相殺する（入力ミスの訂正＝なかったことにする）。
+            # today を使うと元と別の月に落ち、月次が合わなくなる＋疑似freee 側の取消仕訳
+            # （元仕訳の日付を再利用）とも食い違うため、元 movement_date に揃える。
+            original["movement_date"],
             reversal_delta,
             original["unit_price"],
             f"取消: {original['note']} / 理由: {reason}",

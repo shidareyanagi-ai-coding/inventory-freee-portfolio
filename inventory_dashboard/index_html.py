@@ -242,8 +242,7 @@ _INDEX_TEMPLATE = r"""
               <button type="button" onclick="addPartner('supplier', 'newSupplierName', 'purchaseForm')">追加</button>
             </div>
             <label>請求書番号</label><input name="invoice_no" required>
-            <label>仕入日</label><input type="date" name="transaction_date" required>
-            <label>入庫日</label><input type="date" name="received_date" required>
+            <label>仕入日（入庫日）</label><input type="date" name="transaction_date" required>
             <label>数量</label><input type="number" name="quantity" min="1" required>
             <label>単価</label><input type="number" name="unit_price" min="0" required>
             <label>税率</label><input type="number" name="tax_rate" value="10">
