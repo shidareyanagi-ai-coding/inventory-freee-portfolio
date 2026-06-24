@@ -392,6 +392,132 @@ class InventoryAppTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 app.cancel_inventory_movement(conn, self.org_id, {"movement_id": movement["id"], "reason": "再取消"})
 
+    # --- Phase C: 送信済みの取消を疑似freee へ伝播（reverse-and-repost）---
+
+    def _create_and_send_purchase(self, conn, invoice_no, deal_id=201):
+        """仕入を作り、疑似freee 送信済みにして (purchase_id, queue) を返す（HTTP はモック）。"""
+        result = app.create_purchase(conn, self.org_id, {
+            "product_id": self._first_product(conn)["id"],
+            "partner_name": "テスト仕入先",
+            "invoice_no": invoice_no,
+            "transaction_date": "2026-06-01",
+            "received_date": "2026-06-02",
+            "quantity": 3,
+            "unit_price": 1000,
+            "due_date": "2026-07-31",
+        })
+
+        def fake_urlopen(request, timeout):
+            return FakeResponse({"ok": True, "pseudo_freee_deal_id": deal_id, "duplicate": False})
+
+        queue = conn.execute(
+            "SELECT * FROM freee_sync_queue WHERE source_type = 'purchase' AND source_id = ?",
+            (result["purchase_id"],),
+        ).fetchone()
+        with patch("app.urllib.request.urlopen", fake_urlopen):
+            app.send_queue_to_pseudo_freee(conn, self.org_id, {"id": queue["id"]})
+        return result["purchase_id"], queue
+
+    def test_cancel_payload_is_sign_reversed(self):
+        # 取消仕訳の payload は元仕訳の数量・金額をマイナスにし、memo に「取消」が入る。
+        with app.get_conn() as conn:
+            purchase_id, _ = self._create_and_send_purchase(conn, "INV-P-NEG")
+            base = app.build_freee_payload(conn, self.org_id, "purchase", purchase_id)
+            cancel = app.build_freee_payload(conn, self.org_id, "purchase_cancel", purchase_id)
+
+        self.assertGreater(base["details"][0]["amount"], 0)
+        self.assertEqual(cancel["details"][0]["amount"], -base["details"][0]["amount"])
+        self.assertEqual(cancel["details"][0]["quantity"], -base["details"][0]["quantity"])
+        self.assertIn("取消", cancel["memo"])
+        # 元の due_date / type は保持される（疑似freee 側で同じ相手科目に展開され相殺できる）。
+        self.assertEqual(cancel["due_date"], base["due_date"])
+        self.assertEqual(cancel["type"], base["type"])
+
+    def test_cancel_sent_purchase_enqueues_reversal(self):
+        # 送信済み(sent)の仕入を取り消すと、purchase_cancel の取消仕訳がキューに積まれる。
+        with app.get_conn() as conn:
+            purchase_id, sent_queue = self._create_and_send_purchase(conn, "INV-P-SENT-CANCEL")
+            movement = conn.execute(
+                "SELECT * FROM inventory_movements WHERE source_type = 'purchase' AND source_id = ?",
+                (purchase_id,),
+            ).fetchone()
+            result = app.cancel_inventory_movement(conn, self.org_id, {"movement_id": movement["id"], "reason": "誤発注"})
+
+            cancel_queue = conn.execute(
+                "SELECT * FROM freee_sync_queue WHERE source_type = 'purchase_cancel' AND source_id = ?",
+                (purchase_id,),
+            ).fetchone()
+            sent_after = conn.execute(
+                "SELECT * FROM freee_sync_queue WHERE id = ?", (sent_queue["id"],)
+            ).fetchone()
+
+        self.assertTrue(result["cancel_queued"])
+        # 取消仕訳が pending で積まれる（送信ボタンで反映する運用）。
+        self.assertIsNotNone(cancel_queue)
+        self.assertEqual(cancel_queue["status"], "pending")
+        self.assertEqual(cancel_queue["direction"], "expense")
+        self.assertLess(json.loads(cancel_queue["payload_json"])["details"][0]["amount"], 0)
+        # 元の送信済み行はそのまま残る（監査証跡）。
+        self.assertEqual(sent_after["status"], "sent")
+
+    def test_cancel_unsent_purchase_does_not_enqueue_reversal(self):
+        # 未送信(pending)の仕入を取り消すと、従来どおり cancelled にするだけ（取消仕訳は積まない）。
+        with app.get_conn() as conn:
+            result = app.create_purchase(conn, self.org_id, {
+                "product_id": self._first_product(conn)["id"],
+                "partner_name": "テスト仕入先",
+                "invoice_no": "INV-P-UNSENT-CANCEL",
+                "transaction_date": "2026-06-01",
+                "received_date": "2026-06-02",
+                "quantity": 2,
+                "unit_price": 1000,
+            })
+            movement = conn.execute(
+                "SELECT * FROM inventory_movements WHERE source_type = 'purchase' AND source_id = ?",
+                (result["purchase_id"],),
+            ).fetchone()
+            cancel_result = app.cancel_inventory_movement(conn, self.org_id, {"movement_id": movement["id"], "reason": "誤入力"})
+            cancel_queue = conn.execute(
+                "SELECT * FROM freee_sync_queue WHERE source_type = 'purchase_cancel' AND source_id = ?",
+                (result["purchase_id"],),
+            ).fetchone()
+
+        self.assertFalse(cancel_result["cancel_queued"])
+        self.assertIsNone(cancel_queue)
+
+    def test_send_cancel_queue_maps_to_base_source_type(self):
+        # 取消仕訳(purchase_cancel)を送信するとき、疑似freee へは base 型(purchase)で POST する。
+        with app.get_conn() as conn:
+            purchase_id, _ = self._create_and_send_purchase(conn, "INV-P-CANCEL-SEND")
+            movement = conn.execute(
+                "SELECT * FROM inventory_movements WHERE source_type = 'purchase' AND source_id = ?",
+                (purchase_id,),
+            ).fetchone()
+            app.cancel_inventory_movement(conn, self.org_id, {"movement_id": movement["id"], "reason": "誤発注"})
+            cancel_queue = conn.execute(
+                "SELECT * FROM freee_sync_queue WHERE source_type = 'purchase_cancel' AND source_id = ?",
+                (purchase_id,),
+            ).fetchone()
+
+            captured = {}
+
+            def fake_urlopen(request, timeout):
+                captured["body"] = json.loads(request.data.decode("utf-8"))
+                return FakeResponse({"ok": True, "pseudo_freee_deal_id": 999, "duplicate": False})
+
+            with patch("app.urllib.request.urlopen", fake_urlopen):
+                app.send_queue_to_pseudo_freee(conn, self.org_id, {"id": cancel_queue["id"]})
+            updated = conn.execute(
+                "SELECT * FROM freee_sync_queue WHERE id = ?", (cancel_queue["id"],)
+            ).fetchone()
+
+        # 疑似freee の source_type CHECK は purchase/sale/manual のみ → base 型へ戻して送る。
+        self.assertEqual(captured["body"]["source_type"], "purchase")
+        self.assertEqual(captured["body"]["queue_id"], cancel_queue["id"])
+        # payload は符号反転済み（マイナス）で渡る。
+        self.assertLess(captured["body"]["payload"]["details"][0]["amount"], 0)
+        self.assertEqual(updated["status"], "sent")
+
     def test_recommended_order_is_exact_shortage_from_required_level(self):
         product = {
             "stock_quantity": 38,

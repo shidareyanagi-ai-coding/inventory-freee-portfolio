@@ -160,7 +160,23 @@
 
 ## Phase C — 在庫⇄疑似freee の取消・修正の同期（reverse-and-repost）
 
-> **状態: 設計承認済（2026-06-23・ユーザ選択=C案）。実装は Phase A を main マージ後に着手する（ユーザ指示）。Phase A/B とは独立した別変更。**
+> **状態: 実装完了（2026-06-23）。実装ブランチ `feature/phase-c-cancel-sync`。Phase A/B とは独立した別変更。**
+>
+> **Phase C 実装メモ（2026-06-23）**
+> - **在庫 `inventory_dashboard/app.py`**:
+>   - `_negate_freee_payload(payload)`: 元 payload の details の `quantity`/`amount` をマイナスにし `memo` に「取消」を付与（`build_freee_payload` が毎回新規 dict を返すため破壊的編集で安全）。
+>   - `build_freee_payload`: 先頭で `*_cancel` を分岐＝base 型(`purchase`/`sale`)の payload を作って `_negate_freee_payload`。これで **送信前レビュー(`/api/freee-preview`)も取消仕訳をそのまま表示**できる。
+>   - `enqueue_freee_cancel(conn, org, source_type, source_id)`: `source_type='purchase_cancel'/'sale_cancel'`・`source_id=元のid`・`status='pending'` で `freee_sync_queue` に INSERT（`ON CONFLICT DO UPDATE` 冪等）。在庫キューの `UNIQUE(source_type, source_id)` を `*_cancel` 型で衝突回避。
+>   - `cancel_inventory_movement`: 元伝票の queue が **`sent` のとき `enqueue_freee_cancel` を呼ぶ**（戻り値に `cancel_queued: True`）。未送信(pending/failed/retry)は従来どおり `cancelled` にするだけ。元の `sent` 行はそのまま残す＝**元仕訳＋取消仕訳の両方が監査証跡**。
+>   - `send_queue_to_pseudo_freee`: `source_type` が `*_cancel` のとき **base 型へ戻して POST**（疑似freee の `source_type CHECK` と整合）。`queue_id` が別なので疑似freee 側は新規 deal として保存＝マイナス金額で元仕訳を相殺。
+> - **在庫 UI `index_html.py`**: 送信待ちキューで `*_cancel` を「🟥取消仕訳 仕入取消/売上取消 #id」と明示（`queueSourceLabel`）。取消実行時、送信済みなら「取消仕訳を送信待ちキューに積みました（送信で反映）」と案内（`cancelMovement` が `result.cancel_queued` を見る）。
+> - **疑似freee `app.py`**: 実質無改修。`render_index` の deal 行で **`amount < 0` に「取消」バッジ**だけ追加（見える化）。集計はすべて金額の足し算なのでマイナス deal が自動相殺（仕訳・KPI・BS・PL・残高）。
+> - **テスト**: 在庫 `test_app.py` に 4 件（取消payloadの符号反転・送信済み取消→取消仕訳キュー投入・未送信取消は投入しない・`*_cancel`→base マップ送信）。疑似freee `test_app.py` に 1 件（マイナス deal が PL売上/売掛金を相殺・元+取消の2行が残る）。**在庫 38 passed / 疑似freee 59 passed**（各ディレクトリで実行＝ルート一括は dual `app.py` の import 衝突で従来から不可）。
+> - **クロスアプリ検証済**: 在庫が生成する取消リクエスト body を疑似freee の `create_deal` に直接投入し、`source_type='purchase'` で受理＝新規行・2 deal 保持・`買掛金` が期首水準へ復帰（元仕入を相殺）を確認。
+> - **繰越/残**: 🧑 ライブ(Render)で SSO 跨ぎの一気通貫目視（仕入登録→送信→取消→取消仕訳送信→疑似freee の試算表が一致）、main マージ。「修正＝取消＋新規」運用（新規入力は既存 push で足りる）。
+
+### 設計（参考・承認時の記録）
+> **設計承認: 2026-06-23・ユーザ選択=C案。**
 
 ### 背景（コード確認済の前提）
 - 在庫元帳は**追記型(append-only)**。仕入/売上の in-place 編集は無く、訂正は `cancel_inventory_movement`(inventory/app.py:1452) が**逆仕訳の訂正行(correction)＋`inventory_corrections`** を足す形。
@@ -182,3 +198,27 @@
 - **疑似freee**: 実質無改修。任意で「取消」バッジ（`amount < 0` の deal の見栄え）だけ。
 - **テスト**: 在庫＝`enqueue_freee_cancel` のpayload符号反転・`cancel_inventory_movement` が sent のとき取消をキュー投入・`*_cancel`→base マップ（HTTP はモック/分離）。疑似freee＝マイナス金額 deal が KPI/BS/PL を相殺すること。
 - **キー衝突注意**: 取消は必ず `*_cancel` 型で積む（`source_id` に correction movement id を使うと purchase.id と数値衝突しうるため、`source_type` を分けるのが安全）。
+
+---
+
+## Phase D — 在庫⇄会計の整合性強化（API連携の完成）
+
+> **状態: 方向性のみ承認（2026-06-24・ユーザ選択=案①）。実装は Phase C を main マージ後に新フェーズとして着手。** 目的は「実務で使える在庫＋会計ソフト」として、**在庫の全取引を会計側が漏れなく忠実に映し、両者が常に一致する**こと。
+
+### 背景（2026-06-24 のユーザ問い合わせで顕在化）
+- 在庫(`inventory.db`)と疑似freee(`pseudo_freee.db`)は**別データベース**で、同期するのは「freee送信」した取引だけ。全件ミラーではない。
+- 現状の乖離の正体は**バグではなく**「①送信が手動ボタン任せ＝送り忘れ ②取消が伝播していなかった（→Phase C で解消） ③一致を証明する突合が無い ④手動テストの古いデータ滞留」。
+- **CSV一括取込の二重計上リスク（Q1）**: `api_import_sales_history`(app.py:2045-2063) は CSV 1 行ごとに `sales`＋`inventory_movements`(`movement_type='sale'`・在庫を減らす) の**両方**に書き、予測(`forecasting/data.py:24` `FROM sales`)もこの sales を読む。つまり **CSV は「予測用シミュレーション」ではなく実在庫元帳そのもの**。A-9 は「クリーンスタート（全消去）→CSV で実運用データ投入」の**置換運用**前提なので、その流れなら二重計上しないが、**既存の実取引にCSVを足すと二重計上**する。区別印は `partner_name='CSV取込'`/`note='CSV取込'`/`external_accounting_status='imported'` のみ。
+
+### 設計判断（ユーザ承認＝案①）
+- **2DB＋API連携を維持して強化する**（案②=単一DB統合は採らない）。理由: freee は本来「外部の会計SaaS」で、在庫/EC/POS を **API連携**で繋ぐのが実務そのもの＝本ポートフォリオの主題（freee連携）を最も活かせる。既存 `freee_sync_queue`（`UNIQUE(source_type, source_id)` で冪等）は**教科書的な Outbox パターン**で、それを「自動送信＋取消(Phase C)＋突合」で完成させる王道ストーリー。
+
+### 想定スコープ（着手時に詳細化）
+1. **自動・確実な送信**: 仕入/売上の登録時に自動で push（or 既存キューに「未送信を一括送信」＋リトライ）。送り忘れで乖離しない。
+2. **取消の伝播**: Phase C で実装済み（reverse-and-repost）。
+3. **期末突合/棚卸連携**: Phase B（在庫→freee 期末棚卸API連携）。
+4. **突合（照合）ビュー**: 在庫側の集計（売上合計・仕入合計・期末在庫）と疑似freee 側（売上高・仕入高・商品）が一致することを画面で証明（不一致なら差分を表示）。
+5. **CSV シミュレーション/実取引台帳の分離（Q1対応）**: 「予測用の需要履歴」と「記帳する実取引」を概念分離。案: (a) CSV は需要履歴専用テーブルへ入れ在庫元帳/会計には流さない、or (b) 実運用データとして扱うなら**置換運用を強制/明示**し会計送信対象外を維持。どちらにするかは着手時にユーザと確定。
+
+### 工数の目安
+中程度（既存の queue/Outbox を延長）。案② 統合は書き直しに近く大。

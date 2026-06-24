@@ -2475,6 +2475,9 @@ def render_index(filters: dict[str, str] | None = None) -> bytes:
     rows = ""
     for deal in deals:
         badge_class = "income" if deal["deal_type"] == "income" else "expense"
+        # Phase C: 在庫側の取消で流れてくる「取消仕訳」はマイナス金額の deal。見分けが付くよう
+        # 取消バッジを出す（集計は金額の足し算なので元仕訳を自動で相殺する）。
+        cancel_badge = '<span class="badge expense">取消</span> ' if float(deal["amount"]) < 0 else ""
         if deal["source_type"] == "manual_expense":
             source_label = "手入力"
             queue_label = ""
@@ -2496,7 +2499,7 @@ def render_index(filters: dict[str, str] | None = None) -> bytes:
         <tr>
           <td><a href="/deals/{deal["id"]}">#{deal["id"]}</a></td>
           <td>{html.escape(deal["issue_date"])}</td>
-          <td><span class="badge {badge_class}">{deal_type_label(deal["deal_type"])}</span></td>
+          <td>{cancel_badge}<span class="badge {badge_class}">{deal_type_label(deal["deal_type"])}</span></td>
           <td>{html.escape(deal["partner_name"])}</td>
           <td>{html.escape(deal["account_item_name"])}</td>
           <td class="num">{yen(deal["amount"])}</td>

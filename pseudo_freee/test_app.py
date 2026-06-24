@@ -805,6 +805,63 @@ class PseudoFreeeBookkeepingTest(unittest.TestCase):
         self.assertAlmostEqual(equity_accounts["当期純利益"], income["net_income"])
         self.assertAlmostEqual(sheet["asset_total"], sheet["liabilities_equity_total"])
 
+    def test_cancel_deal_offsets_sale(self) -> None:
+        # Phase C: マイナス金額の取消 deal を 1 本入れるだけで、KPI・PL・残高が元仕訳を相殺する。
+        with app.db_connection() as conn:
+            app.create_deal(
+                conn,
+                {
+                    "queue_id": 10, "source_type": "sale", "source_id": 7,
+                    "payload": {
+                        "type": "income", "issue_date": "2026-03-10", "due_date": "2026-04-30",
+                        "partner_name": "青山ECストア",
+                        "details": [{"amount": 300000, "account_item_name": "売上高", "quantity": 1, "unit_price": 300000}],
+                    },
+                },
+            )
+            before_income = app.calculate_income_statement(conn)
+            before_balances = app.account_balances(conn)
+
+            # 取消仕訳: 元と同じ source_type/source_id/due_date だが queue_id は別、金額はマイナス。
+            app.create_deal(
+                conn,
+                {
+                    "queue_id": 11, "source_type": "sale", "source_id": 7,
+                    "payload": {
+                        "type": "income", "issue_date": "2026-03-10", "due_date": "2026-04-30",
+                        "partner_name": "青山ECストア", "memo": "取消: ORD-7",
+                        "details": [{"amount": -300000, "account_item_name": "売上高", "quantity": -1, "unit_price": 300000}],
+                    },
+                },
+            )
+            after_income = app.calculate_income_statement(conn)
+            after_balances = app.account_balances(conn)
+            deals = app.list_deals(conn)
+
+        # 元仕訳＋取消仕訳の両方が残る（監査証跡）。queue_id 違いで重複保存される。
+        self.assertEqual(len(deals), 2)
+        # 売上高・売掛金が、取消で元の水準（取引なし＝0）まで戻る。
+        self.assertAlmostEqual(after_income["sales"], before_income["sales"] - 300000)
+        self.assertAlmostEqual(after_income["sales"], 0.0)
+        self.assertAlmostEqual(after_balances.get("売掛金", 0.0), before_balances.get("売掛金", 0.0) - 300000)
+
+    def test_render_index_shows_cancel_badge_for_negative_deal(self) -> None:
+        # Phase C: マイナス金額の取消 deal には「取消」バッジが付く（見える化）。
+        with app.db_connection() as conn:
+            app.create_deal(
+                conn,
+                {
+                    "queue_id": 9, "source_type": "purchase", "source_id": 3,
+                    "payload": {
+                        "type": "expense", "issue_date": "2026-06-12", "due_date": "2026-07-31",
+                        "partner_name": "東京サプライ", "memo": "取消: P-1",
+                        "details": [{"amount": -13475, "account_item_name": "仕入高", "quantity": -25, "unit_price": 539}],
+                    },
+                },
+            )
+        html = app.render_index().decode("utf-8")
+        self.assertIn('<span class="badge expense">取消</span>', html)
+
     def test_cogs_three_split(self) -> None:
         # 売上原価 = 期首商品 + 当期仕入 − 期末商品（三分法）。
         self._add_sample_deals()

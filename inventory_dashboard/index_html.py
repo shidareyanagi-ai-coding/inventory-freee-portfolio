@@ -678,11 +678,20 @@ _INDEX_TEMPLATE = r"""
       document.getElementById("queue").innerHTML = table(["ID", "元データ", "区分", "状態", "操作"],
         rows.map(q => [
           q.id,
-          `${q.source_type} #${q.source_id}`,
+          queueSourceLabel(q),
           q.direction,
           q.sync_error_message ? `${q.status}<br><span class="error">${q.sync_error_message}</span>` : q.status,
           queueActions(q)
         ]));
+    }
+
+    function queueSourceLabel(q) {
+      // Phase C: purchase_cancel / sale_cancel は在庫取消の「取消仕訳」（マイナス deal）。
+      const cancelMap = { purchase_cancel: "仕入取消", sale_cancel: "売上取消" };
+      if (cancelMap[q.source_type]) {
+        return `<span class="status danger">取消仕訳</span> ${cancelMap[q.source_type]} #${q.source_id}`;
+      }
+      return `${q.source_type} #${q.source_id}`;
     }
 
     function queueActions(q) {
@@ -771,12 +780,14 @@ _INDEX_TEMPLATE = r"""
     async function cancelMovement(movementId) {
       const reason = prompt("取消理由を入力してください", "入力ミスのため取消");
       if (!reason) return;
-      await api("/api/inventory-movements/cancel", {
+      const result = await api("/api/inventory-movements/cancel", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ movement_id: movementId, reason })
       });
-      document.getElementById("message").textContent = "元帳に取消行を追加しました";
+      document.getElementById("message").textContent = result.cancel_queued
+        ? "元帳に取消行を追加しました。疑似freeeへ送信済みのため、取消仕訳を送信待ちキューに積みました（「疑似freeeへ送信」で反映してください）。"
+        : "元帳に取消行を追加しました";
       await loadAll();
     }
 

@@ -751,7 +751,49 @@ def enqueue_freee_payload(conn: db.Connection, organization_id: int, source_type
     )
 
 
+def enqueue_freee_cancel(conn: db.Connection, organization_id: int, source_type: str, source_id: int) -> None:
+    """送信済みの仕入/売上を在庫で取り消したとき、疑似freee に流す「取消仕訳」をキューに積む（Phase C）。
+
+    取消仕訳は元仕訳の符号反転（マイナス deal）。`source_type` を `purchase_cancel`/`sale_cancel`
+    に分けて積むので、元仕訳の queue 行（UNIQUE(source_type, source_id)）と衝突せず、
+    元仕訳＋取消仕訳の両方が監査証跡として残る。送信は既存と同じく「送信」ボタンで明示操作。
+    """
+    cancel_type = f"{source_type}_cancel"
+    payload = build_freee_payload(conn, organization_id, cancel_type, source_id)
+    direction = "expense" if source_type == "purchase" else "income"
+    conn.execute(
+        """
+        INSERT INTO freee_sync_queue (organization_id, source_type, source_id, direction, status, payload_json)
+        VALUES (?, ?, ?, ?, 'pending', ?)
+        ON CONFLICT(source_type, source_id) DO UPDATE SET
+            payload_json = excluded.payload_json,
+            updated_at = CURRENT_TIMESTAMP
+        """,
+        (organization_id, cancel_type, source_id, direction, json.dumps(payload, ensure_ascii=False)),
+    )
+
+
+def _negate_freee_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """元仕訳の payload を符号反転した「取消仕訳」payload にする（Phase C・reverse-and-repost）。
+
+    `build_freee_payload` が毎回 dict/list リテラルを新規に作って返すため、その戻り値を
+    破壊的に書き換えてよい（元データを共有しない）。details の数量・金額をマイナスにし、
+    memo に「取消」を付ける。疑似freee 側の集計はすべて金額ベースの足し算なので、この
+    マイナス deal を 1 本保存するだけで 仕訳・KPI・BS・PL・残高が自動で相殺される。
+    """
+    payload["memo"] = f"取消: {payload.get('invoice_no', '') or ''}".strip()
+    for detail in payload.get("details", []):
+        detail["quantity"] = -detail["quantity"]
+        detail["amount"] = -detail["amount"]
+    return payload
+
+
 def build_freee_payload(conn: db.Connection, organization_id: int, source_type: str, source_id: int) -> dict[str, Any]:
+    # Phase C: purchase_cancel / sale_cancel は元（purchase / sale）の payload を符号反転した取消仕訳。
+    # こうしておくと送信前レビュー（/api/freee-preview）も取消仕訳をそのまま表示できる。
+    if source_type.endswith("_cancel"):
+        base_type = source_type[: -len("_cancel")]
+        return _negate_freee_payload(build_freee_payload(conn, organization_id, base_type, source_id))
     if source_type == "purchase":
         row = conn.execute(
             """
@@ -1502,20 +1544,32 @@ def cancel_inventory_movement(conn: db.Connection, organization_id: int, data: d
         """,
         (organization_id, movement_id, correction_movement_id, reason),
     )
-    # 取消した仕訳は freee 送信待ちに残してはいけない。'cancelled' にして送信待ちから外す
-    # （'failed' だと「再送」対象として残ってしまうため）。送信済み(sent)は freee 側に
-    # 既に登録済みで取り消せないので触らない（取消は元帳の訂正行で記録される）。
-    conn.execute(
-        """
-        UPDATE freee_sync_queue
-        SET status = 'cancelled',
-            sync_error_message = ?,
-            updated_at = CURRENT_TIMESTAMP
-        WHERE organization_id = ? AND source_type = ? AND source_id = ? AND status != 'sent'
-        """,
-        (f"在庫元帳で取消済み: {reason}", organization_id, original["source_type"], original["source_id"]),
-    )
-    return {"ok": True, "correction_movement_id": correction_movement_id}
+    # 元仕訳の freee 送信状況で分岐する（Phase C・reverse-and-repost）。
+    queue_row = conn.execute(
+        "SELECT status FROM freee_sync_queue WHERE organization_id = ? AND source_type = ? AND source_id = ?",
+        (organization_id, original["source_type"], original["source_id"]),
+    ).fetchone()
+    cancel_queued = False
+    if queue_row and queue_row["status"] == "sent":
+        # 既に疑似freee へ送信済み → freee 側に取り消し API は無いので、元仕訳の符号反転（取消仕訳）を
+        # キューに積む。送信ボタンで反映すると、マイナス deal が元仕訳を相殺し帳簿が一致する。
+        # 元仕訳の sent 行はそのまま残し、両方を監査証跡として保持する。
+        enqueue_freee_cancel(conn, organization_id, original["source_type"], original["source_id"])
+        cancel_queued = True
+    else:
+        # 未送信（pending/failed/retry）→ まだ freee に渡っていないので、送信待ちから外すだけでよい。
+        # 'cancelled' にする（'failed' だと「再送」対象として残ってしまうため）。
+        conn.execute(
+            """
+            UPDATE freee_sync_queue
+            SET status = 'cancelled',
+                sync_error_message = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE organization_id = ? AND source_type = ? AND source_id = ? AND status != 'sent'
+            """,
+            (f"在庫元帳で取消済み: {reason}", organization_id, original["source_type"], original["source_id"]),
+        )
+    return {"ok": True, "correction_movement_id": correction_movement_id, "cancel_queued": cancel_queued}
 
 
 def list_queue(conn: db.Connection, organization_id: int) -> list[dict[str, Any]]:
@@ -1579,10 +1633,16 @@ def send_queue_to_pseudo_freee(conn: db.Connection, organization_id: int, data: 
         raise ValueError("取消済みの仕訳は freee へ送信できません")
 
     payload = json.loads(queue["payload_json"])
+    # Phase C: 取消仕訳は purchase_cancel/sale_cancel で積むが、疑似freee の source_type CHECK は
+    # purchase/sale/manual_expense のみ。base 型へ戻して POST する（payload は既に符号反転済み）。
+    # queue_id が別行なので疑似freee 側は新規 deal として保存され、マイナス金額で元仕訳を相殺する。
+    api_source_type = queue["source_type"]
+    if api_source_type.endswith("_cancel"):
+        api_source_type = api_source_type[: -len("_cancel")]
     request_body = json.dumps(
         {
             "queue_id": queue["id"],
-            "source_type": queue["source_type"],
+            "source_type": api_source_type,
             "source_id": queue["source_id"],
             "payload": payload,
         },
