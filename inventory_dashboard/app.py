@@ -608,6 +608,81 @@ def create_business_partner(conn: db.Connection, organization_id: int, data: dic
     return {"ok": True, "partner_type": partner_type, "partner_name": partner_name}
 
 
+def update_business_partner(conn: db.Connection, organization_id: int, data: dict[str, Any]) -> dict[str, Any]:
+    """取引先マスタの名前を修正する（誤登録の訂正）。
+
+    マスタを改名するだけだと `sync_partner_master` が過去取引の旧名から旧マスタを復活させて
+    しまうため、**在庫アプリ内の過去取引（purchases/sales/products）の表示名も一緒に揃える**。
+    既に疑似freee へ送信済みの仕訳は別アプリ側にあるため遡及しない（取引先マスタ連携は Phase D）。
+    """
+    partner_type = data.get("partner_type", "")
+    if partner_type not in {"supplier", "customer"}:
+        raise ValueError("invalid partner_type")
+    old_name = required_text(data.get("old_name"), "old_name")
+    new_name = required_text(data.get("new_name"), "new_name")
+    if old_name == new_name:
+        return {"ok": True, "partner_type": partner_type, "old_name": old_name, "new_name": new_name}
+    target = conn.execute(
+        "SELECT id FROM business_partners WHERE organization_id = ? AND partner_type = ? AND partner_name = ?",
+        (organization_id, partner_type, old_name),
+    ).fetchone()
+    if not target:
+        # 別テナント/不存在は 404（存在の有無を漏らさない）。
+        raise NotFoundError("partner not found")
+    duplicate = conn.execute(
+        "SELECT id FROM business_partners WHERE organization_id = ? AND partner_type = ? AND partner_name = ?",
+        (organization_id, partner_type, new_name),
+    ).fetchone()
+    if duplicate:
+        raise ValueError("同名の取引先が既に存在します。重複を解消したい場合は、誤った方を「削除」してください。")
+    conn.execute(
+        "UPDATE business_partners SET partner_name = ? WHERE organization_id = ? AND partner_type = ? AND partner_name = ?",
+        (new_name, organization_id, partner_type, old_name),
+    )
+    if partner_type == "supplier":
+        conn.execute("UPDATE purchases SET partner_name = ? WHERE organization_id = ? AND partner_name = ?", (new_name, organization_id, old_name))
+        conn.execute("UPDATE products SET supplier_name = ? WHERE organization_id = ? AND supplier_name = ?", (new_name, organization_id, old_name))
+    else:
+        conn.execute("UPDATE sales SET partner_name = ? WHERE organization_id = ? AND partner_name = ?", (new_name, organization_id, old_name))
+    return {"ok": True, "partner_type": partner_type, "old_name": old_name, "new_name": new_name}
+
+
+def delete_business_partner(conn: db.Connection, organization_id: int, data: dict[str, Any]) -> dict[str, Any]:
+    """取引先マスタから削除する（候補リストから外す）。
+
+    取引（仕入/売上）がある取引先は履歴上の実在取引先であり、削除しても `sync_partner_master`
+    で復活する。混乱を避けるため**取引がある取引先は削除不可**（直す場合は編集を使う）。
+    取引の無い手動追加の誤登録だけを削除できる。
+    """
+    partner_type = data.get("partner_type", "")
+    if partner_type not in {"supplier", "customer"}:
+        raise ValueError("invalid partner_type")
+    name = required_text(data.get("partner_name"), "partner_name")
+    target = conn.execute(
+        "SELECT id FROM business_partners WHERE organization_id = ? AND partner_type = ? AND partner_name = ?",
+        (organization_id, partner_type, name),
+    ).fetchone()
+    if not target:
+        raise NotFoundError("partner not found")
+    if partner_type == "supplier":
+        used = conn.execute(
+            "SELECT 1 FROM purchases WHERE organization_id = ? AND partner_name = ? LIMIT 1", (organization_id, name)
+        ).fetchone() or conn.execute(
+            "SELECT 1 FROM products WHERE organization_id = ? AND supplier_name = ? LIMIT 1", (organization_id, name)
+        ).fetchone()
+    else:
+        used = conn.execute(
+            "SELECT 1 FROM sales WHERE organization_id = ? AND partner_name = ? LIMIT 1", (organization_id, name)
+        ).fetchone()
+    if used:
+        raise ValueError("この取引先には取引（仕入/売上）があるため削除できません。名前を直す場合は「編集」を使ってください。")
+    conn.execute(
+        "DELETE FROM business_partners WHERE organization_id = ? AND partner_type = ? AND partner_name = ?",
+        (organization_id, partner_type, name),
+    )
+    return {"ok": True, "partner_type": partner_type, "partner_name": name}
+
+
 def stock_status(product: dict[str, Any]) -> str:
     stock = int(product["stock_quantity"])
     required_stock_level = int(product["reorder_point"]) + int(product["safety_stock"])
@@ -2174,6 +2249,22 @@ def api_create_business_partner(data: dict[str, Any] = Depends(parse_json_body),
     with get_conn() as conn:
         result = create_business_partner(conn, identity.organization_id, data)
         record_audit(conn, identity.organization_id, identity.user_id, "business_partner.create", "business_partner", data.get("partner_name", ""))
+        return result
+
+
+@app.post("/api/business-partners/update", status_code=201)
+def api_update_business_partner(data: dict[str, Any] = Depends(parse_json_body), identity: Identity = WRITER) -> dict[str, Any]:
+    with get_conn() as conn:
+        result = update_business_partner(conn, identity.organization_id, data)
+        record_audit(conn, identity.organization_id, identity.user_id, "business_partner.update", "business_partner", data.get("new_name", ""), {"old_name": data.get("old_name")})
+        return result
+
+
+@app.post("/api/business-partners/delete", status_code=201)
+def api_delete_business_partner(data: dict[str, Any] = Depends(parse_json_body), identity: Identity = WRITER) -> dict[str, Any]:
+    with get_conn() as conn:
+        result = delete_business_partner(conn, identity.organization_id, data)
+        record_audit(conn, identity.organization_id, identity.user_id, "business_partner.delete", "business_partner", data.get("partner_name", ""))
         return result
 
 

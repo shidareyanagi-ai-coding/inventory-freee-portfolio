@@ -311,6 +311,66 @@ class InventoryAppTest(unittest.TestCase):
 
         self.assertIn("テスト販売先", partners["customers"])
 
+    # --- 取引先マスタの編集・削除（誤登録の訂正）---
+
+    def test_update_business_partner_renames_master_and_past_transactions(self):
+        with app.get_conn() as conn:
+            product = self._first_product(conn)
+            app.create_purchase(conn, self.org_id, {
+                "product_id": product["id"], "partner_name": "テスト仕入先A",
+                "invoice_no": "INV-RENAME", "transaction_date": "2026-06-01",
+                "received_date": "2026-06-02", "quantity": 1, "unit_price": 1000,
+            })
+            app.update_business_partner(conn, self.org_id, {
+                "partner_type": "supplier", "old_name": "テスト仕入先A", "new_name": "テスト仕入先B",
+            })
+            after = app.list_business_partners(conn, self.org_id)
+            purchase_partner = conn.execute(
+                "SELECT partner_name FROM purchases WHERE organization_id = ? AND invoice_no = 'INV-RENAME'",
+                (self.org_id,),
+            ).fetchone()["partner_name"]
+
+        self.assertNotIn("テスト仕入先A", after["suppliers"])
+        self.assertIn("テスト仕入先B", after["suppliers"])
+        # マスタだけでなく過去取引（purchases）の表示名も揃う。
+        self.assertEqual(purchase_partner, "テスト仕入先B")
+
+    def test_update_business_partner_rejects_duplicate_name(self):
+        with app.get_conn() as conn:
+            app.create_business_partner(conn, self.org_id, {"partner_type": "customer", "partner_name": "得意先X"})
+            app.create_business_partner(conn, self.org_id, {"partner_type": "customer", "partner_name": "得意先Y"})
+            with self.assertRaises(ValueError):
+                app.update_business_partner(conn, self.org_id, {
+                    "partner_type": "customer", "old_name": "得意先X", "new_name": "得意先Y",
+                })
+
+    def test_update_business_partner_missing_raises_not_found(self):
+        with app.get_conn() as conn:
+            with self.assertRaises(app.NotFoundError):
+                app.update_business_partner(conn, self.org_id, {
+                    "partner_type": "supplier", "old_name": "存在しない取引先", "new_name": "新名",
+                })
+
+    def test_delete_business_partner_removes_unused(self):
+        with app.get_conn() as conn:
+            app.create_business_partner(conn, self.org_id, {"partner_type": "supplier", "partner_name": "未使用仕入先"})
+            app.delete_business_partner(conn, self.org_id, {"partner_type": "supplier", "partner_name": "未使用仕入先"})
+            after = app.list_business_partners(conn, self.org_id)
+
+        self.assertNotIn("未使用仕入先", after["suppliers"])
+
+    def test_delete_business_partner_blocked_when_referenced(self):
+        with app.get_conn() as conn:
+            product = self._first_product(conn)
+            app.create_purchase(conn, self.org_id, {
+                "product_id": product["id"], "partner_name": "参照あり仕入先",
+                "invoice_no": "INV-REF", "transaction_date": "2026-06-01",
+                "received_date": "2026-06-02", "quantity": 1, "unit_price": 1000,
+            })
+            # 取引のある取引先は削除できない（直すなら編集）。
+            with self.assertRaises(ValueError):
+                app.delete_business_partner(conn, self.org_id, {"partner_type": "supplier", "partner_name": "参照あり仕入先"})
+
     def test_cancel_purchase_adds_reversal_movement(self):
         with app.get_conn() as conn:
             product = self._first_product(conn)

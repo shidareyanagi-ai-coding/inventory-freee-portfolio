@@ -99,6 +99,34 @@ class InventoryApiTest(unittest.TestCase):
         after = next(p for p in self.client.get("/api/products").json() if p["id"] == product["id"])
         self.assertEqual(after["stock_quantity"], before + 4)
 
+    def test_update_business_partner_route_renames(self):
+        self.client.post("/api/business-partners", json={"partner_type": "customer", "partner_name": "ルート得意先A"})
+        res = self.client.post(
+            "/api/business-partners/update",
+            json={"partner_type": "customer", "old_name": "ルート得意先A", "new_name": "ルート得意先B"},
+        )
+        self.assertEqual(res.status_code, 201)
+        partners = self.client.get("/api/business-partners").json()
+        self.assertIn("ルート得意先B", partners["customers"])
+        self.assertNotIn("ルート得意先A", partners["customers"])
+
+    def test_delete_business_partner_route_blocked_when_referenced_returns_400(self):
+        product = self.client.get("/api/products").json()[0]
+        self.client.post(
+            "/api/purchases",
+            json={
+                "product_id": product["id"], "partner_name": "ルート参照仕入先",
+                "invoice_no": "INV-ROUTE-REF", "transaction_date": "2026-06-01",
+                "received_date": "2026-06-02", "quantity": 1, "unit_price": 1000,
+            },
+        )
+        res = self.client.post(
+            "/api/business-partners/delete",
+            json={"partner_type": "supplier", "partner_name": "ルート参照仕入先"},
+        )
+        self.assertEqual(res.status_code, 400)
+        self.assertIn("error", res.json())
+
     def test_oversell_returns_400_with_error_message(self):
         product = self.client.get("/api/products").json()[0]
         res = self.client.post(

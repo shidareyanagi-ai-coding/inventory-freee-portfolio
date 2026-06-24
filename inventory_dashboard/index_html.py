@@ -56,6 +56,7 @@ _INDEX_TEMPLATE = r"""
     .transaction-form button[type="submit"] { width: 100%; margin-top: 12px; }
     .partner-add { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; margin-top: 8px; }
     .partner-add button { padding: 9px 12px; white-space: nowrap; }
+    .partner-master-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 16px; }
     label { display: block; font-size: 12px; color: var(--muted); margin: 8px 0 4px; }
     input, select { width: 100%; padding: 9px 10px; border: 1px solid var(--line); border-radius: 6px; background: white; font: inherit; }
     button { border: 0; border-radius: 6px; padding: 10px 12px; background: var(--accent); color: white; font-weight: 700; cursor: pointer; }
@@ -280,6 +281,14 @@ _INDEX_TEMPLATE = r"""
           </form>
         </div>
       </aside>
+    </section>
+    <section class="panel" id="partnerMasterSection">
+      <h2>取引先マスタ</h2>
+      <p class="note">登録済みの仕入先・得意先を修正・削除できます。名前を直すと、その取引先の過去の仕入/売上の表示名も一緒に更新されます（疑似freeeへ送信済みの仕訳には反映されません）。取引のある取引先は削除できません（名前を直す場合は「編集」を使ってください）。</p>
+      <div class="partner-master-grid">
+        <div><h3 class="sub">仕入先</h3><div id="supplierMaster"></div></div>
+        <div><h3 class="sub">得意先</h3><div id="customerMaster"></div></div>
+      </div>
     </section>
     <section class="panel">
       <div class="section-head">
@@ -634,6 +643,67 @@ _INDEX_TEMPLATE = r"""
     async function loadPartners() {
       currentPartners = await api("/api/business-partners");
       renderPartnerSelects();
+      renderPartnerMaster();
+    }
+
+    function partnerRowsFor(type) {
+      return (type === "supplier" ? currentPartners.suppliers : currentPartners.customers) || [];
+    }
+
+    function renderPartnerMaster() {
+      const configs = [
+        { type: "supplier", elId: "supplierMaster" },
+        { type: "customer", elId: "customerMaster" }
+      ];
+      for (const c of configs) {
+        const el = document.getElementById(c.elId);
+        if (!el) continue;
+        const rows = partnerRowsFor(c.type);
+        if (!rows.length) { el.innerHTML = `<p class="note">登録なし</p>`; continue; }
+        // 名前は onclick に直接埋め込まず index を渡す（引用符を含む名前でも壊れない）。
+        el.innerHTML = table(["取引先名", "操作"], rows.map((name, i) => [
+          escapeHtml(name),
+          `<button class="link" onclick="editPartner('${c.type}', ${i})">編集</button> `
+          + `<button class="link" onclick="deletePartner('${c.type}', ${i})">削除</button>`
+        ]));
+      }
+    }
+
+    async function editPartner(type, index) {
+      const oldName = partnerRowsFor(type)[index];
+      if (!oldName) return;
+      const input = prompt("取引先名を修正", oldName);
+      if (input === null) return;
+      const newName = input.trim();
+      if (!newName || newName === oldName) return;
+      try {
+        await api("/api/business-partners/update", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ partner_type: type, old_name: oldName, new_name: newName })
+        });
+        await loadAll();
+        document.getElementById("message").textContent = `取引先名を「${newName}」に修正しました（過去の取引も更新）`;
+      } catch (error) {
+        document.getElementById("message").textContent = error.message;
+      }
+    }
+
+    async function deletePartner(type, index) {
+      const name = partnerRowsFor(type)[index];
+      if (!name) return;
+      if (!confirm(`取引先「${name}」を削除しますか？`)) return;
+      try {
+        await api("/api/business-partners/delete", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ partner_type: type, partner_name: name })
+        });
+        await loadAll();
+        document.getElementById("message").textContent = `取引先「${name}」を削除しました`;
+      } catch (error) {
+        document.getElementById("message").textContent = error.message;
+      }
     }
 
     function renderPartnerSelects() {
