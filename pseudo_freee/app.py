@@ -1550,6 +1550,32 @@ def suggested_depreciation(conn: db.Connection) -> float:
     return round(asset_cost / DEPRECIATION_USEFUL_LIFE_YEARS)
 
 
+def upsert_closing_inventory(conn: db.Connection, data: dict[str, Any]) -> dict[str, Any]:
+    """在庫アプリから受け取った期末棚卸（帳簿評価額・実地棚卸高）を保存する（Phase B/D-4・機械向け）。
+
+    period 単位の upsert で冪等。BS の `商品`・三分法の売上原価はこの physical_amount を使う
+    （closing_inventory_physical_amount）。save_closing_procedure（手入力）と違い book/physical を
+    別々に受ける（帳簿＝在庫評価額・実地＝任意の上書き）。
+    """
+    period = str(data.get("period", "") or "").strip()
+    if not period:
+        raise ValueError("period is required")
+    book_amount = to_float(data.get("book_amount"))
+    raw_physical = data.get("physical_amount")
+    physical_amount = book_amount if raw_physical in (None, "") else to_float(raw_physical)
+    conn.execute(
+        """
+        INSERT INTO pseudo_freee_closing_inventory (period, book_amount, physical_amount)
+        VALUES (?, ?, ?)
+        ON CONFLICT(period) DO UPDATE SET
+            book_amount = excluded.book_amount,
+            physical_amount = excluded.physical_amount
+        """,
+        (period, book_amount, physical_amount),
+    )
+    return {"ok": True, "period": period, "book_amount": book_amount, "physical_amount": physical_amount}
+
+
 def save_closing_procedure(conn: db.Connection, data: dict[str, Any]) -> dict[str, Any]:
     """決算手続きの入力を保存する（期末商品棚卸高＝実地・減価償却費）。
 
@@ -3903,6 +3929,12 @@ class PseudoFreeeHandler(BaseHTTPRequestHandler):
                 data = parse_json_body(self)
                 with db_connection() as conn:
                     result = rename_partner(conn, data)
+                self.respond_json(result, HTTPStatus.CREATED)
+            elif parsed.path == "/api/closing-inventory":
+                # Phase B/D-4: 在庫からの期末棚卸（帳簿評価額・実地棚卸高）。機械向け＝認証なし。
+                data = parse_json_body(self)
+                with db_connection() as conn:
+                    result = upsert_closing_inventory(conn, data)
                 self.respond_json(result, HTTPStatus.CREATED)
             elif parsed.path == "/api/manual-expenses":
                 data = parse_json_body(self)

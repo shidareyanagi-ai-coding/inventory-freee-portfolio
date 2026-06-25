@@ -525,16 +525,28 @@ def safe_date(year: int, month: int, day: int) -> date:
     return date(year, month, min(day, monthrange(year, month)[1]))
 
 
-def stock_by_product(conn: db.Connection, organization_id: int) -> dict[int, int]:
-    rows = conn.execute(
-        """
-        SELECT product_id, COALESCE(SUM(quantity_delta), 0) AS stock_quantity
-        FROM inventory_movements
-        WHERE organization_id = ?
-        GROUP BY product_id
-        """,
-        (organization_id,),
-    ).fetchall()
+def stock_by_product(conn: db.Connection, organization_id: int, as_of: str | None = None) -> dict[int, int]:
+    """商品ごとの在庫数量。as_of（'YYYY-MM-DD'）指定時はその日までの移動だけを合計する（Phase D④ 期末棚卸）。"""
+    if as_of:
+        rows = conn.execute(
+            """
+            SELECT product_id, COALESCE(SUM(quantity_delta), 0) AS stock_quantity
+            FROM inventory_movements
+            WHERE organization_id = ? AND movement_date <= ?
+            GROUP BY product_id
+            """,
+            (organization_id, as_of),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            """
+            SELECT product_id, COALESCE(SUM(quantity_delta), 0) AS stock_quantity
+            FROM inventory_movements
+            WHERE organization_id = ?
+            GROUP BY product_id
+            """,
+            (organization_id,),
+        ).fetchall()
     return {row["product_id"]: int(row["stock_quantity"]) for row in rows}
 
 
@@ -699,6 +711,71 @@ def push_partner_rename(
     if not data.get("ok"):
         return {"ok": False, "error": str(data.get("error") or "疑似freee の取引先更新に失敗しました")}
     return {"ok": True, "updated_deals": int(data.get("updated_deals", 0))}
+
+
+def closing_inventory_book_amount(conn: db.Connection, organization_id: int, as_of: str | None = None) -> float:
+    """期末在庫の帳簿評価額 = Σ(在庫数量 × 仕入単価)。as_of 指定でその日時点（Phase D④＝Phase B）。"""
+    stocks = stock_by_product(conn, organization_id, as_of)
+    if not stocks:
+        return 0.0
+    prices = {
+        row["id"]: float(row["purchase_unit_price"])
+        for row in conn.execute(
+            "SELECT id, purchase_unit_price FROM products WHERE organization_id = ?", (organization_id,)
+        ).fetchall()
+    }
+    return float(sum(max(int(qty), 0) * prices.get(pid, 0.0) for pid, qty in stocks.items()))
+
+
+def push_closing_inventory(conn: db.Connection, organization_id: int, data: dict[str, Any]) -> dict[str, Any]:
+    """期末在庫（帳簿評価額・実地棚卸高）を疑似freee の決算へ送る（Phase D④＝Phase B）。
+
+    在庫が唯一の正。帳簿評価額はサーバ側で再計算（クライアント値は信用しない）、実地棚卸高は任意の
+    上書き（無ければ帳簿＝実地）。疑似freee の `商品`(BS)・売上原価(三分法) がこの額になる。period 単位の
+    upsert で冪等。失敗時は ValueError（ルートがそのまま 4xx で返す＝決算は人が確認して送る操作）。
+    """
+    period = str(data.get("period", "") or "").strip()
+    if not (len(period) == 6 and period.isdigit()):
+        raise ValueError("period は YYYYMM 形式（例 202603）で指定してください。")
+    as_of = str(data.get("as_of", "") or "").strip() or None
+    if as_of:
+        date.fromisoformat(as_of)  # 妥当性チェック（不正な日付は例外）
+    book_amount = closing_inventory_book_amount(conn, organization_id, as_of)
+    raw_override = data.get("physical_amount")
+    physical_amount = book_amount if raw_override in (None, "") else to_float(raw_override)
+    if physical_amount < 0:
+        raise ValueError("実地棚卸高は0以上で入力してください。")
+
+    payload = {
+        "api_target": "pseudo_freee_closing_inventory",
+        "period": period,
+        "book_amount": book_amount,
+        "physical_amount": physical_amount,
+    }
+    request = urllib.request.Request(
+        f"{PSEUDO_FREEE_API_URL}/api/closing-inventory",
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={"Content-Type": "application/json; charset=utf-8"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=8) as response:
+            response_data = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        raise ValueError(f"疑似freee送信失敗 HTTP {exc.code}: {body}") from exc
+    except (urllib.error.URLError, TimeoutError) as exc:
+        reason = getattr(exc, "reason", exc)
+        raise ValueError(f"疑似freeeに接続できません: {reason}") from exc
+    if not response_data.get("ok"):
+        raise ValueError(str(response_data.get("error") or "疑似freee の期末棚卸登録に失敗しました"))
+    return {
+        "ok": True,
+        "period": period,
+        "as_of": as_of or "",
+        "book_amount": book_amount,
+        "physical_amount": physical_amount,
+    }
 
 
 def delete_business_partner(conn: db.Connection, organization_id: int, data: dict[str, Any]) -> dict[str, Any]:
@@ -2403,6 +2480,30 @@ def api_send_all_queue(identity: Identity = WRITER) -> dict[str, Any]:
         record_audit(
             conn, identity.organization_id, identity.user_id, "freee_queue.send_all", "freee_sync_queue", "",
             {"attempted": result["attempted"], "sent": result["sent"], "failed": result["failed"]},
+        )
+        return result
+
+
+@app.post("/api/closing-inventory/preview")
+def api_closing_inventory_preview(data: dict[str, Any] = Depends(parse_json_body), identity: Identity = WRITER) -> dict[str, Any]:
+    """Phase D④: 期末在庫の帳簿評価額だけ計算して返す（送信しない＝「帳簿評価額を計算」用）。"""
+    period = str(data.get("period", "") or "").strip()
+    as_of = str(data.get("as_of", "") or "").strip() or None
+    if as_of:
+        date.fromisoformat(as_of)
+    with get_conn() as conn:
+        book = closing_inventory_book_amount(conn, identity.organization_id, as_of)
+    return {"ok": True, "period": period, "as_of": as_of or "", "book_amount": book}
+
+
+@app.post("/api/closing-inventory/push", status_code=201)
+def api_push_closing_inventory(data: dict[str, Any] = Depends(parse_json_body), identity: Identity = WRITER) -> dict[str, Any]:
+    """Phase D④: 期末在庫（帳簿評価額・実地棚卸高）を疑似freee の決算へ送る。"""
+    with get_conn() as conn:
+        result = push_closing_inventory(conn, identity.organization_id, data)
+        record_audit(
+            conn, identity.organization_id, identity.user_id, "closing_inventory.push", "closing_inventory", result["period"],
+            {"book_amount": result["book_amount"], "physical_amount": result["physical_amount"]},
         )
         return result
 

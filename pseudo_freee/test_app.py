@@ -131,6 +131,24 @@ class PseudoFreeeAppTest(unittest.TestCase):
         self.assertEqual(result["updated_deals"], 1)
         self.assertEqual(d["partner_name"], "名前のみ商店NEW")
 
+    def test_upsert_closing_inventory_insert_then_update(self) -> None:
+        # Phase B/D-4: 在庫からの期末棚卸を受信→保存。同 period の再送は upsert。BS 商品 = physical_amount。
+        with app.db_connection() as conn:
+            app.upsert_closing_inventory(conn, {"period": "202606", "book_amount": 400, "physical_amount": 380})
+            cur = app.closing_inventory_current(conn)
+            phys1 = app.closing_inventory_physical_amount(conn)
+            app.upsert_closing_inventory(conn, {"period": "202606", "book_amount": 500, "physical_amount": 500})
+            phys2 = app.closing_inventory_physical_amount(conn)
+        self.assertEqual(cur["period"], "202606")
+        self.assertEqual(phys1, 380.0)
+        self.assertEqual(phys2, 500.0)
+
+    def test_upsert_closing_inventory_defaults_physical_to_book(self) -> None:
+        # 実地未指定なら帳簿＝実地。
+        with app.db_connection() as conn:
+            result = app.upsert_closing_inventory(conn, {"period": "202607", "book_amount": 1234})
+        self.assertEqual(result["physical_amount"], 1234.0)
+
     def test_create_manual_expense_saves_snapshot_and_updates_summary(self) -> None:
         with app.db_connection() as conn:
             result = app.create_manual_expense(

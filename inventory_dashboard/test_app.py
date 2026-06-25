@@ -489,6 +489,61 @@ class InventoryAppTest(unittest.TestCase):
         self.assertEqual(result["partner_master_id"], bp["id"])
         self.assertEqual(result["new_name"], "改名後得意先")
 
+    def test_stock_by_product_as_of_filters_by_date(self):
+        # Phase D④: as_of でその日までの在庫だけ合計する。
+        with app.get_conn() as conn:
+            app.create_product(conn, self.org_id, {"sku": "AS-OF-1", "product_name": "asof商品", "purchase_unit_price": 100})
+            pid = conn.execute("SELECT id FROM products WHERE organization_id=? AND sku='AS-OF-1'", (self.org_id,)).fetchone()["id"]
+            app.create_purchase(conn, self.org_id, {"product_id": pid, "partner_name": "as", "invoice_no": "AO-1", "transaction_date": "2026-06-10", "received_date": "2026-06-10", "quantity": 5, "unit_price": 100})
+            app.create_purchase(conn, self.org_id, {"product_id": pid, "partner_name": "as", "invoice_no": "AO-2", "transaction_date": "2026-06-20", "received_date": "2026-06-20", "quantity": 3, "unit_price": 100})
+            s_mid = app.stock_by_product(conn, self.org_id, as_of="2026-06-10").get(pid, 0)
+            s_late = app.stock_by_product(conn, self.org_id, as_of="2026-06-20").get(pid, 0)
+            s_now = app.stock_by_product(conn, self.org_id).get(pid, 0)
+        self.assertEqual(s_mid, 5)
+        self.assertEqual(s_late, 8)
+        self.assertEqual(s_now, 8)
+
+    def test_closing_inventory_book_amount_reflects_as_of(self):
+        # Phase D④: 帳簿評価額 = Σ(在庫×仕入単価)。既存 seed の在庫移動を消して入庫1件だけで検証する。
+        with app.get_conn() as conn:
+            conn.execute("DELETE FROM inventory_movements WHERE organization_id = ?", (self.org_id,))
+            app.create_product(conn, self.org_id, {"sku": "BK-1", "product_name": "簿価商品", "purchase_unit_price": 100})
+            pid = conn.execute("SELECT id FROM products WHERE organization_id=? AND sku='BK-1'", (self.org_id,)).fetchone()["id"]
+            app.create_purchase(conn, self.org_id, {"product_id": pid, "partner_name": "bk", "invoice_no": "BK-P-1", "transaction_date": "2026-06-10", "received_date": "2026-06-10", "quantity": 5, "unit_price": 100})
+            before = app.closing_inventory_book_amount(conn, self.org_id, as_of="2026-06-09")  # 入庫前
+            after = app.closing_inventory_book_amount(conn, self.org_id, as_of="2026-06-10")   # 入庫後
+        self.assertEqual(before, 0.0)
+        self.assertEqual(after, 500.0)  # 5 × 100
+
+    def test_push_closing_inventory_posts_book_and_physical(self):
+        # Phase D④: 帳簿評価額はサーバ側で再計算して送る。実地は上書き可（無ければ帳簿＝実地）。
+        captured = {}
+
+        def fake_urlopen(request, timeout):
+            captured["url"] = request.full_url
+            captured["body"] = json.loads(request.data.decode("utf-8"))
+            body = captured["body"]
+            return FakeResponse({"ok": True, "period": body["period"], "book_amount": body["book_amount"], "physical_amount": body["physical_amount"]})
+
+        with app.get_conn() as conn:
+            app.create_product(conn, self.org_id, {"sku": "PUSH-1", "product_name": "送信商品", "purchase_unit_price": 200})
+            pid = conn.execute("SELECT id FROM products WHERE organization_id=? AND sku='PUSH-1'", (self.org_id,)).fetchone()["id"]
+            app.create_purchase(conn, self.org_id, {"product_id": pid, "partner_name": "ps", "invoice_no": "PS-1", "transaction_date": "2026-06-10", "received_date": "2026-06-10", "quantity": 2, "unit_price": 200})
+            expected_book = app.closing_inventory_book_amount(conn, self.org_id, as_of="2026-06-30")
+            with patch("app.urllib.request.urlopen", fake_urlopen):
+                r1 = app.push_closing_inventory(conn, self.org_id, {"period": "202606", "as_of": "2026-06-30"})
+                r2 = app.push_closing_inventory(conn, self.org_id, {"period": "202606", "as_of": "2026-06-30", "physical_amount": 9999})
+        self.assertEqual(captured["url"], f"{app.PSEUDO_FREEE_API_URL}/api/closing-inventory")
+        self.assertEqual(captured["body"]["period"], "202606")
+        self.assertEqual(r1["book_amount"], expected_book)
+        self.assertEqual(r1["physical_amount"], expected_book)  # 上書きなし＝帳簿額
+        self.assertEqual(r2["physical_amount"], 9999.0)         # 上書きあり
+
+    def test_push_closing_inventory_rejects_bad_period(self):
+        with app.get_conn() as conn:
+            with self.assertRaises(ValueError):
+                app.push_closing_inventory(conn, self.org_id, {"period": "2026-06"})
+
     def test_send_queue_to_pseudo_freee_rejects_sent_queue(self):
         with app.get_conn() as conn:
             product = self._first_product(conn)
