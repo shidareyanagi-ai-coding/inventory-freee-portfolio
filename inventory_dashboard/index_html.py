@@ -318,15 +318,10 @@ _INDEX_TEMPLATE = r"""
         </label>
       </div>
       <div class="chart-wrap"><canvas id="forecastChart"></canvas></div>
-      <div class="forecast-grid">
-        <div>
-          <h3 class="sub">モデル精度（バックテスト・末尾28日／★=最良）</h3>
-          <div id="forecastEvaluations"></div>
-        </div>
-        <div>
-          <h3 class="sub">選択商品の発注判定</h3>
-          <div id="forecastCandidates"></div>
-        </div>
+      <div>
+        <h3 class="sub">モデル比較と発注判定 <span id="forecastTargetName" style="font-weight:normal;color:var(--muted);font-size:13px;"></span></h3>
+        <div id="forecastCandidates"></div>
+        <p class="note">MAE/MAPE＝直近28日ホールドアウトのバックテスト精度（全商品平均・小さいほど正確）。★＝最良モデル（ダッシュボードの推奨発注量に採用）。「現在在庫」以降は選択商品の値。</p>
       </div>
     </section>
     <section class="bottom-grid">
@@ -520,7 +515,7 @@ _INDEX_TEMPLATE = r"""
       select.innerHTML = products.map(p => `<option value="${p.id}">${p.sku} ${p.product_name}</option>`).join("");
       if (previous && [...select.options].some(o => o.value === previous)) select.value = previous;
       await refreshForecastModelOptions();
-      await Promise.all([loadForecastChart(), loadForecastEvaluations(), loadForecastCandidates()]);
+      await Promise.all([loadForecastChart(), loadForecastCandidates()]);
     }
 
     async function refreshForecastModelOptions() {
@@ -589,24 +584,7 @@ _INDEX_TEMPLATE = r"""
       });
     }
 
-    async function loadForecastEvaluations() {
-      const rows = await api("/api/forecast/evaluations");
-      const target = document.getElementById("forecastEvaluations");
-      if (!rows.length) {
-        target.innerHTML = '<p class="note">まだバックテスト結果がありません。「予測バッチを実行」を押してください。</p>';
-        return;
-      }
-      const best = rows[0].model_name; // MAE 昇順で返るため先頭が最良。
-      target.innerHTML = table(["モデル", "期間", "MAE", "MAPE(%)"],
-        rows.map(r => [
-          modelLabel(r.model_name) + (r.model_name === best ? " ★" : ""),
-          r.period,
-          Number(r.mae).toFixed(2),
-          Number.isFinite(r.mape) && r.mape > 0 ? Number(r.mape).toFixed(1) : "—",
-        ]));
-    }
-
-    // 上の商品ドロップダウンで選んだ商品の発注判定を表示する（グラフと商品を一致させる）。
+    // 上の商品ドロップダウンで選んだ商品の「モデル比較＋発注判定」を1つの表で表示する。
     function onForecastProductChange() {
       loadForecastChart();
       loadForecastCandidates();
@@ -614,18 +592,20 @@ _INDEX_TEMPLATE = r"""
     async function loadForecastCandidates() {
       const productId = document.getElementById("forecastProduct").value;
       const target = document.getElementById("forecastCandidates");
-      if (!productId) { target.innerHTML = ""; return; }
-      // 3モデル(ベースライン★/LightGBM/SARIMA)を行に並べ、モデルごとの必要在庫・発注量・判定を比較表示。
-      // 左上の角セル(①)には選んだ商品名を出す（モデル精度表と行が揃う／商品列は廃止）。
+      const nameEl = document.getElementById("forecastTargetName");
+      if (!productId) { target.innerHTML = ""; if (nameEl) nameEl.textContent = ""; return; }
+      // 行=3モデル(★最良・MAE昇順)、列=MAE/MAPE(精度)＋現在在庫/必要在庫/今すぐ発注量/判定(選択商品)。商品名は見出しへ。
       const data = await api(`/api/forecast/judgement-by-model?product_id=${productId}`);
+      if (nameEl) nameEl.textContent = data.product ? `／ 対象商品: ${data.product.sku} ${data.product.product_name}` : "";
       if (!data.models || !data.models.length) {
         target.innerHTML = '<p class="note">この商品の予測がまだありません。「予測バッチを実行」を押してください。</p>';
         return;
       }
-      const productName = `${data.product.sku} ${data.product.product_name}`;
-      target.innerHTML = table([productName, "現在在庫", "必要在庫", "今すぐ発注量", "判定"],
+      target.innerHTML = table(["モデル", "MAE", "MAPE", "現在在庫", "必要在庫", "今すぐ発注量", "判定"],
         data.models.map(m => [
           modelLabel(m.model_name) + (m.is_best ? " ★" : ""),
+          (m.mae != null ? Number(m.mae).toFixed(2) : "—"),
+          (m.mape != null && m.mape > 0 ? Number(m.mape).toFixed(1) + "%" : "—"),
           data.stock_quantity,
           m.required_inventory,
           m.recommended_order_quantity,
@@ -643,7 +623,7 @@ _INDEX_TEMPLATE = r"""
         document.getElementById("forecastMlNote").textContent =
           `予測を更新しました（最良モデル: ${modelLabel(result.best_model)} ／ 対象 ${result.products_forecasted} 商品 ／ 発注候補 ${result.order_candidates} 件）。`;
         await refreshForecastModelOptions();
-        await Promise.all([loadForecastChart(), loadForecastEvaluations(), loadForecastCandidates()]);
+        await Promise.all([loadForecastChart(), loadForecastCandidates()]);
       } catch (e) {
         alert(e.message);
       } finally {

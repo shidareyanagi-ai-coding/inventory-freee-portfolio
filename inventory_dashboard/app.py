@@ -1616,6 +1616,14 @@ def order_judgement_by_model(conn: db.Connection, organization_id: int, product_
     }
     ranked = [m for m in _ranked_models(conn, organization_id) if m in present]
     best = ranked[0] if ranked else ""
+    # モデル精度（MAE/MAPE）も同じ表に出すため引く（全商品平均・モデル単位＝バックテスト 直近28日ホールドアウト）。
+    evals = {
+        row["model_name"]: row
+        for row in conn.execute(
+            "SELECT model_name, mae, mape FROM model_evaluations WHERE organization_id = ?",
+            (organization_id,),
+        ).fetchall()
+    }
     models = []
     for m in ranked:
         daily = conn.execute(
@@ -1631,8 +1639,11 @@ def order_judgement_by_model(conn: db.Connection, organization_id: int, product_
             judgement = "発注推奨"
         else:
             judgement = "発注不要"
+        ev = evals.get(m)
         models.append({
             "model_name": m,
+            "mae": float(ev["mae"]) if ev else None,
+            "mape": float(ev["mape"]) if ev and ev["mape"] else None,
             "lead_time_demand": lead_time_demand,
             "required_inventory": required,
             "recommended_order_quantity": order,
