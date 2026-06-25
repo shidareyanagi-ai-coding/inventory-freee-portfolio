@@ -283,7 +283,7 @@ _INDEX_TEMPLATE = r"""
     </section>
     <section class="panel" id="partnerMasterSection">
       <h2>取引先マスタ</h2>
-      <p class="note">登録済みの仕入先・得意先を修正・削除できます。名前を直すと、その取引先の過去の仕入/売上の表示名も一緒に更新されます（疑似freeeへ送信済みの仕訳には反映されません）。取引のある取引先は削除できません（名前を直す場合は「編集」を使ってください）。</p>
+      <p class="note">登録済みの仕入先・得意先を修正・削除できます。名前を直すと、その取引先の過去の仕入/売上の表示名も一緒に更新され、疑似freeeへ送信済みの取引の取引先名も更新します（共有ID連携）。取引のある取引先は削除できません（名前を直す場合は「編集」を使ってください）。</p>
       <div class="partner-master-grid">
         <div><h3 class="sub">仕入先</h3><div id="supplierMaster"></div></div>
         <div><h3 class="sub">得意先</h3><div id="customerMaster"></div></div>
@@ -680,13 +680,20 @@ _INDEX_TEMPLATE = r"""
       const newName = input.trim();
       if (!newName || newName === oldName) return;
       try {
-        await api("/api/business-partners/update", {
+        const r = await api("/api/business-partners/update", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ partner_type: type, old_name: oldName, new_name: newName })
         });
         await loadAll();
-        document.getElementById("message").textContent = `取引先名を「${newName}」に修正しました（過去の取引も更新）`;
+        // Phase D⑥: 疑似freee へ送信済みの取引の取引先名も直したかを案内する。
+        let suffix = "";
+        if (r.partner_sync) {
+          suffix = r.partner_sync.ok
+            ? `／疑似freeeの送信済み取引 ${r.partner_sync.updated_deals}件も更新`
+            : `／疑似freeeは未反映（${r.partner_sync.error}）。疑似freee起動後にもう一度編集すると同期します`;
+        }
+        document.getElementById("message").textContent = `取引先名を「${newName}」に修正しました（過去の取引も更新）${suffix}`;
       } catch (error) {
         document.getElementById("message").textContent = error.message;
       }

@@ -225,7 +225,8 @@
 - **D-0 完了**: 本節を追記。
 - **D-1 完了**（commit f837314）: `demand_history` 新設、CSV取込を予測専用化（sales/在庫元帳/freeeに書かない・冪等置換）、予測リーダー2か所を 実sales＋demand_history 合算に。在庫 68 passed。
 - **D-2 完了**: `freee_sync_queue.retry_count` 追加（両DDL＋既存DB用に `ensure_schema_upgrades` で ALTER）、`count_unsent_queue`／`send_all_pending_queue`／`POST /api/freee-sync-queue/send-all`、`fail_queue_send` で失敗ごとに retry_count++。UI に「未送信 N件」バッジ＋「未送信を一括送信」ボタン＋失敗回数表示。在庫 70 passed＋ローカル実機（両サーバ起動）で 登録→未送信2件→一括送信→送信済み を確認。自動push は不採用（人が確定を維持）。
-- 次=**D-3 取引先マスタの整合（⑥・共有ID連携）**。
+- **D-3 完了**: 取引先マスタの整合（⑥・共有ID連携）。在庫 `build_freee_payload` が `partner_master_id`（business_partners.id）を payload に同梱（create時は add_business_partner→enqueue の順に修正＝初回取引から id が乗る）。疑似freee `create_deal` が deal に id 保存＋payee マスタへ登録、新 `rename_partner`＋`POST /api/partner`（id でひもづく送信済み deal を改名・id 無し旧 deal は名前一致で救済・payee も改名）。在庫 `update_business_partner` は id を返し、ルートが `push_partner_rename` で疑似freee へ best-effort 同期（疑似freee 停止時はローカルのみ更新＋UIに「未反映」案内）。在庫 56＋疑似freee 63 passed。ローカル実機で 仕入登録→送信→在庫で改名→`partner_sync.updated_deals=1`（送信済み deal も改名）を確認。
+- 次=**D-4 期末棚卸連携（③＝Phase B）**。
 
 
 

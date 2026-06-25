@@ -656,7 +656,49 @@ def update_business_partner(conn: db.Connection, organization_id: int, data: dic
         conn.execute("UPDATE products SET supplier_name = ? WHERE organization_id = ? AND supplier_name = ?", (new_name, organization_id, old_name))
     else:
         conn.execute("UPDATE sales SET partner_name = ? WHERE organization_id = ? AND partner_name = ?", (new_name, organization_id, old_name))
-    return {"ok": True, "partner_type": partner_type, "old_name": old_name, "new_name": new_name}
+    # partner_master_id（=改名しても不変の id）を返す。ルート側がこの id で疑似freee の送信済み deal も直す（Phase D⑥）。
+    return {
+        "ok": True,
+        "partner_type": partner_type,
+        "old_name": old_name,
+        "new_name": new_name,
+        "partner_master_id": int(target["id"]),
+    }
+
+
+def push_partner_rename(
+    organization_id: int, partner_type: str, partner_master_id: int, old_name: str, new_name: str
+) -> dict[str, Any]:
+    """疑似freee に取引先の改名を伝える（送信済み deal の取引先名も直す・Phase D⑥）。best-effort。
+
+    在庫が唯一の正。疑似freee が落ちていてもローカルの改名は成立させ、ここは ok:false を返すだけ
+    （UI が「疑似freee未反映」を案内し、起動後に再実行できる）。deal は partner_master_id で確実に、
+    旧来の id 無し deal は名前一致で拾えるよう old_name も渡す。
+    """
+    request_body = json.dumps(
+        {
+            "partner_master_id": partner_master_id,
+            "partner_type": partner_type,
+            "old_name": old_name,
+            "new_name": new_name,
+        },
+        ensure_ascii=False,
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        f"{PSEUDO_FREEE_API_URL}/api/partner",
+        data=request_body,
+        headers={"Content-Type": "application/json; charset=utf-8"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=8) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except (urllib.error.URLError, TimeoutError) as exc:
+        reason = getattr(exc, "reason", exc)
+        return {"ok": False, "error": f"疑似freeeに接続できません: {reason}"}
+    if not data.get("ok"):
+        return {"ok": False, "error": str(data.get("error") or "疑似freee の取引先更新に失敗しました")}
+    return {"ok": True, "updated_deals": int(data.get("updated_deals", 0))}
 
 
 def delete_business_partner(conn: db.Connection, organization_id: int, data: dict[str, Any]) -> dict[str, Any]:
@@ -778,8 +820,9 @@ def create_purchase(conn: db.Connection, organization_id: int, data: dict[str, A
         """,
         (organization_id, product["id"], purchase_id, received_date, quantity, unit_price, f"仕入 {invoice_no}"),
     )
-    enqueue_freee_payload(conn, organization_id, "purchase", purchase_id)
+    # 取引先を先にマスタ登録してから payload を作る＝build_freee_payload が partner_master_id を解決できる（Phase D⑥）。
     add_business_partner(conn, organization_id, "supplier", partner_name)
+    enqueue_freee_payload(conn, organization_id, "purchase", purchase_id)
     return {"ok": True, "purchase_id": purchase_id}
 
 
@@ -818,8 +861,9 @@ def create_sale(conn: db.Connection, organization_id: int, data: dict[str, Any])
         """,
         (organization_id, product["id"], sale_id, transaction_date, -quantity, unit_price, f"売上 {invoice_no}"),
     )
-    enqueue_freee_payload(conn, organization_id, "sale", sale_id)
+    # 取引先を先にマスタ登録してから payload を作る＝build_freee_payload が partner_master_id を解決できる（Phase D⑥）。
     add_business_partner(conn, organization_id, "customer", partner_name)
+    enqueue_freee_payload(conn, organization_id, "sale", sale_id)
     return {"ok": True, "sale_id": sale_id}
 
 
@@ -875,6 +919,21 @@ def _negate_freee_payload(payload: dict[str, Any]) -> dict[str, Any]:
     return payload
 
 
+def _partner_master_id(conn: db.Connection, organization_id: int, partner_type: str, partner_name: str) -> int | None:
+    """取引先名から在庫の business_partners.id を引く（Phase D⑥・共有ID連携）。
+
+    この id を payload に載せて疑似freee の deal に保存しておくと、後で在庫側が取引先を改名したとき
+    id を手がかりに送信済み deal の取引先名も直せる（/api/partner）。未登録名なら None。
+    """
+    if not partner_name:
+        return None
+    row = conn.execute(
+        "SELECT id FROM business_partners WHERE organization_id = ? AND partner_type = ? AND partner_name = ?",
+        (organization_id, partner_type, partner_name),
+    ).fetchone()
+    return int(row["id"]) if row else None
+
+
 def build_freee_payload(conn: db.Connection, organization_id: int, source_type: str, source_id: int) -> dict[str, Any]:
     # Phase C: purchase_cancel / sale_cancel は元（purchase / sale）の payload を符号反転した取消仕訳。
     # こうしておくと送信前レビュー（/api/freee-preview）も取消仕訳をそのまま表示できる。
@@ -902,6 +961,7 @@ def build_freee_payload(conn: db.Connection, organization_id: int, source_type: 
             "due_date": row["due_date"],
             "type": "expense",
             "partner_name": row["partner_name"],
+            "partner_master_id": _partner_master_id(conn, organization_id, "supplier", row["partner_name"]),
             "invoice_no": row["invoice_no"],
             "details": [
                 {
@@ -935,6 +995,7 @@ def build_freee_payload(conn: db.Connection, organization_id: int, source_type: 
             "due_date": row["due_date"],
             "type": "income",
             "partner_name": row["partner_name"],
+            "partner_master_id": _partner_master_id(conn, organization_id, "customer", row["partner_name"]),
             "invoice_no": row["invoice_no"],
             "details": [
                 {
@@ -2309,7 +2370,13 @@ def api_update_business_partner(data: dict[str, Any] = Depends(parse_json_body),
     with get_conn() as conn:
         result = update_business_partner(conn, identity.organization_id, data)
         record_audit(conn, identity.organization_id, identity.user_id, "business_partner.update", "business_partner", data.get("new_name", ""), {"old_name": data.get("old_name")})
-        return result
+    # ローカル更新のコミット後に、疑似freee の送信済み deal の取引先名も直す（best-effort・Phase D⑥）。
+    if result.get("partner_master_id") is not None and result["old_name"] != result["new_name"]:
+        result["partner_sync"] = push_partner_rename(
+            identity.organization_id, result["partner_type"], result["partner_master_id"],
+            result["old_name"], result["new_name"],
+        )
+    return result
 
 
 @app.post("/api/business-partners/delete", status_code=201)

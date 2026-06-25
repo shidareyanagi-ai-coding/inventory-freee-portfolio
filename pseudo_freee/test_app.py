@@ -81,6 +81,56 @@ class PseudoFreeeAppTest(unittest.TestCase):
         self.assertEqual(second_id, first_id)
         self.assertEqual(len(deals), 1)
 
+    def _deal(self, queue_id: int, source_id: int, master_id, partner_name: str, source_type: str = "purchase") -> dict:
+        d = sample_deal(queue_id)
+        d["source_type"] = source_type
+        d["source_id"] = source_id
+        d["payload"]["type"] = "expense" if source_type == "purchase" else "income"
+        d["payload"]["partner_master_id"] = master_id
+        d["payload"]["partner_name"] = partner_name
+        return d
+
+    def test_create_deal_registers_payee(self) -> None:
+        # Phase D⑥: 在庫から来た取引先も payee マスタに登録される（手入力経費と同様に名寄せ候補に出る）。
+        with app.db_connection() as conn:
+            app.create_deal(conn, sample_deal())
+            row = conn.execute(
+                "SELECT 1 FROM pseudo_freee_payees WHERE payee_name = ?", ("東京サプライ",)
+            ).fetchone()
+        self.assertIsNotNone(row)
+
+    def test_rename_partner_updates_deals_by_master_id(self) -> None:
+        # Phase D⑥: partner_master_id でひもづく送信済み deal の取引先名を一括で直す（別IDは不変）。
+        with app.db_connection() as conn:
+            app.create_deal(conn, self._deal(queue_id=101, source_id=11, master_id=1, partner_name="東京サプライ"))
+            app.create_deal(conn, self._deal(queue_id=102, source_id=12, master_id=2, partner_name="大阪商店"))
+            result = app.rename_partner(
+                conn, {"partner_master_id": 1, "old_name": "東京サプライ", "new_name": "東京サプライ商事"}
+            )
+            d1 = conn.execute("SELECT partner_name FROM pseudo_freee_deals WHERE partner_master_id = 1").fetchone()
+            d2 = conn.execute("SELECT partner_name FROM pseudo_freee_deals WHERE partner_master_id = 2").fetchone()
+            payee_new = conn.execute("SELECT 1 FROM pseudo_freee_payees WHERE payee_name = '東京サプライ商事'").fetchone()
+            payee_old = conn.execute("SELECT 1 FROM pseudo_freee_payees WHERE payee_name = '東京サプライ'").fetchone()
+        self.assertEqual(result["updated_deals"], 1)
+        self.assertEqual(d1["partner_name"], "東京サプライ商事")
+        self.assertEqual(d2["partner_name"], "大阪商店")
+        self.assertIsNotNone(payee_new)
+        self.assertIsNone(payee_old)
+
+    def test_rename_partner_name_fallback_for_legacy_deal(self) -> None:
+        # Phase D⑥: partner_master_id 無し（D-3前に送信した）deal も、在庫由来なら名前一致で直せる。
+        with app.db_connection() as conn:
+            deal_id, _ = app.create_deal(
+                conn, self._deal(queue_id=103, source_id=13, master_id=1, partner_name="名前のみ商店")
+            )
+            conn.execute("UPDATE pseudo_freee_deals SET partner_master_id = NULL WHERE id = ?", (deal_id,))
+            result = app.rename_partner(
+                conn, {"partner_master_id": None, "old_name": "名前のみ商店", "new_name": "名前のみ商店NEW"}
+            )
+            d = conn.execute("SELECT partner_name FROM pseudo_freee_deals WHERE id = ?", (deal_id,)).fetchone()
+        self.assertEqual(result["updated_deals"], 1)
+        self.assertEqual(d["partner_name"], "名前のみ商店NEW")
+
     def test_create_manual_expense_saves_snapshot_and_updates_summary(self) -> None:
         with app.db_connection() as conn:
             result = app.create_manual_expense(

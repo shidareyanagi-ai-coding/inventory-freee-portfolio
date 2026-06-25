@@ -421,6 +421,74 @@ class InventoryAppTest(unittest.TestCase):
         self.assertEqual(after_ok["status"], "sent")
         self.assertEqual(after_ok["retry_count"], 1)  # 成功時はカウント据え置き
 
+    def test_build_freee_payload_includes_partner_master_id(self):
+        # Phase D⑥: payload に business_partners.id を載せる（共有ID連携の起点）。登録時の payload にも入る。
+        with app.get_conn() as conn:
+            product = self._first_product(conn)
+            res = app.create_purchase(conn, self.org_id, {
+                "product_id": product["id"], "partner_name": "共有ID仕入先", "invoice_no": "P-PM-1",
+                "transaction_date": "2026-06-01", "received_date": "2026-06-01", "quantity": 1, "unit_price": 1000,
+            })
+            bp = conn.execute(
+                "SELECT id FROM business_partners WHERE organization_id = ? AND partner_type='supplier' AND partner_name='共有ID仕入先'",
+                (self.org_id,),
+            ).fetchone()
+            payload = app.build_freee_payload(conn, self.org_id, "purchase", res["purchase_id"])
+            queue = conn.execute(
+                "SELECT payload_json FROM freee_sync_queue WHERE source_type='purchase' AND source_id=?",
+                (res["purchase_id"],),
+            ).fetchone()
+        self.assertIsNotNone(bp)
+        self.assertEqual(payload["partner_master_id"], bp["id"])
+        # add_business_partner→enqueue の順なので、登録時に積まれた payload にも id が入っている。
+        self.assertEqual(json.loads(queue["payload_json"])["partner_master_id"], bp["id"])
+
+    def test_push_partner_rename_posts_to_pseudo_freee(self):
+        # Phase D⑥: 改名を疑似freee へ push（/api/partner）。
+        captured = {}
+
+        def fake_urlopen(request, timeout):
+            captured["url"] = request.full_url
+            captured["body"] = json.loads(request.data.decode("utf-8"))
+            return FakeResponse({"ok": True, "updated_deals": 3})
+
+        with patch("app.urllib.request.urlopen", fake_urlopen):
+            result = app.push_partner_rename(self.org_id, "supplier", 7, "旧名", "新名")
+        self.assertEqual(captured["url"], f"{app.PSEUDO_FREEE_API_URL}/api/partner")
+        self.assertEqual(captured["body"]["partner_master_id"], 7)
+        self.assertEqual(captured["body"]["old_name"], "旧名")
+        self.assertEqual(captured["body"]["new_name"], "新名")
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["updated_deals"], 3)
+
+    def test_push_partner_rename_graceful_on_connection_error(self):
+        # 疑似freee が落ちていてもローカル改名は成立。push は ok:false を返すだけ。
+        def fake_urlopen(request, timeout):
+            raise urllib.error.URLError("refused")
+
+        with patch("app.urllib.request.urlopen", fake_urlopen):
+            result = app.push_partner_rename(self.org_id, "supplier", 7, "旧名", "新名")
+        self.assertFalse(result["ok"])
+        self.assertIn("接続できません", result["error"])
+
+    def test_update_business_partner_returns_master_id(self):
+        # Phase D⑥: 改名関数は id を返す（ルートが push に使う）。HTTP はしない＝DB のみ。
+        with app.get_conn() as conn:
+            product = self._first_product(conn)
+            app.create_sale(conn, self.org_id, {
+                "product_id": product["id"], "partner_name": "改名前得意先", "invoice_no": "S-RN-1",
+                "transaction_date": "2026-06-03", "quantity": 1, "unit_price": 1500,
+            })
+            result = app.update_business_partner(conn, self.org_id, {
+                "partner_type": "customer", "old_name": "改名前得意先", "new_name": "改名後得意先",
+            })
+            bp = conn.execute(
+                "SELECT id FROM business_partners WHERE organization_id=? AND partner_type='customer' AND partner_name='改名後得意先'",
+                (self.org_id,),
+            ).fetchone()
+        self.assertEqual(result["partner_master_id"], bp["id"])
+        self.assertEqual(result["new_name"], "改名後得意先")
+
     def test_send_queue_to_pseudo_freee_rejects_sent_queue(self):
         with app.get_conn() as conn:
             product = self._first_product(conn)

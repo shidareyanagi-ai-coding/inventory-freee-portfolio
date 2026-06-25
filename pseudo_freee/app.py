@@ -900,7 +900,59 @@ def create_deal(conn: db.Connection, data: dict[str, Any]) -> tuple[int, bool]:
             for line in deal["lines"]
         ],
     )
+    # Phase D⑥: 在庫から来た取引先も payee マスタに登録（手入力経費と同様に名寄せ候補に出す）。
+    if deal["partner_name"]:
+        conn.execute(
+            "INSERT INTO pseudo_freee_payees (payee_name) VALUES (?) ON CONFLICT DO NOTHING",
+            (deal["partner_name"],),
+        )
     return deal_id, True
+
+
+def rename_partner(conn: db.Connection, data: dict[str, Any]) -> dict[str, Any]:
+    """在庫から来た取引先の改名を反映する（Phase D⑥・共有ID連携）。
+
+    送信済み deal の取引先名を直す。`partner_master_id` で確実に拾い、id 無しの旧 deal は
+    名前一致（在庫由来＝source_type purchase/sale に限定）でも拾う。payee マスタも改名する。
+    在庫が唯一の正なので受け取った新名で上書きするだけ（冪等・機械向け＝認証なし）。
+    """
+    new_name = str(data.get("new_name", "") or "").strip()
+    if not new_name:
+        raise ValueError("new_name is required")
+    old_name = str(data.get("old_name", "") or "").strip()
+    raw_id = data.get("partner_master_id")
+    partner_master_id = None if raw_id in (None, "") else to_int(raw_id, "partner_master_id")
+
+    where = (
+        "(partner_master_id IS NOT NULL AND partner_master_id = ?) "
+        "OR (partner_master_id IS NULL AND source_type IN ('purchase', 'sale') AND partner_name = ?)"
+    )
+    count_row = conn.execute(
+        f"SELECT COUNT(*) AS c FROM pseudo_freee_deals WHERE {where}",
+        (partner_master_id, old_name),
+    ).fetchone()
+    updated_deals = int(count_row["c"])
+    conn.execute(
+        f"UPDATE pseudo_freee_deals SET partner_name = ? WHERE {where}",
+        (new_name, partner_master_id, old_name),
+    )
+
+    # payee マスタも改名（UNIQUE(payee_name) 衝突を避ける）。新名が既存なら旧名を消し、無ければ改名。
+    if old_name and old_name != new_name:
+        exists_new = conn.execute(
+            "SELECT 1 FROM pseudo_freee_payees WHERE payee_name = ?", (new_name,)
+        ).fetchone()
+        if exists_new:
+            conn.execute("DELETE FROM pseudo_freee_payees WHERE payee_name = ?", (old_name,))
+        else:
+            conn.execute(
+                "UPDATE pseudo_freee_payees SET payee_name = ? WHERE payee_name = ?", (new_name, old_name)
+            )
+    else:
+        conn.execute(
+            "INSERT INTO pseudo_freee_payees (payee_name) VALUES (?) ON CONFLICT DO NOTHING", (new_name,)
+        )
+    return {"ok": True, "updated_deals": updated_deals}
 
 
 def create_manual_expense(conn: db.Connection, data: dict[str, Any]) -> dict[str, Any]:
@@ -3846,6 +3898,12 @@ class PseudoFreeeHandler(BaseHTTPRequestHandler):
                     },
                     status,
                 )
+            elif parsed.path == "/api/partner":
+                # Phase D⑥: 在庫からの取引先改名（送信済み deal の取引先名も直す）。機械向け＝認証なし。
+                data = parse_json_body(self)
+                with db_connection() as conn:
+                    result = rename_partner(conn, data)
+                self.respond_json(result, HTTPStatus.CREATED)
             elif parsed.path == "/api/manual-expenses":
                 data = parse_json_body(self)
                 with db_connection() as conn:
