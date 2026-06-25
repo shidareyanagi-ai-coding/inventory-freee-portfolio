@@ -1595,6 +1595,59 @@ def list_order_candidates(
     ]
 
 
+def order_judgement_by_model(conn: db.Connection, organization_id: int, product_id: int) -> dict[str, Any]:
+    """選択商品の発注判定を「各モデル(baseline/sarima/lightgbm)の予測」で算出して返す（需要予測レベル2）。
+
+    行＝モデル（モデル精度表と同じ MAE 昇順・★=最良）、各モデルの予測で 必要在庫／今すぐ発注量／判定 を出す。
+    現在在庫・判定の基準は forecast_simulation と同じ（リードタイム需要＝予測の最初 lead_time_days 日の合計）。
+    予測未生成のモデルは含めない（バッチ実行を促す）。運用の本命（ダッシュボードの推奨発注量）は最良モデルのまま。
+    """
+    product = get_product(conn, organization_id, product_id)  # 他テナントの product_id は 404
+    stock = stock_by_product(conn, organization_id).get(product_id, 0)
+    total_sales = active_sales_quantity(conn, organization_id, product_id, "1900-01-01", date.today().isoformat())
+    lead_days = int(product["lead_time_days"])
+    safety = int(product["safety_stock"])
+    present = {
+        row["model_name"]
+        for row in conn.execute(
+            "SELECT DISTINCT model_name FROM forecasts WHERE organization_id = ? AND product_id = ?",
+            (organization_id, product_id),
+        ).fetchall()
+    }
+    ranked = [m for m in _ranked_models(conn, organization_id) if m in present]
+    best = ranked[0] if ranked else ""
+    models = []
+    for m in ranked:
+        daily = conn.execute(
+            "SELECT predicted_quantity FROM forecasts WHERE organization_id = ? AND product_id = ? AND model_name = ? ORDER BY target_date",
+            (organization_id, product_id, m),
+        ).fetchall()
+        lead_time_demand = math.ceil(sum(max(float(r["predicted_quantity"]), 0.0) for r in daily[:lead_days]))
+        required = lead_time_demand + safety
+        order = max(required - stock, 0)
+        if total_sales == 0:
+            judgement = "データ不足"
+        elif order > 0:
+            judgement = "発注推奨"
+        else:
+            judgement = "発注不要"
+        models.append({
+            "model_name": m,
+            "lead_time_demand": lead_time_demand,
+            "required_inventory": required,
+            "recommended_order_quantity": order,
+            "judgement": judgement,
+            "is_best": m == best,
+        })
+    return {
+        "product": {"id": product["id"], "sku": product["sku"], "product_name": product["product_name"]},
+        "stock_quantity": stock,
+        "lead_time_days": lead_days,
+        "safety_stock": safety,
+        "models": models,
+    }
+
+
 # ---------------------------------------------------------------------------
 # A-5 経費キャプチャ（AI証憑入力）
 # ---------------------------------------------------------------------------
@@ -2275,6 +2328,15 @@ def api_forecast_order_candidates(
     # product_id 指定で「選択商品1件」、0 で「発注が必要な全商品」を返す。
     with get_conn() as conn:
         return list_order_candidates(conn, identity.organization_id, product_id or None)
+
+
+@app.get("/api/forecast/judgement-by-model")
+def api_forecast_judgement_by_model(
+    product_id: int = 0, identity: Identity = Depends(current_identity)
+) -> dict[str, Any]:
+    """選択商品の発注判定を3モデル(baseline/sarima/lightgbm)それぞれの予測で返す（需要予測レベル2）。"""
+    with get_conn() as conn:
+        return order_judgement_by_model(conn, identity.organization_id, product_id)
 
 
 # --- 証憑（仕入・売上請求書）参照系（A-5・全ロール可）-----------------------

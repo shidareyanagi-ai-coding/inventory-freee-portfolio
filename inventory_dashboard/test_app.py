@@ -577,6 +577,41 @@ class InventoryAppTest(unittest.TestCase):
         self.assertFalse(r_down["freee_available"])
         self.assertIsNone(r_down["all_match"])
 
+    def test_order_judgement_by_model_differs_per_model(self):
+        # 需要予測レベル2: 選択商品の発注判定を3モデルで算出。MAE昇順・★最良・モデルで必要在庫/判定が変わる。
+        from datetime import date as _date, timedelta as _td
+        with app.get_conn() as conn:
+            app.create_product(conn, self.org_id, {"sku": "JM-1", "product_name": "判定商品", "purchase_unit_price": 100, "safety_stock": 5, "lead_time_days": 3})
+            pid = conn.execute("SELECT id FROM products WHERE organization_id=? AND sku='JM-1'", (self.org_id,)).fetchone()["id"]
+            app.create_purchase(conn, self.org_id, {"product_id": pid, "partner_name": "s", "invoice_no": "JM-P", "transaction_date": "2026-06-01", "received_date": "2026-06-01", "quantity": 20, "unit_price": 100})
+            app.create_sale(conn, self.org_id, {"product_id": pid, "partner_name": "c", "invoice_no": "JM-S", "transaction_date": "2026-06-02", "quantity": 2, "unit_price": 150})
+            for mname, mae in [("baseline", 4.0), ("lightgbm", 4.1), ("sarima", 4.2)]:
+                conn.execute("INSERT INTO model_evaluations (organization_id, model_name, period, mae, mape) VALUES (?,?,?,?,?)", (self.org_id, mname, "test", mae, 50.0))
+            preds = {"baseline": [5, 5, 5], "lightgbm": [1, 1, 1], "sarima": [4, 4, 4]}
+            base = _date(2026, 7, 1)
+            for mname, vals in preds.items():
+                for i, v in enumerate(vals):
+                    conn.execute(
+                        "INSERT INTO forecasts (organization_id, product_id, target_date, model_name, predicted_quantity, lower, upper) VALUES (?,?,?,?,?,?,?)",
+                        (self.org_id, pid, (base + _td(days=i)).isoformat(), mname, v, v, v),
+                    )
+            result = app.order_judgement_by_model(conn, self.org_id, pid)
+        by = {m["model_name"]: m for m in result["models"]}
+        self.assertEqual([m["model_name"] for m in result["models"]], ["baseline", "lightgbm", "sarima"])  # MAE 昇順
+        self.assertTrue(by["baseline"]["is_best"])
+        self.assertEqual(result["product"]["product_name"], "判定商品")
+        self.assertEqual(result["stock_quantity"], 18)  # 仕入20 − 売上2
+        # baseline: ltd=15, 必要在庫=20, 発注量=max(20-18,0)=2 → 発注推奨
+        self.assertEqual(by["baseline"]["required_inventory"], 20)
+        self.assertEqual(by["baseline"]["recommended_order_quantity"], 2)
+        self.assertEqual(by["baseline"]["judgement"], "発注推奨")
+        # lightgbm: ltd=3, 必要在庫=8, 発注量=0 → 発注不要
+        self.assertEqual(by["lightgbm"]["required_inventory"], 8)
+        self.assertEqual(by["lightgbm"]["recommended_order_quantity"], 0)
+        self.assertEqual(by["lightgbm"]["judgement"], "発注不要")
+        # sarima: ltd=12, 必要在庫=17
+        self.assertEqual(by["sarima"]["required_inventory"], 17)
+
     def test_send_queue_to_pseudo_freee_rejects_sent_queue(self):
         with app.get_conn() as conn:
             product = self._first_product(conn)

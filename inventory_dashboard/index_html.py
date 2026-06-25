@@ -615,13 +615,22 @@ _INDEX_TEMPLATE = r"""
       const productId = document.getElementById("forecastProduct").value;
       const target = document.getElementById("forecastCandidates");
       if (!productId) { target.innerHTML = ""; return; }
-      const rows = await api(`/api/forecast/order-candidates?product_id=${productId}`);
-      if (!rows.length) {
+      // 3モデル(ベースライン★/LightGBM/SARIMA)を行に並べ、モデルごとの必要在庫・発注量・判定を比較表示。
+      // 左上の角セル(①)には選んだ商品名を出す（モデル精度表と行が揃う／商品列は廃止）。
+      const data = await api(`/api/forecast/judgement-by-model?product_id=${productId}`);
+      if (!data.models || !data.models.length) {
         target.innerHTML = '<p class="note">この商品の予測がまだありません。「予測バッチを実行」を押してください。</p>';
         return;
       }
-      target.innerHTML = table(["商品", "現在在庫", "必要在庫", "今すぐ発注量", "判定"],
-        rows.map(r => [`${r.sku} ${r.product_name}`, r.stock_quantity, r.required_inventory, r.recommended_order_quantity, forecastJudgement(r.judgement)]));
+      const productName = `${data.product.sku} ${data.product.product_name}`;
+      target.innerHTML = table([productName, "現在在庫", "必要在庫", "今すぐ発注量", "判定"],
+        data.models.map(m => [
+          modelLabel(m.model_name) + (m.is_best ? " ★" : ""),
+          data.stock_quantity,
+          m.required_inventory,
+          m.recommended_order_quantity,
+          forecastJudgement(m.judgement),
+        ]));
     }
 
     async function runForecastBatch() {
