@@ -544,6 +544,39 @@ class InventoryAppTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 app.push_closing_inventory(conn, self.org_id, {"period": "2026-06"})
 
+    def test_reconciliation_matches_and_detects_diff(self):
+        # Phase D⑤: 在庫の税込総額（取消除外）と疑似freee の純額を比較。一致/差分/接続不可を判定。
+        with app.get_conn() as conn:
+            conn.execute("DELETE FROM inventory_movements WHERE organization_id = ?", (self.org_id,))
+            conn.execute("DELETE FROM sales WHERE organization_id = ?", (self.org_id,))
+            conn.execute("DELETE FROM purchases WHERE organization_id = ?", (self.org_id,))
+            app.create_product(conn, self.org_id, {"sku": "RX", "product_name": "突合商品", "purchase_unit_price": 1000})
+            pid = conn.execute("SELECT id FROM products WHERE organization_id=? AND sku='RX'", (self.org_id,)).fetchone()["id"]
+            app.create_purchase(conn, self.org_id, {"product_id": pid, "partner_name": "r仕", "invoice_no": "RX-P", "transaction_date": "2026-06-10", "received_date": "2026-06-10", "quantity": 5, "unit_price": 1000, "tax_rate": 10})
+            app.create_sale(conn, self.org_id, {"product_id": pid, "partner_name": "r得", "invoice_no": "RX-S", "transaction_date": "2026-06-11", "quantity": 2, "unit_price": 2000, "tax_rate": 10})
+            # 在庫: 売上 round(2*2000*1.1)=4400 / 仕入 round(5*1000*1.1)=5500 / 期末在庫 3*1000=3000
+            with patch("app._fetch_pseudo_freee_reconciliation", lambda: {"ok": True, "sales_total": 4400.0, "purchase_total": 5500.0, "merchandise": 3000.0}):
+                r = app.reconciliation(conn, self.org_id)
+            with patch("app._fetch_pseudo_freee_reconciliation", lambda: {"ok": True, "sales_total": 0.0, "purchase_total": 5500.0, "merchandise": 3000.0}):
+                r_diff = app.reconciliation(conn, self.org_id)
+            with patch("app._fetch_pseudo_freee_reconciliation", lambda: None):
+                r_down = app.reconciliation(conn, self.org_id)
+        sales = next(x for x in r["rows"] if x["label"] == "売上高")
+        purch = next(x for x in r["rows"] if x["label"] == "仕入高")
+        merch = next(x for x in r["rows"] if x["label"].startswith("期末在庫"))
+        self.assertTrue(r["all_match"])
+        self.assertEqual((sales["inventory"], sales["freee"]), (4400.0, 4400.0))
+        self.assertEqual(purch["inventory"], 5500.0)
+        self.assertEqual(merch["inventory"], 3000.0)
+        # 売上が未送信で疑似freee に無い→差分検出
+        self.assertFalse(r_diff["all_match"])
+        s2 = next(x for x in r_diff["rows"] if x["label"] == "売上高")
+        self.assertFalse(s2["match"])
+        self.assertEqual(s2["diff"], 4400.0)
+        # 疑似freee 接続不可
+        self.assertFalse(r_down["freee_available"])
+        self.assertIsNone(r_down["all_match"])
+
     def test_send_queue_to_pseudo_freee_rejects_sent_queue(self):
         with app.get_conn() as conn:
             product = self._first_product(conn)

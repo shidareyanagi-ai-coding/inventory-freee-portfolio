@@ -373,6 +373,12 @@ _INDEX_TEMPLATE = r"""
       </div>
       <p id="closingResult" style="color:var(--muted);font-size:12px;margin:10px 0 0;"></p>
     </section>
+    <section class="panel" id="reconciliationSection">
+      <h2>🔗 会計突合（在庫 ⇄ 疑似freee） <span id="reconBadge" class="status" style="display:none;"></span></h2>
+      <p style="color:var(--muted);font-size:13px;margin:0 0 12px;">在庫の「会計に映すべき総額」と疑似freee の記帳額を突き合わせます。差分があれば未送信などのズレです（「未送信を一括送信」「期末在庫を送る」で解消）。</p>
+      <button type="button" id="reconBtn" class="secondary">在庫と疑似freee を突合する</button>
+      <div id="reconResult" style="margin-top:12px;"></div>
+    </section>
   </main>
   <script>
     const yen = new Intl.NumberFormat("ja-JP", { style: "currency", currency: "JPY", maximumFractionDigits: 0 });
@@ -1230,6 +1236,38 @@ _INDEX_TEMPLATE = r"""
         el.textContent = "計算に失敗しました: " + e.message;
       }
     });
+    // Phase D⑤: 会計突合（在庫⇄疑似freee）をオンデマンドで実行する。
+    async function runReconciliation() {
+      const el = document.getElementById("reconResult");
+      const badge = document.getElementById("reconBadge");
+      el.textContent = "突合中…";
+      let r;
+      try {
+        r = await api("/api/reconciliation");
+      } catch (e) {
+        el.textContent = "突合に失敗しました: " + e.message;
+        return;
+      }
+      if (!r.freee_available) {
+        badge.style.display = "none";
+        el.innerHTML = '<p class="error">疑似freee に接続できません。疑似freee を起動してから再度突合してください。</p>';
+        return;
+      }
+      badge.style.display = "";
+      badge.className = "status " + (r.all_match ? "match" : "danger");
+      badge.textContent = r.all_match ? "一致 ✓" : "差分あり";
+      el.innerHTML = table(["項目", "在庫", "疑似freee", "差分", "判定"],
+        r.rows.map(row => [
+          row.label,
+          yen.format(row.inventory),
+          yen.format(row.freee),
+          yen.format(row.diff),
+          row.match ? '<span class="match">✓ 一致</span>' : `<span class="status danger">✗ 差分</span>`
+        ]));
+    }
+    const reconBtn = document.getElementById("reconBtn");
+    if (reconBtn) reconBtn.addEventListener("click", runReconciliation);
+
     const closingPushBtn = document.getElementById("closingPushBtn");
     if (closingPushBtn) closingPushBtn.addEventListener("click", async () => {
       const period = (document.getElementById("closingPeriod").value || "").trim();

@@ -149,6 +149,18 @@ class PseudoFreeeAppTest(unittest.TestCase):
             result = app.upsert_closing_inventory(conn, {"period": "202607", "book_amount": 1234})
         self.assertEqual(result["physical_amount"], 1234.0)
 
+    def test_reconciliation_totals_sums_income_purchase_and_merchandise(self) -> None:
+        # Phase D⑤: 突合用の素の合計。売上高=income deal、仕入高=source_type purchase、商品=期末実地。
+        with app.db_connection() as conn:
+            app.create_deal(conn, self._deal(queue_id=201, source_id=21, master_id=1, partner_name="売A", source_type="sale"))
+            app.create_deal(conn, self._deal(queue_id=202, source_id=22, master_id=1, partner_name="仕A", source_type="purchase"))
+            app.upsert_closing_inventory(conn, {"period": "202609", "book_amount": 50000, "physical_amount": 50000})
+            totals = app.reconciliation_totals(conn)
+        # sample_deal の明細金額は 13475（売上=income / 仕入=purchase でそれぞれ計上）
+        self.assertEqual(totals["sales_total"], 13475.0)
+        self.assertEqual(totals["purchase_total"], 13475.0)
+        self.assertEqual(totals["merchandise"], 50000.0)
+
     def test_create_manual_expense_saves_snapshot_and_updates_summary(self) -> None:
         with app.db_connection() as conn:
             result = app.create_manual_expense(

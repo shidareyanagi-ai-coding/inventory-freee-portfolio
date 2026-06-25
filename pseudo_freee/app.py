@@ -1531,6 +1531,26 @@ def current_closing_period(conn: db.Connection) -> str:
     return str(row["period"]) if row else DEFAULT_CLOSING_INVENTORY[0]
 
 
+def reconciliation_totals(conn: db.Connection) -> dict[str, Any]:
+    """突合（在庫⇄会計）用の素の合計（Phase D⑤・機械向け＝認証なし）。
+
+    取消仕訳（マイナス deal）も足すので、売上高・仕入高は相殺後の純額。在庫側の「会計に映すべき
+    総額」と突き合わせ、一致を画面で証明する。商品＝期末棚卸（実地）。
+    """
+    income = conn.execute(
+        "SELECT COALESCE(SUM(amount), 0) AS t FROM pseudo_freee_deals WHERE deal_type = 'income'"
+    ).fetchone()["t"]
+    purchase = conn.execute(
+        "SELECT COALESCE(SUM(amount), 0) AS t FROM pseudo_freee_deals WHERE source_type = 'purchase'"
+    ).fetchone()["t"]
+    return {
+        "ok": True,
+        "sales_total": float(income),
+        "purchase_total": float(purchase),
+        "merchandise": float(closing_inventory_physical_amount(conn)),
+    }
+
+
 def depreciation_amount(conn: db.Connection) -> float:
     """当期の減価償却費（決算手続きで確定／上書きした額）。無ければ 0。"""
     row = conn.execute(
@@ -3853,6 +3873,10 @@ class PseudoFreeeHandler(BaseHTTPRequestHandler):
                             "balance_sheet": calculate_balance_sheet(conn),
                         }
                     )
+            elif parsed.path == "/api/reconciliation":
+                # Phase D⑤: 突合用の素の合計（在庫からサーバ間で取得）。機械向け＝認証なし。
+                with db_connection() as conn:
+                    self.respond_json(reconciliation_totals(conn))
             elif parsed.path.startswith("/deals/") and parsed.path.endswith("/edit"):
                 deal_id = to_int(parsed.path[len("/deals/"):-len("/edit")], "deal_id")
                 body = render_edit_deal(deal_id)

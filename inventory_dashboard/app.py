@@ -778,6 +778,71 @@ def push_closing_inventory(conn: db.Connection, organization_id: int, data: dict
     }
 
 
+def _fetch_pseudo_freee_reconciliation() -> dict[str, Any] | None:
+    """疑似freee の突合用合計をサーバ間で取得する（Phase D⑤）。接続不可なら None。"""
+    request = urllib.request.Request(f"{PSEUDO_FREEE_API_URL}/api/reconciliation", method="GET")
+    try:
+        with urllib.request.urlopen(request, timeout=8) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except (urllib.error.URLError, TimeoutError):
+        return None
+    return data if data.get("ok") else None
+
+
+def reconciliation(conn: db.Connection, organization_id: int) -> dict[str, Any]:
+    """在庫⇄疑似freee の突合（Phase D⑤）。在庫の「会計に映すべき総額」と疑似freee の記帳額を比較。
+
+    在庫側は取消(inventory_corrections)を除いた active な仕入/売上の税込額（build_freee_payload と同じ
+    round 計算）＋現在の期末在庫評価額。疑似freee 側は /api/reconciliation（取消仕訳で相殺後の純額）。
+    差分があれば未送信などのズレ＝「未送信を一括送信」「期末在庫を送る」で解消できる。
+    """
+    def taxed(r: dict[str, Any]) -> int:
+        return round(r["quantity"] * r["unit_price"] * (1 + r["tax_rate"] / 100))
+
+    sale_rows = conn.execute(
+        """
+        SELECT s.quantity, s.unit_price, s.tax_rate
+        FROM sales s
+        JOIN inventory_movements im ON im.source_type = 'sale' AND im.source_id = s.id
+        LEFT JOIN inventory_corrections c ON c.original_movement_id = im.id
+        WHERE s.organization_id = ? AND c.id IS NULL
+        """,
+        (organization_id,),
+    ).fetchall()
+    purchase_rows = conn.execute(
+        """
+        SELECT p.quantity, p.unit_price, p.tax_rate
+        FROM purchases p
+        JOIN inventory_movements im ON im.source_type = 'purchase' AND im.source_id = p.id
+        LEFT JOIN inventory_corrections c ON c.original_movement_id = im.id
+        WHERE p.organization_id = ? AND c.id IS NULL
+        """,
+        (organization_id,),
+    ).fetchall()
+    inv = {
+        "sales_total": float(sum(taxed(r) for r in sale_rows)),
+        "purchase_total": float(sum(taxed(r) for r in purchase_rows)),
+        "merchandise": closing_inventory_book_amount(conn, organization_id, None),
+    }
+    freee = _fetch_pseudo_freee_reconciliation()
+    labels = [("売上高", "sales_total"), ("仕入高", "purchase_total"), ("期末在庫（商品）", "merchandise")]
+    rows: list[dict[str, Any]] = []
+    all_match = True
+    for label, key in labels:
+        iv = inv[key]
+        fv = None if freee is None else float(freee.get(key, 0.0))
+        match = None if fv is None else abs(iv - fv) < 1
+        if match is False:
+            all_match = False
+        rows.append({"label": label, "inventory": iv, "freee": fv, "diff": None if fv is None else iv - fv, "match": match})
+    return {
+        "ok": True,
+        "freee_available": freee is not None,
+        "all_match": all_match if freee is not None else None,
+        "rows": rows,
+    }
+
+
 def delete_business_partner(conn: db.Connection, organization_id: int, data: dict[str, Any]) -> dict[str, Any]:
     """取引先マスタから削除する（候補リストから外す）。
 
@@ -2506,6 +2571,13 @@ def api_push_closing_inventory(data: dict[str, Any] = Depends(parse_json_body), 
             {"book_amount": result["book_amount"], "physical_amount": result["physical_amount"]},
         )
         return result
+
+
+@app.get("/api/reconciliation")
+def api_reconciliation(identity: Identity = Depends(current_identity)) -> dict[str, Any]:
+    """Phase D⑤: 在庫⇄疑似freee の突合（売上高・仕入高・期末在庫の一致/差分）。"""
+    with get_conn() as conn:
+        return reconciliation(conn, identity.organization_id)
 
 
 @app.post("/api/freee-sync-queue/status", status_code=201)
