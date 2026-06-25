@@ -611,11 +611,11 @@ class InventoryAppTest(unittest.TestCase):
         self.assertEqual(by["lightgbm"]["judgement"], "発注不要")
         # sarima: ltd=12, 必要在庫=17
         self.assertEqual(by["sarima"]["required_inventory"], 17)
-        # 同じ表に出すモデル精度(MAE/MAPE)も含まれる（model_evaluations から）。
+        # 同じ表に出すモデル精度(MAE)も含まれる（model_evaluations から・選定基準）。MAPE は出さない。
         self.assertEqual(by["baseline"]["mae"], 4.0)
         self.assertEqual(by["lightgbm"]["mae"], 4.1)
         self.assertEqual(by["sarima"]["mae"], 4.2)
-        self.assertEqual(by["baseline"]["mape"], 50.0)
+        self.assertNotIn("mape", by["baseline"])
 
     def test_send_queue_to_pseudo_freee_rejects_sent_queue(self):
         with app.get_conn() as conn:

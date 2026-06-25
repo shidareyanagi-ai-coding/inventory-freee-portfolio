@@ -321,7 +321,7 @@ _INDEX_TEMPLATE = r"""
       <div>
         <h3 class="sub">モデル比較と発注判定 <span id="forecastTargetName" style="font-weight:normal;color:var(--muted);font-size:13px;"></span></h3>
         <div id="forecastCandidates"></div>
-        <p class="note">MAE/MAPE＝直近28日ホールドアウトのバックテスト精度（全商品平均・小さいほど正確）。★＝最良モデル（ダッシュボードの推奨発注量に採用）。「現在在庫」以降は選択商品の値。</p>
+        <p class="note">MAE＝直近28日ホールドアウトの平均予測誤差（個/日・全商品平均・小さいほど正確）。★＝MAEが最小のモデル（在庫は個数で発注するため MAE で選定し、推奨発注量に採用）。「現在在庫」以降は選択商品の値。</p>
       </div>
     </section>
     <section class="bottom-grid">
@@ -601,11 +601,10 @@ _INDEX_TEMPLATE = r"""
         target.innerHTML = '<p class="note">この商品の予測がまだありません。「予測バッチを実行」を押してください。</p>';
         return;
       }
-      target.innerHTML = table(["モデル", "MAE", "MAPE", "現在在庫", "必要在庫", "今すぐ発注量", "判定"],
+      target.innerHTML = table(["モデル", "MAE", "現在在庫", "必要在庫", "今すぐ発注量", "判定"],
         data.models.map(m => [
           modelLabel(m.model_name) + (m.is_best ? " ★" : ""),
           (m.mae != null ? Number(m.mae).toFixed(2) : "—"),
-          (m.mape != null && m.mape > 0 ? Number(m.mape).toFixed(1) + "%" : "—"),
           data.stock_quantity,
           m.required_inventory,
           m.recommended_order_quantity,
