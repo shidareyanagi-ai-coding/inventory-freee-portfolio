@@ -388,6 +388,8 @@ _INDEX_TEMPLATE = r"""
     let ledgerExpanded = false;
     let currentPartners = { suppliers: [], customers: [] };
     let currentQueueRows = [];
+    let queueExpanded = false;
+    const QUEUE_COLLAPSE_LIMIT = 8;  // freee送信待ちキューが長いと縦長になるので既定で折りたたむ。
     let currentPreviewKey = null;
     const defaultPreviewText = "キューの「確認」を押すと、freee送信用の中間データを表示します。";
     for (const input of document.querySelectorAll('input[type="date"][required]')) input.value = today;
@@ -773,15 +775,28 @@ _INDEX_TEMPLATE = r"""
 
     function renderQueue(rows) {
       currentQueueRows = rows;
-      document.getElementById("queue").innerHTML = table(["ID", "元データ", "区分", "状態", "操作"],
-        rows.map(q => [
+      const collapsed = rows.length > QUEUE_COLLAPSE_LIMIT && !queueExpanded;
+      const shown = collapsed ? rows.slice(0, QUEUE_COLLAPSE_LIMIT) : rows;
+      let html = table(["ID", "元データ", "区分", "状態", "操作"],
+        shown.map(q => [
           q.id,
           queueSourceLabel(q),
           q.direction,
           queueStatusCell(q),
           queueActions(q)
         ]));
+      if (rows.length > QUEUE_COLLAPSE_LIMIT) {
+        html += collapsed
+          ? `<button type="button" class="link" onclick="toggleQueueExpanded()">残り ${rows.length - QUEUE_COLLAPSE_LIMIT} 件を表示（全${rows.length}件）</button>`
+          : `<button type="button" class="link" onclick="toggleQueueExpanded()">折りたたむ</button>`;
+      }
+      document.getElementById("queue").innerHTML = html;
       updateQueueBadge(rows);
+    }
+
+    function toggleQueueExpanded() {
+      queueExpanded = !queueExpanded;
+      renderQueue(currentQueueRows);
     }
 
     function queueStatusCell(q) {
