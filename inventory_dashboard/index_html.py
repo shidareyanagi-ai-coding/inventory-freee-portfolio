@@ -171,6 +171,7 @@ _INDEX_TEMPLATE = r"""
   </header>
   <main>
     <section class="metrics" id="metrics"></section>
+    <div id="modelWarning" style="display:none;margin:0 0 14px;padding:10px 14px;border:1px solid #f3beb7;background:#fff7f6;color:var(--danger);border-radius:8px;font-size:13px;font-weight:600;"></div>
     <section class="top-grid">
       <div class="panel">
         <h2>在庫一覧</h2>
@@ -314,7 +315,7 @@ _INDEX_TEMPLATE = r"""
           <select id="forecastProduct" onchange="onForecastProductChange()"></select>
         </label>
         <label class="inline-control">モデル
-          <select id="forecastModel" onchange="loadForecastChart()"></select>
+          <select id="forecastModel" onchange="onForecastModelChange()"></select>
         </label>
       </div>
       <div class="chart-wrap"><canvas id="forecastChart"></canvas></div>
@@ -411,9 +412,10 @@ _INDEX_TEMPLATE = r"""
     }
 
     async function loadAll() {
-      const data = await api("/api/dashboard");
+      const data = await api("/api/dashboard?model_name=" + encodeURIComponent(currentModel()));
       renderMetrics(data);
       renderProducts(data.products);
+      updateModelWarning(currentModel(), data.best_model);
       renderMonthlySummary("monthlyPurchases", data.monthly_purchases, data.monthly_purchase_total, "今月仕入 合計");
       renderMonthlySummary("monthlySales", data.monthly_sales, data.monthly_sales_total, "今月売上 合計");
       await loadForecast();
@@ -471,13 +473,14 @@ _INDEX_TEMPLATE = r"""
 
     async function loadForecast() {
       const horizon = document.getElementById("forecastHorizon").value;
-      const data = await api(`/api/forecast-simulation?horizon_days=${horizon}`);
+      const data = await api(`/api/forecast-simulation?horizon_days=${horizon}&model_name=${encodeURIComponent(currentModel())}`);
       renderForecast(data);
     }
 
     function renderForecast(data) {
+      const appliedNote = data.applied_model ? `選択モデル「${modelLabel(data.applied_model)}」` : "AIモデル（最良）";
       document.getElementById("forecastNote").textContent =
-        `AIモデル(最良)の予測で ${data.month_end} までの需要を見込み、各商品の「必要在庫」と「今すぐ発注量」を出しています。必要在庫 = リードタイム需要(入荷までに売れる予測数) + 安全在庫。今すぐ発注量 = max(必要在庫 − 現在在庫, 0)。`;
+        `${appliedNote}の予測で ${data.month_end} までの需要を見込み、各商品の「必要在庫」と「今すぐ発注量」を出しています（「採用モデル」列で商品ごとの使用モデルを確認できます）。必要在庫 = リードタイム需要(入荷までに売れる予測数) + 安全在庫。今すぐ発注量 = max(必要在庫 − 現在在庫, 0)。`;
       document.getElementById("forecastSimulation").innerHTML = table(
         ["SKU", "商品", "現在在庫", "採用モデル", "リードタイム日数", "リードタイム需要", "安全在庫", "必要在庫", "今すぐ発注量", "リードタイム判定", "月末予測販売数", "月末在庫見込み", "月末不足数", "月末判定"],
         data.rows.map(row => [
@@ -508,6 +511,40 @@ _INDEX_TEMPLATE = r"""
     let forecastChartInstance = null;
     const MODEL_LABELS = { baseline: "ベースライン", sarima: "SARIMA", lightgbm: "LightGBM" };
     function modelLabel(name) { return MODEL_LABELS[name] || name || "—"; }
+
+    // 需要予測レベル2のモデル選択（""＝自動＝最良）。在庫一覧・適正在庫シミュレーション・発注判定を駆動する。
+    function currentModel() {
+      const el = document.getElementById("forecastModel");
+      return el ? (el.value || "") : "";
+    }
+
+    // モデルを切り替えたとき：チャート＋在庫一覧／シミュレーション／発注判定／警告を選択モデルで再計算。
+    async function onForecastModelChange() {
+      await loadForecastChart();
+      await refreshModelDrivenViews();
+    }
+
+    async function refreshModelDrivenViews() {
+      const m = currentModel();
+      const data = await api("/api/dashboard?model_name=" + encodeURIComponent(m));
+      renderMetrics(data);
+      renderProducts(data.products);
+      updateModelWarning(m, data.best_model);
+      await loadForecast();
+      await loadForecastCandidates();
+    }
+
+    // 最良でないモデルを選んでいるときは赤い警告を出す（自動＝最良に戻すと消える）。
+    function updateModelWarning(selected, bestModel) {
+      const el = document.getElementById("modelWarning");
+      if (!el) return;
+      if (selected && bestModel && selected !== bestModel) {
+        el.textContent = `⚠ 現在の予測は最良モデル（${modelLabel(bestModel)}）ではありません。選択中: ${modelLabel(selected)}。在庫一覧・適正在庫シミュレーションはこのモデルで計算されています（「自動（最良）」に戻すと最適化されます）。`;
+        el.style.display = "";
+      } else {
+        el.style.display = "none";
+      }
+    }
 
     async function loadForecastML(products) {
       const select = document.getElementById("forecastProduct");
@@ -601,15 +638,19 @@ _INDEX_TEMPLATE = r"""
         target.innerHTML = '<p class="note">この商品の予測がまだありません。「予測バッチを実行」を押してください。</p>';
         return;
       }
-      target.innerHTML = table(["モデル", "MAE", "現在在庫", "必要在庫", "今すぐ発注量", "判定"],
-        data.models.map(m => [
-          modelLabel(m.model_name) + (m.is_best ? " ★" : ""),
-          (m.mae != null ? Number(m.mae).toFixed(2) : "—"),
-          data.stock_quantity,
-          m.required_inventory,
-          m.recommended_order_quantity,
-          forecastJudgement(m.judgement),
-        ]));
+      // 最良(★)行は緑で強調。最良以外を選択中ならその行を黄色＋「選択中」で示す（在庫一覧・シミュもこのモデル）。
+      const sel = currentModel();
+      const headers = ["モデル", "MAE", "現在在庫", "必要在庫", "今すぐ発注量", "判定"];
+      const body = data.models.map(m => {
+        const isSel = sel && m.model_name === sel;
+        const bg = m.is_best ? ' style="background:#eafaf1;"' : (isSel ? ' style="background:#fff8e1;"' : '');
+        const tag = m.is_best ? " ★" : (isSel ? "（選択中）" : "");
+        return `<tr${bg}><td>${modelLabel(m.model_name)}${tag}</td>`
+          + `<td>${m.mae != null ? Number(m.mae).toFixed(2) : "—"}</td>`
+          + `<td>${data.stock_quantity}</td><td>${m.required_inventory}</td>`
+          + `<td>${m.recommended_order_quantity}</td><td>${forecastJudgement(m.judgement)}</td></tr>`;
+      }).join("");
+      target.innerHTML = `<table><thead><tr>${headers.map(h => `<th>${h}</th>`).join("")}</tr></thead><tbody>${body}</tbody></table>`;
     }
 
     async function runForecastBatch() {

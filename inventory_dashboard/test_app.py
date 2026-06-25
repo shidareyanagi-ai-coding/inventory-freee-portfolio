@@ -617,6 +617,43 @@ class InventoryAppTest(unittest.TestCase):
         self.assertEqual(by["sarima"]["mae"], 4.2)
         self.assertNotIn("mape", by["baseline"])
 
+    def test_forecast_simulation_and_dashboard_respect_model_name(self):
+        # モデル選択を在庫一覧・適正在庫シミュレーションに反映（探索モード）。best_model も返す。
+        from datetime import date as _date, timedelta as _td
+        with app.get_conn() as conn:
+            conn.execute("DELETE FROM inventory_movements WHERE organization_id = ?", (self.org_id,))
+            conn.execute("DELETE FROM sales WHERE organization_id = ?", (self.org_id,))
+            conn.execute("DELETE FROM purchases WHERE organization_id = ?", (self.org_id,))
+            conn.execute("DELETE FROM products WHERE organization_id = ?", (self.org_id,))
+            app.create_product(conn, self.org_id, {"sku": "MM-1", "product_name": "モデル商品", "purchase_unit_price": 100, "safety_stock": 5, "lead_time_days": 3})
+            pid = conn.execute("SELECT id FROM products WHERE organization_id=? AND sku='MM-1'", (self.org_id,)).fetchone()["id"]
+            app.create_purchase(conn, self.org_id, {"product_id": pid, "partner_name": "s", "invoice_no": "MM-P", "transaction_date": "2026-06-01", "received_date": "2026-06-01", "quantity": 20, "unit_price": 100})
+            app.create_sale(conn, self.org_id, {"product_id": pid, "partner_name": "c", "invoice_no": "MM-S", "transaction_date": "2026-06-02", "quantity": 2, "unit_price": 150})
+            for mname, mae in [("baseline", 4.0), ("lightgbm", 4.1), ("sarima", 4.2)]:
+                conn.execute("INSERT INTO model_evaluations (organization_id, model_name, period, mae, mape) VALUES (?,?,?,?,?)", (self.org_id, mname, "t", mae, 50.0))
+            preds = {"baseline": [5, 5, 5], "lightgbm": [1, 1, 1], "sarima": [4, 4, 4]}
+            base = _date(2026, 7, 1)
+            for mname, vals in preds.items():
+                for i, v in enumerate(vals):
+                    conn.execute("INSERT INTO forecasts (organization_id, product_id, target_date, model_name, predicted_quantity, lower, upper) VALUES (?,?,?,?,?,?,?)", (self.org_id, pid, (base + _td(days=i)).isoformat(), mname, v, v, v))
+            sim_auto = app.forecast_simulation(conn, self.org_id, 30)
+            sim_lgbm = app.forecast_simulation(conn, self.org_id, 30, "lightgbm")
+            dash_lgbm = app.dashboard(conn, self.org_id, "lightgbm")
+            dash_auto = app.dashboard(conn, self.org_id)
+        row_auto = next(r for r in sim_auto["rows"] if r["sku"] == "MM-1")
+        row_lgbm = next(r for r in sim_lgbm["rows"] if r["sku"] == "MM-1")
+        # 自動=最良(baseline): ltd=15, 必要在庫=20。lightgbm: ltd=3, 必要在庫=8。
+        self.assertEqual(row_auto["required_inventory"], 20)
+        self.assertEqual(row_auto["model"], "baseline")
+        self.assertEqual(row_lgbm["required_inventory"], 8)
+        self.assertEqual(row_lgbm["model"], "lightgbm")
+        # 在庫一覧(dashboard)の必要水準も選択モデルで計算。best_model/applied_model を返す。
+        p_lgbm = next(p for p in dash_lgbm["products"] if p["sku"] == "MM-1")
+        self.assertEqual(p_lgbm["required_stock_level"], 8)
+        self.assertEqual(dash_lgbm["best_model"], "baseline")
+        self.assertEqual(dash_lgbm["applied_model"], "lightgbm")
+        self.assertEqual(dash_auto["applied_model"], "")
+
     def test_send_queue_to_pseudo_freee_rejects_sent_queue(self):
         with app.get_conn() as conn:
             product = self._first_product(conn)

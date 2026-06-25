@@ -1166,7 +1166,7 @@ def get_product(conn: db.Connection, organization_id: int, product_id: int) -> d
     return product
 
 
-def dashboard(conn: db.Connection, organization_id: int) -> dict[str, Any]:
+def dashboard(conn: db.Connection, organization_id: int, model_name: str = "") -> dict[str, Any]:
     products = list_products(conn, organization_id)
     total_stock_value = sum(product["stock_value"] for product in products)
     recent_movements = conn.execute(
@@ -1229,7 +1229,7 @@ def dashboard(conn: db.Connection, organization_id: int) -> dict[str, Any]:
         """,
         (organization_id, month_start, today_text),
     ).fetchone()["total"]
-    forecast = forecast_simulation(conn, organization_id, 30)
+    forecast = forecast_simulation(conn, organization_id, 30, model_name)
     forecast_by_sku = {row["sku"]: row for row in forecast["rows"]}
     for product in products:
         forecast_row = forecast_by_sku.get(product["sku"])
@@ -1245,6 +1245,10 @@ def dashboard(conn: db.Connection, organization_id: int) -> dict[str, Any]:
             product["status"] = "必要水準割れ"
         else:
             product["status"] = "正常"
+    best_row = conn.execute(
+        "SELECT model_name FROM model_evaluations WHERE organization_id = ? ORDER BY mae ASC LIMIT 1",
+        (organization_id,),
+    ).fetchone()
     return {
         "total_stock_value": total_stock_value,
         "product_count": len(products),
@@ -1257,6 +1261,9 @@ def dashboard(conn: db.Connection, organization_id: int) -> dict[str, Any]:
         "monthly_sales": monthly_sales,
         "products": products,
         "recent_movements": recent_movements,
+        # Phase: モデル選択の探索モード用。最良モデル名（無ければ""）と、今回計算に使ったモデル名（""=自動）。
+        "best_model": best_row["model_name"] if best_row else "",
+        "applied_model": model_name if model_name in {"baseline", "sarima", "lightgbm"} else "",
     }
 
 
@@ -1303,7 +1310,7 @@ def _ai_daily_forecast(
     return model, [(r["target_date"], max(float(r["predicted_quantity"]), 0.0)) for r in rows]
 
 
-def forecast_simulation(conn: db.Connection, organization_id: int, horizon_days: int = 30) -> dict[str, Any]:
+def forecast_simulation(conn: db.Connection, organization_id: int, horizon_days: int = 30, model_name: str = "") -> dict[str, Any]:
     if horizon_days not in {30, 60, 90}:
         horizon_days = 30
 
@@ -1313,7 +1320,10 @@ def forecast_simulation(conn: db.Connection, organization_id: int, horizon_days:
     month_end = date(today.year, today.month, monthrange(today.year, today.month)[1])
     days_to_month_end = max((month_end - today).days + 1, 0)
     products = list_products(conn, organization_id)
-    ranked_models = _ranked_models(conn, organization_id)
+    # model_name 指定時はそのモデルで一本化（探索モード）。未指定/不正は従来どおり最良モデル（自動）。
+    # 指定モデルの予測がその商品に無ければ _ai_daily_forecast が ("", []) を返し簡易計算にフォールバックする。
+    model_name = model_name if model_name in {"baseline", "sarima", "lightgbm"} else ""
+    ranked_models = [model_name] if model_name else _ranked_models(conn, organization_id)
     rows = []
 
     for product in products:
@@ -2281,9 +2291,9 @@ def launcher() -> str:
 
 # --- 参照系 API（認証必須・全ロール可）-------------------------------------
 @app.get("/api/dashboard")
-def api_dashboard(identity: Identity = Depends(current_identity)) -> dict[str, Any]:
+def api_dashboard(model_name: str = "", identity: Identity = Depends(current_identity)) -> dict[str, Any]:
     with get_conn() as conn:
-        return dashboard(conn, identity.organization_id)
+        return dashboard(conn, identity.organization_id, model_name)
 
 
 @app.get("/api/products")
@@ -2299,9 +2309,9 @@ def api_business_partners(identity: Identity = Depends(current_identity)) -> dic
 
 
 @app.get("/api/forecast-simulation")
-def api_forecast_simulation(horizon_days: int = 30, identity: Identity = Depends(current_identity)) -> dict[str, Any]:
+def api_forecast_simulation(horizon_days: int = 30, model_name: str = "", identity: Identity = Depends(current_identity)) -> dict[str, Any]:
     with get_conn() as conn:
-        return forecast_simulation(conn, identity.organization_id, horizon_days)
+        return forecast_simulation(conn, identity.organization_id, horizon_days, model_name)
 
 
 # --- 需要予測レベル2（A-4）------------------------------------------------
