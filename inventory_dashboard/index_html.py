@@ -309,7 +309,12 @@ _INDEX_TEMPLATE = r"""
         <h2>需要予測レベル2（実績×予測）</h2>
         <button type="button" id="runForecastBtn" onclick="runForecastBatch()">予測バッチを実行</button>
       </div>
-      <p class="note" id="forecastMlNote">baseline / SARIMA / LightGBM をバックテスト(MAE/MAPE)で比較し、実績線＋予測線＋信頼区間(80%)を表示します。「予測バッチを実行」で再計算します。</p>
+      <p class="note" id="forecastMlNote">baseline / SARIMA / LightGBM の精度(MAE)を比較し、実績線＋予測線＋信頼区間(80%)を表示します。</p>
+      <div class="note" style="background:#f4f7fb;border:1px solid var(--line);border-radius:8px;padding:10px 12px;margin:0 0 12px;">
+        <strong>「予測バッチを実行」とは？</strong>＝機械学習の再計算ボタンです（重い処理なので画面表示とは分けています）。
+        <br>・<b>いつ押す</b>: 売上を登録した／需要履歴CSVを取り込んだ／クリーンスタートした後など、<b>データが変わったとき</b>。押すまでは前回の結果のまま（未計算の商品は簡易計算）。
+        <br>・<b>何をする</b>: 現在の需要データで3モデルを学習し、①未来の需要予測（チャートの予測線）②バックテスト（直近28日で精度MAEを測り<b>最良モデル★を決定</b>）③各商品の必要在庫・推奨発注量、をまとめて更新します。
+      </div>
       <div class="forecast-controls">
         <label class="inline-control">商品
           <select id="forecastProduct" onchange="onForecastProductChange()"></select>
