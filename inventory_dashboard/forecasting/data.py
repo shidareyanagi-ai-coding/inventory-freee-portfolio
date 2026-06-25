@@ -17,21 +17,27 @@ import db
 def load_demand_series(conn: Any, organization_id: int, product_id: int) -> pd.Series:
     """商品の日次実績需要を連続日次の pd.Series（欠損日は 0）で返す。
 
-    空（売上ゼロ）なら空 Series。index は DatetimeIndex（freq='D'）。
+    需要 = 実 sales（取消除外）＋ demand_history（CSV取込などの予測専用履歴）の合算（Phase D⑤）。
+    CSV取込は demand_history に入る＝実取引台帳/会計とは分離（二重計上しない）。
+    空（需要ゼロ）なら空 Series。index は DatetimeIndex（freq='D'）。
     """
     rows = conn.execute(
         """
-        SELECT s.transaction_date AS d, COALESCE(SUM(s.quantity), 0) AS qty
-        FROM sales s
-        JOIN inventory_movements im ON im.source_type = 'sale' AND im.source_id = s.id
-        LEFT JOIN inventory_corrections c ON c.original_movement_id = im.id
-        WHERE s.organization_id = ?
-          AND s.product_id = ?
-          AND c.id IS NULL
-        GROUP BY s.transaction_date
-        ORDER BY s.transaction_date
+        SELECT d, SUM(qty) AS qty FROM (
+            SELECT s.transaction_date AS d, s.quantity AS qty
+            FROM sales s
+            JOIN inventory_movements im ON im.source_type = 'sale' AND im.source_id = s.id
+            LEFT JOIN inventory_corrections c ON c.original_movement_id = im.id
+            WHERE s.organization_id = ? AND s.product_id = ? AND c.id IS NULL
+            UNION ALL
+            SELECT dh.demand_date AS d, dh.quantity AS qty
+            FROM demand_history dh
+            WHERE dh.organization_id = ? AND dh.product_id = ?
+        ) t
+        GROUP BY d
+        ORDER BY d
         """,
-        (organization_id, product_id),
+        (organization_id, product_id, organization_id, product_id),
     ).fetchall()
     if not rows:
         return pd.Series(dtype="float64")

@@ -203,7 +203,25 @@
 
 ## Phase D — 在庫⇄会計の整合性強化（API連携の完成）
 
-> **状態: 方向性のみ承認（2026-06-24・ユーザ選択=案①）。実装は Phase C を main マージ後に新フェーズとして着手。** 目的は「実務で使える在庫＋会計ソフト」として、**在庫の全取引を会計側が漏れなく忠実に映し、両者が常に一致する**こと。
+> **状態: 確定設計を承認・実装着手（2026-06-25・ユーザ選択=案①）。実装ブランチ `feature/phase-d-integration`（基点 6734cc7=main）。** 目的は「実務で使える在庫＋会計ソフト」として、**在庫の全取引を会計側が漏れなく忠実に映し、両者が常に一致する**こと。ライブ(Render/Neon)反映は最終段階(D-6)・ユーザの合図で。
+
+### 確定設計とサブステップ（2026-06-25 ユーザ承認・実装中）
+
+**設計の分岐（ユーザ承認済）**
+- **⑤ CSV分離 = 需要履歴の専用テーブル新設**。新テーブル `demand_history`（予測専用）を作り、CSV取込はそこだけに入れる。`sales`/`inventory_movements`/`freee_sync_queue` には流さない。予測 `forecasting/data.py` は `demand_history`（＋実 `sales`）を読む。これで**実取引台帳が常にクリーン＝突合④を緑にできる**。A-9 の「CSV=実運用データ投入」挙動は**予測用シミュレーションに役割変更**（現ライブのデモ売上はサンプル実取引 D-6 で作り直す）。
+- **⑥ 取引先マスタ = 共有ID連携**。在庫 `business_partners.id` を payload の `partner_master_id`（疑似freee `pseudo_freee_deals` に**既存の空き列**）へ載せる。疑似freee は deal に id を保存＋payee マスタを id 付きで upsert。在庫で改名したら**id ベースで送信済み deal の取引先名も一括更新**（新エンドポイント `/api/partner`）。安定IDなので改名・名寄せに強い。
+- **① 確実な送信 = 一括送信＋リトライ＋未送信バッジ（自動push無し）**。Outbox を人がドレインする形を維持（「下書き=システム/確定=人」）。「未送信 N件」を目立たせ、ワンクリックで全 pending/failed を送信、失敗はリトライ回数付きで再送。登録時の同期自動pushは採らない（疑似freee=別Renderサービスのコールドスタートに登録が引きずられる/人の確定が消えるため）。
+
+**サブステップと実装順**（各単位でテスト緑＆コミット可能に）
+- **D-0 設計の正本化**: 本節（このドキュメント追記）。
+- **D-1 CSV＝予測用 / 実取引台帳 の分離（⑤）**: `demand_history` テーブル新設（両DDL＋clear_organization_data）。`import_sales_history` を `demand_history` 書き込みへ変更（sales/inventory_movements/freee には書かない）。`forecasting/data.py` を `demand_history` 主体に。CSV取込UIの文言を「予測用シミュレーションデータ」に。**受け入れ**: CSV取込後、在庫元帳/会計KPIは不変・予測グラフだけ伸びる。
+- **D-2 確実な送信（①）**: 未送信件数の集計＋「未送信 N件 一括送信」ルート/ボタン、`freee_sync_queue` にリトライ回数列、failed の自動リトライ。**受け入れ**: 仕入/売上を複数登録→1クリックで全送信、疑似freee停止時はfailed＋件数表示、復帰後リトライで送信。
+- **D-3 取引先マスタの整合（⑥）**: `build_freee_payload` に `partner_master_id`（business_partners.id をnameで解決）を載せる。疑似freee `create_deal` で payee マスタ upsert＋deal に id 保存。新 `/api/partner`（upsert payee＋`UPDATE deals SET partner_name WHERE partner_master_id=?`）。在庫 `update_business_partner` から疑似freee へ改名push。**受け入れ**: 送信後に在庫で改名→疑似freeeの該当deal名も直る。
+- **D-4 期末棚卸連携（③＝Phase B）**: 疑似freee に `upsert_closing_inventory`＋`/api/closing-inventory`。在庫に `stock_by_product` の as_of、`closing_inventory_book_amount`、`push_closing_inventory`、`/api/closing-inventory/push`、UIパネル。`freee_sync_queue` 経由（source_type='closing_inventory'）。**受け入れ**: 在庫の期末評価額→疑似freeeの `商品`＝期末額・BS一致。
+- **D-5 突合ビュー（④）**: 在庫側に「会計突合」ビュー。在庫の 売上合計/仕入合計/期末在庫 と 疑似freee の 売上高/仕入高/商品 をAPIで取得し並べ、一致＝✓・不一致＝差分表示。**受け入れ**: D-1〜D-4 後に全項目✓。未送信や乖離があれば差分が出る。
+- **D-6 サンプルデータ整備**: ローカルで「約1ヶ月の実取引（会計用・在庫⇄会計一致）」＋「長い日次需要履歴（予測用＝`demand_history`）」を分離生成→一致を検証→**最後にユーザの合図でライブ(Render/Neon)へ**。リセットは1回だけ。
+
+
 
 ### 背景（2026-06-24 のユーザ問い合わせで顕在化）
 - 在庫(`inventory.db`)と疑似freee(`pseudo_freee.db`)は**別データベース**で、同期するのは「freee送信」した取引だけ。全件ミラーではない。

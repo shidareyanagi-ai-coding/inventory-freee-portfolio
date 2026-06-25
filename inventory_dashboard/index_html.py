@@ -344,8 +344,8 @@ _INDEX_TEMPLATE = r"""
       <p style="color:var(--muted);font-size:13px;margin:0 0 12px;">デモではなく、実際の過去データで使うための機能です。</p>
       <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:16px;">
         <div style="border:1px solid var(--line);border-radius:8px;padding:14px;">
-          <h3 style="margin:0 0 6px;font-size:14px;">① 過去の売上を CSV で一括取込</h3>
-          <p style="color:var(--muted);font-size:12px;margin:0 0 10px;">列: <code>date,sku,product_name,quantity,unit_price</code>（1行目に列名）。取込後、下の「需要予測レベル2」で <b>予測バッチを実行</b> すると実データで予測します。</p>
+          <h3 style="margin:0 0 6px;font-size:14px;">① 需要履歴を CSV で一括取込（予測用）</h3>
+          <p style="color:var(--muted);font-size:12px;margin:0 0 10px;">列: <code>date,sku,product_name,quantity,unit_price</code>（1行目に列名）。<b>予測専用の需要履歴</b>として取り込みます（在庫元帳・会計には計上しません＝二重計上なし）。取込後、下の「需要予測レベル2」で <b>予測バッチを実行</b>。再取込は置き換えになります。</p>
           <input type="file" id="salesCsvFile" accept=".csv,text/csv" style="display:block;margin-bottom:8px;">
           <button type="button" id="salesCsvImportBtn" class="secondary">CSV を取り込む</button>
           <p id="salesCsvResult" style="color:var(--muted);font-size:12px;margin:8px 0 0;"></p>
@@ -1127,11 +1127,11 @@ _INDEX_TEMPLATE = r"""
         return;
       }
       // ここに来たら取込API自体は成功（DBに入っている）。以降の画面再描画が失敗しても「取込失敗」とは出さない。
-      let msg = `取込 ${r.imported}件・新規商品 ${r.created_products}件・スキップ ${r.skipped}件。`;
+      let msg = `需要履歴に取込 ${r.imported}件・新規商品 ${r.created_products}件・スキップ ${r.skipped}件（予測用。在庫元帳・会計には計上しません）。`;
       if (r.errors && r.errors.length) {
         msg += " 例: " + r.errors.slice(0, 3).map(e => `${e.line}行目(${e.error})`).join(" / ");
       }
-      msg += " → 下の「需要予測レベル2」で『予測バッチを実行』すると実データ予測になります。";
+      msg += " → 下の「需要予測レベル2」で『予測バッチを実行』すると予測に反映されます。";
       resultEl.textContent = msg;
       try {
         await loadAll();

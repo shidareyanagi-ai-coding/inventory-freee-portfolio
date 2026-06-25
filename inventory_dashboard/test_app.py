@@ -82,6 +82,81 @@ class InventoryAppTest(unittest.TestCase):
         self.assertEqual(summary["skipped"], 3)
         self.assertEqual(len(summary["errors"]), 3)
 
+    def test_import_sales_history_does_not_touch_ledger(self):
+        # Phase D(⑤): CSV取込は demand_history にだけ入る。sales/inventory_movements/freee には書かない。
+        csv = (
+            "date,sku,product_name,quantity,unit_price\n"
+            "2026-03-01,SKU-DH,需要商品,4,1200\n"
+            "2026-03-02,SKU-DH,需要商品,6,1200\n"
+        )
+        with app.get_conn() as conn:
+            sales_before = conn.execute(
+                "SELECT COUNT(*) AS c FROM sales WHERE organization_id = ?", (self.org_id,)
+            ).fetchone()["c"]
+            moves_before = conn.execute(
+                "SELECT COUNT(*) AS c FROM inventory_movements WHERE organization_id = ?", (self.org_id,)
+            ).fetchone()["c"]
+            queue_before = conn.execute(
+                "SELECT COUNT(*) AS c FROM freee_sync_queue WHERE organization_id = ?", (self.org_id,)
+            ).fetchone()["c"]
+            summary = app.import_sales_history(conn, self.org_id, csv)
+            sales_after = conn.execute(
+                "SELECT COUNT(*) AS c FROM sales WHERE organization_id = ?", (self.org_id,)
+            ).fetchone()["c"]
+            moves_after = conn.execute(
+                "SELECT COUNT(*) AS c FROM inventory_movements WHERE organization_id = ?", (self.org_id,)
+            ).fetchone()["c"]
+            queue_after = conn.execute(
+                "SELECT COUNT(*) AS c FROM freee_sync_queue WHERE organization_id = ?", (self.org_id,)
+            ).fetchone()["c"]
+            dh = conn.execute(
+                "SELECT COUNT(*) AS c, COALESCE(SUM(quantity), 0) AS q "
+                "FROM demand_history WHERE organization_id = ? AND source = 'csv'",
+                (self.org_id,),
+            ).fetchone()
+        self.assertEqual(summary["imported"], 2)
+        self.assertEqual(sales_after, sales_before)   # 売上台帳は不変
+        self.assertEqual(moves_after, moves_before)   # 在庫元帳は不変
+        self.assertEqual(queue_after, queue_before)   # freee 連携キューも不変
+        self.assertEqual(dh["c"], 2)                  # 需要履歴に2件
+        self.assertEqual(int(dh["q"]), 10)            # 数量合計 4+6
+
+    def test_import_sales_history_idempotent_replace(self):
+        # Phase D(⑤): 同じ CSV を2回取り込んでも demand_history は二重にならない（source='csv' 置換）。
+        csv = (
+            "date,sku,product_name,quantity,unit_price\n"
+            "2026-03-01,SKU-DH2,需要商品2,4,1000\n"
+            "2026-03-02,SKU-DH2,需要商品2,6,1000\n"
+        )
+        with app.get_conn() as conn:
+            app.import_sales_history(conn, self.org_id, csv)
+            app.import_sales_history(conn, self.org_id, csv)
+            dh = conn.execute(
+                "SELECT COUNT(*) AS c FROM demand_history WHERE organization_id = ? AND source = 'csv'",
+                (self.org_id,),
+            ).fetchone()["c"]
+            products = conn.execute(
+                "SELECT COUNT(*) AS c FROM products WHERE organization_id = ? AND sku = 'SKU-DH2'",
+                (self.org_id,),
+            ).fetchone()["c"]
+        self.assertEqual(dh, 2)        # 二重取込でも2件のまま（置換）
+        self.assertEqual(products, 1)  # 商品も重複作成しない（sku で照合）
+
+    def test_clear_organization_data_clears_demand_history(self):
+        # Phase D(⑤): クリーンスタートで需要履歴も消える。
+        csv = "date,sku,product_name,quantity,unit_price\n2026-03-01,SKU-CLR,消す商品,3,500\n"
+        with app.get_conn() as conn:
+            app.import_sales_history(conn, self.org_id, csv)
+            before = conn.execute(
+                "SELECT COUNT(*) AS c FROM demand_history WHERE organization_id = ?", (self.org_id,)
+            ).fetchone()["c"]
+            self.assertGreater(before, 0)
+            app.db.clear_organization_data(conn, self.org_id)
+            after = conn.execute(
+                "SELECT COUNT(*) AS c FROM demand_history WHERE organization_id = ?", (self.org_id,)
+            ).fetchone()["c"]
+        self.assertEqual(after, 0)
+
     def test_clear_organization_data_empties_but_keeps_account(self):
         # A-9 クリーンスタート: 業務データは全消去・組織(アカウント)は残る。
         with app.get_conn() as conn:
