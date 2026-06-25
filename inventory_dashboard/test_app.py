@@ -349,6 +349,78 @@ class InventoryAppTest(unittest.TestCase):
         self.assertEqual(updated["status"], "failed")
         self.assertIn("疑似freeeに接続できません", updated["sync_error_message"])
 
+    def test_send_all_pending_queue_sends_all_pending(self):
+        # Phase D①: 未送信(pending/failed/retry)を一括送信。全部 sent になり remaining=0。
+        deal = {"n": 100}
+
+        def fake_urlopen(request, timeout):
+            deal["n"] += 1
+            return FakeResponse({"ok": True, "pseudo_freee_deal_id": deal["n"], "duplicate": False})
+
+        with app.get_conn() as conn:
+            conn.execute("DELETE FROM freee_sync_queue WHERE organization_id = ?", (self.org_id,))
+            product = self._first_product(conn)
+            app.create_purchase(conn, self.org_id, {
+                "product_id": product["id"], "partner_name": "仕入先A", "invoice_no": "P-ALL-1",
+                "transaction_date": "2026-06-01", "received_date": "2026-06-01", "quantity": 2, "unit_price": 500,
+            })
+            app.create_purchase(conn, self.org_id, {
+                "product_id": product["id"], "partner_name": "仕入先A", "invoice_no": "P-ALL-2",
+                "transaction_date": "2026-06-02", "received_date": "2026-06-02", "quantity": 1, "unit_price": 800,
+            })
+            app.create_sale(conn, self.org_id, {
+                "product_id": product["id"], "partner_name": "得意先B", "invoice_no": "S-ALL-1",
+                "transaction_date": "2026-06-03", "quantity": 1, "unit_price": 1500,
+            })
+            self.assertEqual(app.count_unsent_queue(conn, self.org_id), 3)
+            with patch("app.urllib.request.urlopen", fake_urlopen):
+                result = app.send_all_pending_queue(conn, self.org_id)
+            statuses = [
+                r["status"] for r in conn.execute(
+                    "SELECT status FROM freee_sync_queue WHERE organization_id = ?", (self.org_id,)
+                ).fetchall()
+            ]
+        self.assertEqual(result["attempted"], 3)
+        self.assertEqual(result["sent"], 3)
+        self.assertEqual(result["failed"], 0)
+        self.assertEqual(result["remaining_unsent"], 0)
+        self.assertTrue(all(s == "sent" for s in statuses))
+
+    def test_send_all_queue_failure_then_retry_increments_count(self):
+        # Phase D①: 疑似freee 停止中は failed＋retry_count++、復帰後に再度一括送信で sent。
+        def failing_urlopen(request, timeout):
+            raise urllib.error.URLError("connection refused")
+
+        def ok_urlopen(request, timeout):
+            return FakeResponse({"ok": True, "pseudo_freee_deal_id": 555, "duplicate": False})
+
+        with app.get_conn() as conn:
+            conn.execute("DELETE FROM freee_sync_queue WHERE organization_id = ?", (self.org_id,))
+            product = self._first_product(conn)
+            app.create_purchase(conn, self.org_id, {
+                "product_id": product["id"], "partner_name": "仕入先C", "invoice_no": "P-RETRY",
+                "transaction_date": "2026-06-01", "received_date": "2026-06-01", "quantity": 1, "unit_price": 1000,
+            })
+            with patch("app.urllib.request.urlopen", failing_urlopen):
+                first = app.send_all_pending_queue(conn, self.org_id)
+            after_fail = conn.execute(
+                "SELECT status, retry_count FROM freee_sync_queue WHERE organization_id = ?", (self.org_id,)
+            ).fetchone()
+            with patch("app.urllib.request.urlopen", ok_urlopen):
+                second = app.send_all_pending_queue(conn, self.org_id)
+            after_ok = conn.execute(
+                "SELECT status, retry_count FROM freee_sync_queue WHERE organization_id = ?", (self.org_id,)
+            ).fetchone()
+        self.assertEqual(first["sent"], 0)
+        self.assertEqual(first["failed"], 1)
+        self.assertEqual(after_fail["status"], "failed")
+        self.assertEqual(after_fail["retry_count"], 1)
+        self.assertEqual(second["sent"], 1)
+        self.assertEqual(second["failed"], 0)
+        self.assertEqual(second["remaining_unsent"], 0)
+        self.assertEqual(after_ok["status"], "sent")
+        self.assertEqual(after_ok["retry_count"], 1)  # 成功時はカウント据え置き
+
     def test_send_queue_to_pseudo_freee_rejects_sent_queue(self):
         with app.get_conn() as conn:
             product = self._first_product(conn)

@@ -221,6 +221,12 @@
 - **D-5 突合ビュー（④）**: 在庫側に「会計突合」ビュー。在庫の 売上合計/仕入合計/期末在庫 と 疑似freee の 売上高/仕入高/商品 をAPIで取得し並べ、一致＝✓・不一致＝差分表示。**受け入れ**: D-1〜D-4 後に全項目✓。未送信や乖離があれば差分が出る。
 - **D-6 サンプルデータ整備**: ローカルで「約1ヶ月の実取引（会計用・在庫⇄会計一致）」＋「長い日次需要履歴（予測用＝`demand_history`）」を分離生成→一致を検証→**最後にユーザの合図でライブ(Render/Neon)へ**。リセットは1回だけ。
 
+**実装進捗（2026-06-25・ブランチ feature/phase-d-integration・未push）**
+- **D-0 完了**: 本節を追記。
+- **D-1 完了**（commit f837314）: `demand_history` 新設、CSV取込を予測専用化（sales/在庫元帳/freeeに書かない・冪等置換）、予測リーダー2か所を 実sales＋demand_history 合算に。在庫 68 passed。
+- **D-2 完了**: `freee_sync_queue.retry_count` 追加（両DDL＋既存DB用に `ensure_schema_upgrades` で ALTER）、`count_unsent_queue`／`send_all_pending_queue`／`POST /api/freee-sync-queue/send-all`、`fail_queue_send` で失敗ごとに retry_count++。UI に「未送信 N件」バッジ＋「未送信を一括送信」ボタン＋失敗回数表示。在庫 70 passed＋ローカル実機（両サーバ起動）で 登録→未送信2件→一括送信→送信済み を確認。自動push は不採用（人が確定を維持）。
+- 次=**D-3 取引先マスタの整合（⑥・共有ID連携）**。
+
 
 
 ### 背景（2026-06-24 のユーザ問い合わせで顕在化）

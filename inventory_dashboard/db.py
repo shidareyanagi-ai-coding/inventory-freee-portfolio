@@ -176,6 +176,7 @@ CREATE TABLE IF NOT EXISTS freee_sync_queue (
     payload_json TEXT NOT NULL,
     external_accounting_id TEXT NOT NULL DEFAULT '',
     sync_error_message TEXT NOT NULL DEFAULT '',
+    retry_count INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(source_type, source_id)
@@ -402,6 +403,7 @@ CREATE TABLE IF NOT EXISTS freee_sync_queue (
     payload_json TEXT NOT NULL,
     external_accounting_id TEXT NOT NULL DEFAULT '',
     sync_error_message TEXT NOT NULL DEFAULT '',
+    retry_count INTEGER NOT NULL DEFAULT 0,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(source_type, source_id)

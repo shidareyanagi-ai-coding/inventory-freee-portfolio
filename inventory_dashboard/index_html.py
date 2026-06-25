@@ -331,7 +331,11 @@ _INDEX_TEMPLATE = r"""
     </section>
     <section class="bottom-grid">
       <div class="summary-box">
-        <h2>freee送信待ちキュー</h2>
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;margin-bottom:8px;">
+          <h2 style="margin:0;">freee送信待ちキュー <span id="queueUnsentBadge" class="status danger" style="display:none;"></span></h2>
+          <button type="button" id="sendAllBtn" class="warning" onclick="sendAllToPseudoFreee()" style="font-size:13px;padding:5px 12px;">未送信を一括送信</button>
+        </div>
+        <p style="color:var(--muted);font-size:12px;margin:0 0 8px;">登録は自動でキューに積まれます。<b>未送信を一括送信</b>でまとめて疑似freeeへ。失敗は再度押せばリトライします。</p>
         <div id="queue"></div>
       </div>
       <div class="summary-box">
@@ -749,9 +753,28 @@ _INDEX_TEMPLATE = r"""
           q.id,
           queueSourceLabel(q),
           q.direction,
-          q.sync_error_message ? `${q.status}<br><span class="error">${q.sync_error_message}</span>` : q.status,
+          queueStatusCell(q),
           queueActions(q)
         ]));
+      updateQueueBadge(rows);
+    }
+
+    function queueStatusCell(q) {
+      let s = q.status;
+      if (q.retry_count > 0) s += ` <span style="color:var(--muted)">(失敗${q.retry_count}回)</span>`;
+      if (q.sync_error_message) s += `<br><span class="error">${q.sync_error_message}</span>`;
+      return s;
+    }
+
+    function updateQueueBadge(rows) {
+      const unsent = rows.filter(q => ["pending", "failed", "retry"].includes(q.status)).length;
+      const badge = document.getElementById("queueUnsentBadge");
+      const btn = document.getElementById("sendAllBtn");
+      if (badge) {
+        if (unsent > 0) { badge.textContent = `未送信 ${unsent}件`; badge.style.display = ""; }
+        else { badge.style.display = "none"; }
+      }
+      if (btn) { btn.disabled = unsent === 0; btn.style.opacity = unsent === 0 ? "0.5" : ""; }
     }
 
     function queueSourceLabel(q) {
@@ -930,6 +953,28 @@ _INDEX_TEMPLATE = r"""
         document.getElementById("message").textContent = `疑似freeeへ送信しました: ${result.external_accounting_id}`;
       } catch (error) {
         document.getElementById("message").textContent = error.message;
+      }
+      await loadAll();
+    }
+
+    // Phase D①: 未送信（pending/failed/retry）をまとめて送る。失敗は retry_count++ で残り、再度押せばリトライ。
+    async function sendAllToPseudoFreee() {
+      const btn = document.getElementById("sendAllBtn");
+      const msg = document.getElementById("message");
+      if (btn) btn.disabled = true;
+      try {
+        const r = await api("/api/freee-sync-queue/send-all", { method: "POST" });
+        if (r.attempted === 0) {
+          msg.textContent = "未送信のキューはありません。";
+        } else if (r.failed === 0) {
+          msg.textContent = `一括送信: ${r.sent}件 送信しました。`;
+        } else {
+          let t = `一括送信: 成功 ${r.sent}件 / 失敗 ${r.failed}件（未送信 ${r.remaining_unsent}件 残り）。疑似freeeが起動しているか確認し、もう一度押すと再送します。`;
+          if (r.errors && r.errors.length) t += " 例: " + r.errors.slice(0, 2).map(e => `${e.source_type}#${e.source_id}(${e.error})`).join(" / ");
+          msg.textContent = t;
+        }
+      } catch (error) {
+        msg.textContent = "一括送信に失敗しました: " + error.message;
       }
       await loadAll();
     }

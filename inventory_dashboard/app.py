@@ -79,6 +79,18 @@ def init_db() -> None:
     with get_conn() as conn:
         db.create_schema(conn)
         db.assert_tenancy_ready(conn)
+        ensure_schema_upgrades(conn)
+
+
+def ensure_schema_upgrades(conn: db.Connection) -> None:
+    """既存DBへの軽微なカラム追加。
+
+    create_schema は CREATE TABLE IF NOT EXISTS で新テーブルは作るが、既存テーブルへの
+    カラム追加はしない。ここで has_column を見て不足カラムだけ ALTER する（SQLite/Postgres 両対応）。
+    """
+    # Phase D(①): 一括送信のリトライ回数を表示・記録するための列。
+    if not db.has_column(conn, "freee_sync_queue", "retry_count"):
+        conn.execute("ALTER TABLE freee_sync_queue ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0")
 
 
 # ---------------------------------------------------------------------------
@@ -1694,16 +1706,69 @@ def mark_queue_status(conn: db.Connection, organization_id: int, data: dict[str,
 
 
 def fail_queue_send(conn: db.Connection, organization_id: int, queue_id: int, message: str) -> None:
+    # Phase D(①): 失敗のたびに retry_count を増やす（単発送信・一括送信どちらの失敗もカウント）。
     conn.execute(
         """
         UPDATE freee_sync_queue
         SET status = 'failed',
             sync_error_message = ?,
+            retry_count = retry_count + 1,
             updated_at = CURRENT_TIMESTAMP
         WHERE id = ? AND organization_id = ?
         """,
         (message, queue_id, organization_id),
     )
+
+
+def count_unsent_queue(conn: db.Connection, organization_id: int) -> int:
+    """未送信（pending/failed/retry）の件数。送信済み・取消は除く。一括送信ボタンのバッジに使う。"""
+    row = conn.execute(
+        """
+        SELECT COUNT(*) AS c FROM freee_sync_queue
+        WHERE organization_id = ? AND status IN ('pending', 'failed', 'retry')
+        """,
+        (organization_id,),
+    ).fetchone()
+    return int(row["c"])
+
+
+def send_all_pending_queue(conn: db.Connection, organization_id: int) -> dict[str, Any]:
+    """未送信（pending/failed/retry）のキューを古い順に一括送信する（Phase D①）。
+
+    1件ずつ send_queue_to_pseudo_freee を呼び、送信失敗（ValueError）は握って次へ進む。
+    失敗は send 側で status='failed'＋retry_count++ が記録される。部分的成功も同一
+    トランザクションで確定する（成功=sent / 失敗=failed が混在しうる）。送り忘れを無くしつつ、
+    疑似freee が一時的に落ちていても「復帰後にもう一度押せば送れる」運用にする。
+    """
+    rows = conn.execute(
+        """
+        SELECT id, source_type, source_id FROM freee_sync_queue
+        WHERE organization_id = ? AND status IN ('pending', 'failed', 'retry')
+        ORDER BY created_at ASC, id ASC
+        """,
+        (organization_id,),
+    ).fetchall()
+    sent = 0
+    failed = 0
+    errors: list[dict[str, Any]] = []
+    for row in rows:
+        try:
+            send_queue_to_pseudo_freee(conn, organization_id, {"id": row["id"]})
+            sent += 1
+        except ValueError as exc:  # 送信失敗（HTTP/接続/タイムアウト/疑似freee 拒否）。次の1件へ。
+            failed += 1
+            if len(errors) < 50:
+                errors.append(
+                    {"id": row["id"], "source_type": row["source_type"], "source_id": row["source_id"], "error": str(exc)}
+                )
+    return {
+        "ok": True,
+        "attempted": len(rows),
+        "sent": sent,
+        "failed": failed,
+        "remaining_unsent": count_unsent_queue(conn, organization_id),
+        "errors": errors,
+    }
 
 
 def send_queue_to_pseudo_freee(conn: db.Connection, organization_id: int, data: dict[str, Any]) -> dict[str, Any]:
@@ -2260,6 +2325,18 @@ def api_send_queue(data: dict[str, Any] = Depends(parse_json_body), identity: Id
     with get_conn() as conn:
         result = send_queue_to_pseudo_freee(conn, identity.organization_id, data)
         record_audit(conn, identity.organization_id, identity.user_id, "freee_queue.send", "freee_sync_queue", data.get("id"), {"external_accounting_id": result.get("external_accounting_id")})
+        return result
+
+
+@app.post("/api/freee-sync-queue/send-all", status_code=201)
+def api_send_all_queue(identity: Identity = WRITER) -> dict[str, Any]:
+    """Phase D①: 未送信（pending/failed/retry）を一括送信する。送り忘れ防止＋失敗リトライ。"""
+    with get_conn() as conn:
+        result = send_all_pending_queue(conn, identity.organization_id)
+        record_audit(
+            conn, identity.organization_id, identity.user_id, "freee_queue.send_all", "freee_sync_queue", "",
+            {"attempted": result["attempted"], "sent": result["sent"], "failed": result["failed"]},
+        )
         return result
 
 
