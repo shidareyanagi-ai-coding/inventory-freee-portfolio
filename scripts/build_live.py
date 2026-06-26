@@ -60,8 +60,17 @@ DEMAND_BASE = [
 
 
 def pf_clear(url: str) -> None:
-    """疑似freee の本番DBから既存の取引・期末棚卸を消す（マスタ・期首残高は残す）。"""
-    tables = ("pseudo_freee_deal_lines", "pseudo_freee_deals", "pseudo_freee_closing_inventory")
+    """疑似freee の本番DBから既存の取引・証憑・期末棚卸を消す（マスタ・期首残高は残す）。
+
+    削除順が重要: deals を参照する pseudo_freee_vouchers（カスケード無し）を先に消す。
+    deal_lines は ON DELETE CASCADE だが明示的にも消す。
+    """
+    tables = (
+        "pseudo_freee_vouchers",       # deals を参照（カスケード無し＝先に消す必要）
+        "pseudo_freee_deal_lines",     # deals を参照（CASCADE だが明示）
+        "pseudo_freee_deals",
+        "pseudo_freee_closing_inventory",
+    )
     if url.startswith("postgres"):
         import psycopg
 
@@ -81,6 +90,28 @@ def pf_clear(url: str) -> None:
                 pass
         conn.commit()
         conn.close()
+
+
+def wait_for_pseudo_freee() -> None:
+    """疑似freee が応答するまで待つ（Render 無料枠はスリープ→コールドスタートに数十秒）。
+
+    起動前に送信すると接続拒否になり、途中失敗→片側だけ反映の不整合になりうるため、先に待つ。
+    """
+    import time
+    import urllib.error
+    import urllib.request
+
+    url = app.PSEUDO_FREEE_API_URL.rstrip("/") + "/api/reconciliation"
+    for attempt in range(1, 13):  # 最大 ~120 秒
+        try:
+            with urllib.request.urlopen(url, timeout=10) as r:
+                if r.status == 200:
+                    return
+        except (urllib.error.URLError, TimeoutError):
+            pass
+        print(f"  疑似freee 起動待ち... ({attempt}/12)")
+        time.sleep(10)
+    sys.exit("疑似freee に接続できませんでした。URL を確認し、ブラウザで一度開いてから再実行してください。")
 
 
 def demand_csv() -> str:
@@ -118,7 +149,9 @@ def main() -> None:
         print("\n[下見のみ] 実際に消して入れ直すには、末尾に --yes を付けて再実行してください。")
         return
 
-    print("\n[実行] 疑似freee の既存データを消去 ...")
+    print("\n[実行] 疑似freee の起動を確認（無料枠スリープ時はコールドスタートを待つ）...")
+    wait_for_pseudo_freee()
+    print("[実行] 疑似freee の既存データを消去 ...")
     pf_clear(PF_DB_URL)
 
     with app.get_conn() as conn:
