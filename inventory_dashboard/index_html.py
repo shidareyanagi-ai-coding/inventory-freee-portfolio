@@ -178,11 +178,11 @@ _INDEX_TEMPLATE = r"""
         <div id="products"></div>
       </div>
       <div class="summary-box">
-        <h3>今月仕入 商品別</h3>
+        <h3>今月仕入 商品別（税込）</h3>
         <div id="monthlyPurchases"></div>
       </div>
       <div class="summary-box">
-        <h3>今月売上 商品別</h3>
+        <h3>今月売上 商品別（税込）</h3>
         <div id="monthlySales"></div>
       </div>
     </section>
@@ -414,8 +414,8 @@ _INDEX_TEMPLATE = r"""
       renderMetrics(data);
       renderProducts(data.products);
       updateModelWarning(currentModel(), data.best_model);
-      renderMonthlySummary("monthlyPurchases", data.monthly_purchases, data.monthly_purchase_total, "今月仕入 合計");
-      renderMonthlySummary("monthlySales", data.monthly_sales, data.monthly_sales_total, "今月売上 合計");
+      renderMonthlySummary("monthlyPurchases", data.monthly_purchases, data.monthly_purchase_total, "今月仕入 合計（税込）");
+      renderMonthlySummary("monthlySales", data.monthly_sales, data.monthly_sales_total, "今月売上 合計（税込）");
       await loadForecast();
       renderSelects(data.products);
       await loadForecastML(data.products);
@@ -447,8 +447,8 @@ _INDEX_TEMPLATE = r"""
         ["在庫総額", yen.format(data.total_stock_value), ""],
         ["商品数", data.product_count, ""],
         ["発注/欠品リスク", data.reorder_count, Number(data.reorder_count || 0) > 0 ? "risk-alert" : ""],
-        ["今月仕入", yen.format(data.monthly_purchase_total), ""],
-        ["今月売上", yen.format(data.monthly_sales_total), ""]
+        ["今月仕入（税込）", yen.format(data.monthly_purchase_total), ""],
+        ["今月売上（税込）", yen.format(data.monthly_sales_total), ""]
       ].map(([label, value, cls]) => `<div class="metric ${cls}"><span>${label}</span><strong>${value}</strong></div>`).join("");
     }
 

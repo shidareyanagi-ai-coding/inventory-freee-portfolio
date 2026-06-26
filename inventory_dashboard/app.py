@@ -1189,7 +1189,7 @@ def dashboard(conn: db.Connection, organization_id: int, model_name: str = "") -
             p.sku,
             p.product_name,
             SUM(pu.quantity) AS quantity,
-            SUM(pu.quantity * pu.unit_price) AS amount
+            SUM(ROUND(pu.quantity * pu.unit_price * (1 + pu.tax_rate / 100.0))) AS amount
         FROM purchases pu
         JOIN products p ON p.id = pu.product_id
         WHERE pu.organization_id = ? AND pu.transaction_date BETWEEN ? AND ?
@@ -1204,7 +1204,7 @@ def dashboard(conn: db.Connection, organization_id: int, model_name: str = "") -
             p.sku,
             p.product_name,
             SUM(s.quantity) AS quantity,
-            SUM(s.quantity * s.unit_price) AS amount
+            SUM(ROUND(s.quantity * s.unit_price * (1 + s.tax_rate / 100.0))) AS amount
         FROM sales s
         JOIN products p ON p.id = s.product_id
         WHERE s.organization_id = ? AND s.transaction_date BETWEEN ? AND ?
@@ -1215,7 +1215,7 @@ def dashboard(conn: db.Connection, organization_id: int, model_name: str = "") -
     ).fetchall()
     monthly_purchase_total = conn.execute(
         """
-        SELECT COALESCE(SUM(quantity * unit_price), 0) AS total
+        SELECT COALESCE(SUM(ROUND(quantity * unit_price * (1 + tax_rate / 100.0))), 0) AS total
         FROM purchases
         WHERE organization_id = ? AND transaction_date BETWEEN ? AND ?
         """,
@@ -1223,7 +1223,7 @@ def dashboard(conn: db.Connection, organization_id: int, model_name: str = "") -
     ).fetchone()["total"]
     monthly_sales_total = conn.execute(
         """
-        SELECT COALESCE(SUM(quantity * unit_price), 0) AS total
+        SELECT COALESCE(SUM(ROUND(quantity * unit_price * (1 + tax_rate / 100.0))), 0) AS total
         FROM sales
         WHERE organization_id = ? AND transaction_date BETWEEN ? AND ?
         """,
