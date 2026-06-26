@@ -2320,12 +2320,14 @@ def api_forecast_models(identity: Identity = Depends(current_identity)) -> dict[
     # この環境で利用可能なモデル（依存が無いものは自動的に外れる）。
     from forecasting import models as forecast_models
 
-    return {
-        "models": [
-            {"name": model.name, "label": model.label}
-            for model in forecast_models.available_models()
-        ]
-    }
+    available = list(forecast_models.available_models())
+    by_name = {m.name: m for m in available}
+    # 「モデル比較と発注判定」表と並びを揃える＝精度(MAE)昇順。未評価分は元の順で末尾に。
+    with get_conn() as conn:
+        ranked = _ranked_models(conn, identity.organization_id)
+    ordered = [by_name[n] for n in ranked if n in by_name]
+    ordered += [m for m in available if m.name not in {x.name for x in ordered}]
+    return {"models": [{"name": m.name, "label": m.label} for m in ordered]}
 
 
 @app.get("/api/forecast/series")
