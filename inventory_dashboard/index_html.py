@@ -293,13 +293,6 @@ _INDEX_TEMPLATE = r"""
     <section class="panel">
       <div class="section-head">
         <h2>適正在庫シミュレーション</h2>
-        <label class="inline-control">予測期間
-          <select id="forecastHorizon" onchange="loadForecast()">
-            <option value="30">直近30日</option>
-            <option value="60">直近60日</option>
-            <option value="90">直近90日</option>
-          </select>
-        </label>
       </div>
       <p class="note" id="forecastNote">過去売上から月末販売数、リードタイム需要、必要在庫、推奨発注量を計算します。</p>
       <div id="forecastSimulation"></div>
@@ -477,8 +470,8 @@ _INDEX_TEMPLATE = r"""
     }
 
     async function loadForecast() {
-      const horizon = document.getElementById("forecastHorizon").value;
-      const data = await api(`/api/forecast-simulation?horizon_days=${horizon}&model_name=${encodeURIComponent(currentModel())}`);
+      // 予測期間ドロップダウンは廃止（AI予測ベースに一本化したため表示に影響しなかった）。horizon は既定30日。
+      const data = await api(`/api/forecast-simulation?model_name=${encodeURIComponent(currentModel())}`);
       renderForecast(data);
     }
 
@@ -544,7 +537,7 @@ _INDEX_TEMPLATE = r"""
       const el = document.getElementById("modelWarning");
       if (!el) return;
       if (selected && bestModel && selected !== bestModel) {
-        el.textContent = `⚠ 現在の予測は最良モデル（${modelLabel(bestModel)}）ではありません。選択中: ${modelLabel(selected)}。在庫一覧・適正在庫シミュレーションはこのモデルで計算されています（「自動（最良）」に戻すと最適化されます）。`;
+        el.textContent = `⚠ 現在の予測は最良モデル（${modelLabel(bestModel)}）ではありません。選択中: ${modelLabel(selected)}。在庫一覧・適正在庫シミュレーションはこのモデルで計算中です。最良に戻すには、下の「需要予測レベル2」の『モデル』を『自動（最良）』に選び直してください。`;
         el.style.display = "";
       } else {
         el.style.display = "none";
