@@ -125,7 +125,7 @@
 ## 💻 ローカルでの動かし方
 
 ```bash
-git clone https://github.com/87yoko-ai-engineer/inventory-freee-portfolio.git
+git clone https://github.com/shidareyanagi-ai-coding/inventory-freee-portfolio.git
 cd inventory-freee-portfolio
 python -m venv .venv
 # Windows: .venv\Scripts\activate   /   Mac・Linux: source .venv/bin/activate
