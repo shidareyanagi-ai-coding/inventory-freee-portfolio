@@ -297,6 +297,24 @@ _INDEX_TEMPLATE = r"""
         <div><h3 class="sub">得意先</h3><div id="customerMaster"></div></div>
       </div>
     </section>
+    <section class="panel" id="realDataSection">
+      <h2>🗂 実データ運用（CSV取込・クリーンスタート）</h2>
+      <p style="color:var(--muted);font-size:13px;margin:0 0 12px;">デモではなく、実際の過去データで使うための機能です。</p>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:16px;">
+        <div style="border:1px solid var(--line);border-radius:8px;padding:14px;">
+          <h3 style="margin:0 0 6px;font-size:14px;">① 需要履歴を CSV で一括取込（予測用）</h3>
+          <p style="color:var(--muted);font-size:12px;margin:0 0 10px;">列: <code>date,sku,product_name,quantity,unit_price</code>（1行目に列名）。<b>予測専用の需要履歴</b>として取り込みます（在庫元帳・会計には計上しません＝二重計上なし）。取込後、下の「需要予測レベル2」で <b>予測バッチを実行</b>。再取込は置き換えになります。</p>
+          <input type="file" id="salesCsvFile" accept=".csv,text/csv" style="display:block;margin-bottom:8px;">
+          <button type="button" id="salesCsvImportBtn" class="secondary">CSV を取り込む</button>
+          <p id="salesCsvResult" style="color:var(--muted);font-size:12px;margin:8px 0 0;"></p>
+        </div>
+        <div style="border:1px solid #f3beb7;border-radius:8px;padding:14px;background:#fff7f6;">
+          <h3 style="margin:0 0 6px;font-size:14px;color:var(--danger);">② デモデータを全消去（クリーンスタート）</h3>
+          <p style="color:var(--muted);font-size:12px;margin:0 0 10px;">この組織の商品・取引・履歴・予測・証憑を <b>すべて消去</b> します（アカウントとログインは残ります）。実データだけで始めたいときに。</p>
+          <button type="button" id="clearDataBtn" style="background:var(--danger);color:#fff;border:none;">デモデータを全消去</button>
+        </div>
+      </div>
+    </section>
     <section class="panel">
       <div class="section-head">
         <h2>適正在庫シミュレーション</h2>
@@ -343,24 +361,6 @@ _INDEX_TEMPLATE = r"""
       <div class="summary-box">
         <h2>送信前レビュー</h2>
         <pre id="preview">キューの「確認」を押すと、freee送信用の中間データを表示します。</pre>
-      </div>
-    </section>
-    <section class="panel" id="realDataSection">
-      <h2>🗂 実データ運用（CSV取込・クリーンスタート）</h2>
-      <p style="color:var(--muted);font-size:13px;margin:0 0 12px;">デモではなく、実際の過去データで使うための機能です。</p>
-      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:16px;">
-        <div style="border:1px solid var(--line);border-radius:8px;padding:14px;">
-          <h3 style="margin:0 0 6px;font-size:14px;">① 需要履歴を CSV で一括取込（予測用）</h3>
-          <p style="color:var(--muted);font-size:12px;margin:0 0 10px;">列: <code>date,sku,product_name,quantity,unit_price</code>（1行目に列名）。<b>予測専用の需要履歴</b>として取り込みます（在庫元帳・会計には計上しません＝二重計上なし）。取込後、下の「需要予測レベル2」で <b>予測バッチを実行</b>。再取込は置き換えになります。</p>
-          <input type="file" id="salesCsvFile" accept=".csv,text/csv" style="display:block;margin-bottom:8px;">
-          <button type="button" id="salesCsvImportBtn" class="secondary">CSV を取り込む</button>
-          <p id="salesCsvResult" style="color:var(--muted);font-size:12px;margin:8px 0 0;"></p>
-        </div>
-        <div style="border:1px solid #f3beb7;border-radius:8px;padding:14px;background:#fff7f6;">
-          <h3 style="margin:0 0 6px;font-size:14px;color:var(--danger);">② デモデータを全消去（クリーンスタート）</h3>
-          <p style="color:var(--muted);font-size:12px;margin:0 0 10px;">この組織の商品・取引・履歴・予測・証憑を <b>すべて消去</b> します（アカウントとログインは残ります）。実データだけで始めたいときに。</p>
-          <button type="button" id="clearDataBtn" style="background:var(--danger);color:#fff;border:none;">デモデータを全消去</button>
-        </div>
       </div>
     </section>
     <section class="panel" id="closingInventorySection">
