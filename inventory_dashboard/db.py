@@ -642,6 +642,9 @@ def create_schema(conn: _Connection) -> None:
 DOMAIN_TABLES = (
     # A-5 証憑（organizations を参照するため先に DROP する）。
     "vouchers",
+    # Phase D: 期末在庫の freee 送信履歴（organizations 参照・子なし）。
+    # クリーンスタート/再 seed で消さないと送信履歴だけ積み残るため DOMAIN_TABLES に含める。
+    "closing_inventory_sends",
     # A-4 予測系（products/organizations を参照するため先に DROP する）。
     "model_evaluations",
     "order_candidates",

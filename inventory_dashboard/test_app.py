@@ -175,6 +175,21 @@ class InventoryAppTest(unittest.TestCase):
             ).fetchone()["c"]
             self.assertEqual(org_count, 1)  # アカウントは残る
 
+    def test_clear_organization_data_clears_closing_inventory_sends(self):
+        # クリーンスタートは期末在庫の freee 送信履歴も消す（消さないと再 seed のたび履歴だけ積み残る）。
+        with app.get_conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO closing_inventory_sends
+                    (organization_id, period, book_amount, physical_amount, shrinkage_amount)
+                VALUES (?, '202606', 210650, 198650, 12000)
+                """,
+                (self.org_id,),
+            )
+            self.assertEqual(len(app.list_closing_inventory_sends(conn, self.org_id)), 1)
+            app.db.clear_organization_data(conn, self.org_id)
+            self.assertEqual(len(app.list_closing_inventory_sends(conn, self.org_id)), 0)
+
     def test_clear_then_import_full_cycle_and_stale_ledger_contract(self):
         # A-9 実運用フロー: デモ商品で元帳を開く→クリーンスタート→CSV取込（新id採番）。
         # 取込自体は必ず成功する。一方、削除済みの「旧 product_id」で元帳を引くと 404 になる
