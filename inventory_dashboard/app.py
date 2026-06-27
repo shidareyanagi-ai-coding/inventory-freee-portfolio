@@ -713,18 +713,86 @@ def push_partner_rename(
     return {"ok": True, "updated_deals": int(data.get("updated_deals", 0))}
 
 
-def closing_inventory_book_amount(conn: db.Connection, organization_id: int, as_of: str | None = None) -> float:
-    """期末在庫の帳簿評価額 = Σ(在庫数量 × 仕入単価)。as_of 指定でその日時点（Phase D④＝Phase B）。"""
-    stocks = stock_by_product(conn, organization_id, as_of)
-    if not stocks:
-        return 0.0
-    prices = {
+def _purchase_prices(conn: db.Connection, organization_id: int) -> dict[int, float]:
+    return {
         row["id"]: float(row["purchase_unit_price"])
         for row in conn.execute(
             "SELECT id, purchase_unit_price FROM products WHERE organization_id = ?", (organization_id,)
         ).fetchall()
     }
+
+
+def closing_inventory_physical_amount(conn: db.Connection, organization_id: int, as_of: str | None = None) -> float:
+    """実地棚卸高 = Σ(現在の実在庫数量 × 仕入単価)。棚卸減耗の評価減を反映した「実際の在庫額」。
+
+    stock_by_product は棚卸減耗(source_type='shrinkage')も含む全移動の合計なので、
+    この額は評価減後＝実地額になる。as_of 指定でその日時点（Phase D④＝Phase B）。
+    """
+    stocks = stock_by_product(conn, organization_id, as_of)
+    if not stocks:
+        return 0.0
+    prices = _purchase_prices(conn, organization_id)
     return float(sum(max(int(qty), 0) * prices.get(pid, 0.0) for pid, qty in stocks.items()))
+
+
+def shrinkage_value(conn: db.Connection, organization_id: int, as_of: str | None = None) -> float:
+    """棚卸減耗の評価額（正の値）= Σ(|減耗数量| × 仕入単価)。source_type='shrinkage' の評価減移動。"""
+    if as_of:
+        rows = conn.execute(
+            "SELECT product_id, COALESCE(SUM(quantity_delta), 0) AS d FROM inventory_movements "
+            "WHERE organization_id = ? AND source_type = 'shrinkage' AND movement_date <= ? GROUP BY product_id",
+            (organization_id, as_of),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT product_id, COALESCE(SUM(quantity_delta), 0) AS d FROM inventory_movements "
+            "WHERE organization_id = ? AND source_type = 'shrinkage' GROUP BY product_id",
+            (organization_id,),
+        ).fetchall()
+    prices = _purchase_prices(conn, organization_id)
+    return float(sum(-int(row["d"]) * prices.get(row["product_id"], 0.0) for row in rows))
+
+
+def closing_inventory_book_amount(conn: db.Connection, organization_id: int, as_of: str | None = None) -> float:
+    """帳簿棚卸高 = 実地額 + 棚卸減耗額（＝評価減を戻した「帳簿上あるべき在庫額」）。
+
+    疑似freee へはこの帳簿額と実地額の両方を送り、差額（棚卸減耗損）を会計側で計上する。
+    減耗が無ければ 帳簿＝実地（従来どおり）。
+    """
+    return closing_inventory_physical_amount(conn, organization_id, as_of) + shrinkage_value(conn, organization_id, as_of)
+
+
+def record_shrinkage(conn: db.Connection, organization_id: int, data: dict[str, Any]) -> dict[str, Any]:
+    """棚卸減耗（実地棚卸）を商品ごとに記録する。実地数量に合わせて在庫を評価減する。
+
+    physical_quantity（実地カウント）に現在庫を合わせる評価減移動を1本入れる（quantity_delta
+    = 実地 − 現在庫）。差が0なら何もしない（冪等）。会計連携は決算の期末棚卸送信で行うため、
+    ここでは freee キューに積まない（在庫台帳だけを実地に合わせる）。
+    """
+    product = get_product(conn, organization_id, to_int(data.get("product_id")))
+    raw = data.get("physical_quantity")
+    if raw in (None, ""):
+        raise ValueError("実地数量を入力してください。")
+    physical_qty = to_int(raw)
+    if physical_qty < 0:
+        raise ValueError("実地数量は0以上で入力してください。")
+    current = stock_by_product(conn, organization_id).get(product["id"], 0)
+    delta = physical_qty - current  # 通常は負（減耗）。実地が多ければ正（過大計上の修正）。
+    if delta == 0:
+        return {"ok": True, "product_id": product["id"], "delta": 0, "physical_quantity": physical_qty}
+    movement_date = (data.get("movement_date") or date.today().isoformat())
+    conn.execute(
+        """
+        INSERT INTO inventory_movements (
+            organization_id, product_id, movement_type, source_type, source_id, movement_date,
+            quantity_delta, unit_price, note
+        )
+        VALUES (?, ?, 'shrinkage_adjustment', 'shrinkage', ?, ?, ?, ?, ?)
+        """,
+        (organization_id, product["id"], product["id"], movement_date, delta,
+         product["purchase_unit_price"], f"棚卸減耗（実地{physical_qty}・帳簿{current}）"),
+    )
+    return {"ok": True, "product_id": product["id"], "delta": delta, "physical_quantity": physical_qty}
 
 
 def push_closing_inventory(conn: db.Connection, organization_id: int, data: dict[str, Any]) -> dict[str, Any]:
@@ -740,11 +808,10 @@ def push_closing_inventory(conn: db.Connection, organization_id: int, data: dict
     as_of = str(data.get("as_of", "") or "").strip() or None
     if as_of:
         date.fromisoformat(as_of)  # 妥当性チェック（不正な日付は例外）
+    # 実地額は在庫台帳から導出（棚卸減耗の評価減を反映した現在庫）。帳簿額は減耗を戻した額。
+    # 差額（帳簿−実地）が棚卸減耗損として疑似freee で計上される。
+    physical_amount = closing_inventory_physical_amount(conn, organization_id, as_of)
     book_amount = closing_inventory_book_amount(conn, organization_id, as_of)
-    raw_override = data.get("physical_amount")
-    physical_amount = book_amount if raw_override in (None, "") else to_float(raw_override)
-    if physical_amount < 0:
-        raise ValueError("実地棚卸高は0以上で入力してください。")
 
     payload = {
         "api_target": "pseudo_freee_closing_inventory",
@@ -822,7 +889,8 @@ def reconciliation(conn: db.Connection, organization_id: int) -> dict[str, Any]:
     inv = {
         "sales_total": float(sum(taxed(r) for r in sale_rows)),
         "purchase_total": float(sum(taxed(r) for r in purchase_rows)),
-        "merchandise": closing_inventory_book_amount(conn, organization_id, None),
+        # 期末在庫は実地額で突合（疑似freee 側も実地額＝棚卸減耗の評価減後で記帳する）。
+        "merchandise": closing_inventory_physical_amount(conn, organization_id, None),
     }
     freee = _fetch_pseudo_freee_reconciliation()
     labels = [("売上高", "sales_total"), ("仕入高", "purchase_total"), ("期末在庫（商品）", "merchandise")]
@@ -2636,14 +2704,31 @@ def api_send_all_queue(identity: Identity = WRITER) -> dict[str, Any]:
 
 @app.post("/api/closing-inventory/preview")
 def api_closing_inventory_preview(data: dict[str, Any] = Depends(parse_json_body), identity: Identity = WRITER) -> dict[str, Any]:
-    """Phase D④: 期末在庫の帳簿評価額だけ計算して返す（送信しない＝「帳簿評価額を計算」用）。"""
+    """Phase D④: 期末在庫の帳簿額・実地額・棚卸減耗額を計算して返す（送信しない＝確認用）。"""
     period = str(data.get("period", "") or "").strip()
     as_of = str(data.get("as_of", "") or "").strip() or None
     if as_of:
         date.fromisoformat(as_of)
     with get_conn() as conn:
-        book = closing_inventory_book_amount(conn, identity.organization_id, as_of)
-    return {"ok": True, "period": period, "as_of": as_of or "", "book_amount": book}
+        physical = closing_inventory_physical_amount(conn, identity.organization_id, as_of)
+        shrinkage = shrinkage_value(conn, identity.organization_id, as_of)
+        book = physical + shrinkage
+    return {
+        "ok": True, "period": period, "as_of": as_of or "",
+        "book_amount": book, "physical_amount": physical, "shrinkage_amount": shrinkage,
+    }
+
+
+@app.post("/api/shrinkage", status_code=201)
+def api_record_shrinkage(data: dict[str, Any] = Depends(parse_json_body), identity: Identity = WRITER) -> dict[str, Any]:
+    """棚卸減耗（実地棚卸）を商品ごとに記録し、在庫を実地数量へ評価減する。"""
+    with get_conn() as conn:
+        result = record_shrinkage(conn, identity.organization_id, data)
+        record_audit(
+            conn, identity.organization_id, identity.user_id, "shrinkage.record", "inventory_movements",
+            str(result["product_id"]), {"delta": result["delta"], "physical_quantity": result["physical_quantity"]},
+        )
+        return result
 
 
 @app.post("/api/closing-inventory/push", status_code=201)

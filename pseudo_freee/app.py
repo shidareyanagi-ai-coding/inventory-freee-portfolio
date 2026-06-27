@@ -260,6 +260,8 @@ ACCOUNT_CLASSIFICATION: dict[str, tuple[str, str, str]] = {
     # 費用（売上原価は決算整理で導出。仕入高は期中に積み、決算で売上原価へ振り替えて 0 になる）
     "売上原価": (EXPENSE, PL, DEBIT),
     "仕入高": (EXPENSE, PL, DEBIT),
+    # 棚卸減耗損: 帳簿棚卸高と実地棚卸高の差。原価性ありとして売上原価へ算入する（決算整理で振替→残高0）。
+    "棚卸減耗損": (EXPENSE, PL, DEBIT),
     "減価償却費": (EXPENSE, PL, DEBIT),
     "消耗品費": (EXPENSE, PL, DEBIT),
     "旅費交通費": (EXPENSE, PL, DEBIT),
@@ -280,7 +282,7 @@ ACCOUNT_CLASSIFICATION: dict[str, tuple[str, str, str]] = {
 # （現金や売掛金を経費の勘定として選べてしまうのを防ぐ）。売上原価は決算で導出するので候補にしない。
 NON_EXPENSE_ACCOUNT_ITEMS = {
     "現金", "普通預金", "売掛金", "未収金", "商品", "建物", "備品", "減価償却累計額",
-    "買掛金", "未払金", "資本金", "繰越利益剰余金", "売上高", "売上原価", "減価償却費",
+    "買掛金", "未払金", "資本金", "繰越利益剰余金", "売上高", "売上原価", "減価償却費", "棚卸減耗損",
 }
 
 # 期首残高（BS科目のみ）。借合計 = 貸合計 になるデモ値。`商品` は期首商品棚卸高を兼ねる。
@@ -1692,7 +1694,10 @@ def closing_journal(conn: db.Connection) -> list[dict[str, Any]]:
     """
     beginning_inventory = opening_inventory_amount(conn)
     current_purchases = current_period_purchases(conn)  # 当期仕入高（期中の `仕入高` 借方合計）
-    ending_inventory = closing_inventory_physical_amount(conn)
+    closing = closing_inventory_current(conn)
+    book_inventory = float(closing["book_amount"]) if closing else 0.0       # 帳簿棚卸高
+    physical_inventory = float(closing["physical_amount"]) if closing else 0.0  # 実地棚卸高
+    shrinkage = book_inventory - physical_inventory                          # 棚卸減耗（>0 で減耗）
     depreciation = depreciation_amount(conn)
     journal: list[dict[str, Any]] = []
     if abs(beginning_inventory) > _BALANCE_EPSILON:  # 期首商品 → 売上原価
@@ -1703,10 +1708,17 @@ def closing_journal(conn: db.Connection) -> list[dict[str, Any]]:
         journal.append({"description": "当期仕入を売上原価へ振替", "entries": [
             {"account": "売上原価", "side": DEBIT, "amount": current_purchases},
             {"account": "仕入高", "side": CREDIT, "amount": current_purchases}]})
-    if abs(ending_inventory) > _BALANCE_EPSILON:  # 期末商品を計上（売上原価から控除）
-        journal.append({"description": "期末商品を計上（売上原価から控除）", "entries": [
-            {"account": "商品", "side": DEBIT, "amount": ending_inventory},
-            {"account": "売上原価", "side": CREDIT, "amount": ending_inventory}]})
+    if abs(book_inventory) > _BALANCE_EPSILON:  # 期末商品（帳簿）を計上（売上原価から控除）
+        journal.append({"description": "期末商品（帳簿）を計上（売上原価から控除）", "entries": [
+            {"account": "商品", "side": DEBIT, "amount": book_inventory},
+            {"account": "売上原価", "side": CREDIT, "amount": book_inventory}]})
+    if shrinkage > _BALANCE_EPSILON:  # 棚卸減耗損: 帳簿→実地へ評価減し、原価性ありとして売上原価へ算入
+        journal.append({"description": "棚卸減耗損の計上（帳簿−実地）", "entries": [
+            {"account": "棚卸減耗損", "side": DEBIT, "amount": shrinkage},
+            {"account": "商品", "side": CREDIT, "amount": shrinkage}]})
+        journal.append({"description": "棚卸減耗損を売上原価へ算入", "entries": [
+            {"account": "売上原価", "side": DEBIT, "amount": shrinkage},
+            {"account": "棚卸減耗損", "side": CREDIT, "amount": shrinkage}]})
     if abs(depreciation) > _BALANCE_EPSILON:  # 減価償却（定額法・間接法）
         journal.append({"description": "減価償却費の計上（定額法・間接法）", "entries": [
             {"account": "減価償却費", "side": DEBIT, "amount": depreciation},
@@ -3446,7 +3458,9 @@ def render_statements(active_view: str = "statements", month: str = "") -> bytes
         if month and month not in periods:
             month = ""  # 不正な月は全期間に戻す
         ledger = general_ledger(conn, month)
-    ending_inventory = float(closing_inv["physical_amount"]) if closing_inv else 0.0
+    ending_inventory = float(closing_inv["physical_amount"]) if closing_inv else 0.0   # 実地棚卸高
+    book_inventory = float(closing_inv["book_amount"]) if closing_inv else 0.0          # 帳簿棚卸高
+    shrinkage_loss = book_inventory - ending_inventory                                  # 棚卸減耗損（>0 で減耗）
 
     def view_hidden(name: str) -> str:
         return "" if name == active_view else " hidden"
@@ -3464,6 +3478,25 @@ def render_statements(active_view: str = "statements", month: str = "") -> bytes
           <td class="je-credit">{html.escape(credit["account"]) if credit else ""}</td>
           <td class="num">{yen(credit["amount"]) if credit else ""}</td>
         </tr>"""
+
+    # --- 売上原価の計算（三分法）。棚卸減耗があれば 帳簿期末→減耗→実地ベース原価 の過程を見せる ---
+    if shrinkage_loss > _BALANCE_EPSILON:
+        subtotal = beginning_inventory + current_purchases - book_inventory
+        cogs_rows = (
+            f'<tr><td>期首商品棚卸高</td><td class="num">{yen(beginning_inventory)}</td></tr>'
+            f'<tr><td>＋ 当期仕入高</td><td class="num">{yen(current_purchases)}</td></tr>'
+            f'<tr><td>－ 期末商品棚卸高（帳簿）</td><td class="num">{yen(book_inventory)}</td></tr>'
+            f'<tr><td>＝ 差引</td><td class="num">{yen(subtotal)}</td></tr>'
+            f'<tr><td>＋ 棚卸減耗損（帳簿−実地）</td><td class="num">{yen(shrinkage_loss)}</td></tr>'
+            f'<tr><th>＝ 売上原価（実地ベース）</th><th class="num">{yen(income["cogs"])}</th></tr>'
+        )
+    else:
+        cogs_rows = (
+            f'<tr><td>期首商品棚卸高</td><td class="num">{yen(beginning_inventory)}</td></tr>'
+            f'<tr><td>＋ 当期仕入高</td><td class="num">{yen(current_purchases)}</td></tr>'
+            f'<tr><td>－ 期末商品棚卸高</td><td class="num">{yen(ending_inventory)}</td></tr>'
+            f'<tr><th>＝ 売上原価</th><th class="num">{yen(income["cogs"])}</th></tr>'
+        )
 
     # --- 試算表（決算整理後・残高試算表） ---
     tb_rows = "".join(
@@ -3553,7 +3586,7 @@ def render_statements(active_view: str = "statements", month: str = "") -> bytes
             <label>減価償却費（当期）
               <input class="no-spinner" inputmode="decimal" name="depreciation_amount" value="{depreciation:.0f}">
             </label>
-            <p class="label full" style="margin:0;">{depreciation_hint}。Phase A は手入力です（帳簿=実地＝棚卸減耗0）。</p>
+            <p class="label full" style="margin:0;">{depreciation_hint}。手入力では帳簿=実地（棚卸減耗0）。棚卸減耗は在庫ダッシュボードの「期末在庫を freee へ送る」で帳簿・実地の差として連携され、棚卸減耗損が計上されます。</p>
             <button type="submit">決算整理を反映する</button>
             <button type="button" disabled title="Phase B で在庫ダッシュボードの期末評価額を取り込みます">在庫DBから反映（Phase B）</button>
           </form>
@@ -3567,12 +3600,7 @@ def render_statements(active_view: str = "statements", month: str = "") -> bytes
           </table>
           <table style="margin-top:12px;">
             <thead><tr><th colspan="2">売上原価の計算（三分法）</th></tr></thead>
-            <tbody>
-              <tr><td>期首商品棚卸高</td><td class="num">{yen(beginning_inventory)}</td></tr>
-              <tr><td>＋ 当期仕入高</td><td class="num">{yen(current_purchases)}</td></tr>
-              <tr><td>－ 期末商品棚卸高</td><td class="num">{yen(ending_inventory)}</td></tr>
-              <tr><th>＝ 売上原価</th><th class="num">{yen(income["cogs"])}</th></tr>
-            </tbody>
+            <tbody>{cogs_rows}</tbody>
           </table>
         </section>
 

@@ -43,13 +43,16 @@ PURCHASES = [
     ("PC-STAND", "2026-06-04", 60, "テックサプライ", "P-2026-06-005"),
 ]
 CUSTOMERS = ["オフィス相模", "スタートアップ田中商店", "個人ユーザーK"]
+# USB-C-1M / USB-HUB は月末に追加売上を入れ、在庫を必要水準より下げて「発注を促す」表示を作る。
 SALES = {
-    "USB-C-1M": [("2026-06-05", 40), ("2026-06-11", 30), ("2026-06-17", 50), ("2026-06-23", 30)],
+    "USB-C-1M": [("2026-06-05", 40), ("2026-06-11", 30), ("2026-06-17", 50), ("2026-06-23", 30), ("2026-06-25", 15)],
     "WL-MOUSE": [("2026-06-06", 15), ("2026-06-12", 20), ("2026-06-18", 10), ("2026-06-24", 15)],
     "MON-24": [("2026-06-07", 5), ("2026-06-13", 4), ("2026-06-19", 6), ("2026-06-24", 5)],
-    "USB-HUB": [("2026-06-08", 20), ("2026-06-14", 15), ("2026-06-20", 20), ("2026-06-24", 15)],
+    "USB-HUB": [("2026-06-08", 20), ("2026-06-14", 15), ("2026-06-20", 20), ("2026-06-24", 15), ("2026-06-25", 15)],
     "PC-STAND": [("2026-06-09", 12), ("2026-06-15", 10), ("2026-06-21", 13), ("2026-06-23", 10)],
 }
+# 棚卸減耗のデモ: 商品ごとに実地数量へ評価減（帳簿>実地→棚卸減耗損）。
+SHRINKAGE = [("MON-24", 9)]  # 24インチモニター: 帳簿10 → 実地9（1個・¥12,000 の減耗）
 DEMAND_BASE = [
     ("USB-C-1M", "USB-Cケーブル 1m", 6.0, 0.0, 980),
     ("WL-MOUSE", "ワイヤレスマウス", 2.6, 1.1, 2480),
@@ -182,15 +185,23 @@ def main() -> None:
                     "invoice_no": f"S-2026-06-{n:03d}", "transaction_date": d, "quantity": qty,
                     "unit_price": p["sales_unit_price"], "tax_rate": 10, "due_date": "2026-07-31",
                 })
+        print("[実行] 棚卸減耗（実地棚卸）を記録 ...")
+        for sku, physical_qty in SHRINKAGE:
+            r = app.record_shrinkage(conn, org_id, {"product_id": prods[sku]["id"], "physical_quantity": physical_qty})
+            print(f"        {sku}: 実地{physical_qty} → 評価減 {r['delta']} 個")
         print("[実行] freee へ一括送信 ...")
         send = app.send_all_pending_queue(conn, org_id)
         print(f"        送信 {send['sent']} 件 / 失敗 {send['failed']} 件")
-        print("[実行] 期末在庫を送信 ...")
+        print("[実行] 期末在庫を送信（帳簿/実地・棚卸減耗を会計へ） ...")
         closing = app.push_closing_inventory(conn, org_id, {"period": "202606"})
         print(f"        期末在庫 帳簿={closing['book_amount']:.0f} 実地={closing['physical_amount']:.0f}")
         print("[実行] 需要履歴(約1年)を取込 ...")
         summary = app.import_sales_history(conn, org_id, demand_csv())
         print(f"        需要履歴 {summary['imported']} 行")
+        print("[実行] 予測バッチを実行（発注判定・必要水準を更新） ...")
+        from forecasting import service as forecast_service
+        fc = forecast_service.run_forecast(conn, org_id, horizon_days=30, actor_user_id=None)
+        print(f"        予測: best={fc.get('best_model')} / {fc.get('products_forecasted')}商品")
         print("[確認] 突合 ...")
         recon = app.reconciliation(conn, org_id)
 

@@ -357,15 +357,22 @@ _INDEX_TEMPLATE = r"""
     </section>
     <section class="panel" id="closingInventorySection">
       <h2>📦 決算: 期末在庫を freee へ送る</h2>
-      <p style="color:var(--muted);font-size:13px;margin:0 0 12px;">期末時点の在庫評価額（Σ 在庫数量 × 仕入単価）を計算し、疑似freee の決算（期末商品・売上原価・BS の「商品」）へ送ります。基準日を空にすると現在時点で計算します。</p>
+      <p style="color:var(--muted);font-size:13px;margin:0 0 12px;">期末時点の在庫評価額を計算し、疑似freee の決算（期末商品・売上原価・BS の「商品」）へ送ります。実地棚卸で帳簿と差（棚卸減耗）があれば、その差額は会計側で<strong>「棚卸減耗損」</strong>として計上され、売上原価に算入されます。基準日を空にすると現在時点で計算します。</p>
       <div style="display:flex;gap:14px;flex-wrap:wrap;align-items:flex-end;">
         <label style="font-size:13px;">対象期(YYYYMM)<br><input type="text" id="closingPeriod" placeholder="202603" inputmode="numeric" style="margin-top:4px;"></label>
         <label style="font-size:13px;">基準日(任意)<br><input type="date" id="closingAsOf" style="margin-top:4px;"></label>
-        <button type="button" id="closingCalcBtn" class="secondary">帳簿評価額を計算</button>
-        <label style="font-size:13px;">実地棚卸高(任意・上書き)<br><input type="number" id="closingPhysical" placeholder="未入力なら帳簿額" min="0" style="margin-top:4px;"></label>
+        <button type="button" id="closingCalcBtn" class="secondary">帳簿・実地・減耗を計算</button>
         <button type="button" id="closingPushBtn" class="warning">freeeへ送信</button>
       </div>
       <p id="closingResult" style="color:var(--muted);font-size:12px;margin:10px 0 0;"></p>
+      <div class="section-head" style="margin-top:16px;"><h3 class="sub">棚卸減耗を記録（実地棚卸）</h3></div>
+      <p style="color:var(--muted);font-size:12px;margin:0 0 8px;">実地カウントが帳簿在庫より少ないときに、<strong>商品ごとに実地数量を入力</strong>して在庫を評価減します（在庫一覧・期末在庫・突合にすぐ反映）。記録後、上の「freeeへ送信」で会計へ棚卸減耗損として連携します。</p>
+      <div style="display:flex;gap:14px;flex-wrap:wrap;align-items:flex-end;">
+        <label style="font-size:13px;">商品<br><select id="shrinkProduct" style="margin-top:4px;"></select></label>
+        <label style="font-size:13px;">実地数量<br><input type="number" id="shrinkPhysicalQty" min="0" style="margin-top:4px;"></label>
+        <button type="button" id="shrinkBtn" class="secondary">評価減を記録</button>
+      </div>
+      <p id="shrinkResult" style="color:var(--muted);font-size:12px;margin:10px 0 0;"></p>
     </section>
     <section class="panel" id="reconciliationSection">
       <h2>🔗 会計突合（在庫 ⇄ 疑似freee） <span id="reconBadge" class="status" style="display:none;"></span></h2>
@@ -686,6 +693,14 @@ _INDEX_TEMPLATE = r"""
         ledgerSelect.innerHTML = html;
         if (currentValue && [...ledgerSelect.options].some(option => option.value === currentValue)) {
           ledgerSelect.value = currentValue;
+        }
+      }
+      const shrinkSelect = document.getElementById("shrinkProduct");
+      if (shrinkSelect) {
+        const currentValue = shrinkSelect.value;
+        shrinkSelect.innerHTML = html;
+        if (currentValue && [...shrinkSelect.options].some(option => option.value === currentValue)) {
+          shrinkSelect.value = currentValue;
         }
       }
     }
@@ -1273,9 +1288,34 @@ _INDEX_TEMPLATE = r"""
       const el = document.getElementById("closingResult");
       try {
         const r = await api("/api/closing-inventory/preview", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ period, as_of }) });
-        el.textContent = `帳簿評価額: ${yen.format(r.book_amount)}${as_of ? `（${as_of} 時点）` : "（現在）"}。実地棚卸高を入れない場合はこの額で送信します。`;
+        const when = as_of ? `（${as_of} 時点）` : "（現在）";
+        const shrinkText = r.shrinkage_amount > 0
+          ? ` ／ 棚卸減耗 ${yen.format(r.shrinkage_amount)}（帳簿−実地）→ 会計で棚卸減耗損に計上`
+          : "（帳簿＝実地・減耗なし）";
+        el.textContent = `帳簿棚卸高 ${yen.format(r.book_amount)} ／ 実地棚卸高 ${yen.format(r.physical_amount)}${shrinkText} ${when}`;
       } catch (e) {
         el.textContent = "計算に失敗しました: " + e.message;
+      }
+    });
+    const shrinkBtn = document.getElementById("shrinkBtn");
+    if (shrinkBtn) shrinkBtn.addEventListener("click", async () => {
+      const product_id = (document.getElementById("shrinkProduct").value || "").trim();
+      const physical_quantity = (document.getElementById("shrinkPhysicalQty").value || "").trim();
+      const el = document.getElementById("shrinkResult");
+      if (!product_id) { el.textContent = "商品を選んでください。"; return; }
+      if (physical_quantity === "") { el.textContent = "実地数量を入力してください。"; return; }
+      try {
+        const r = await api("/api/shrinkage", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ product_id, physical_quantity }) });
+        if (r.delta === 0) {
+          el.textContent = "帳簿と実地が同じため、評価減はありませんでした。";
+        } else if (r.delta < 0) {
+          el.textContent = `評価減を記録しました（${-r.delta} 個の棚卸減耗）。在庫一覧・期末在庫に反映しました。上の「freeeへ送信」で会計へ連携できます。`;
+        } else {
+          el.textContent = `実地が帳簿より ${r.delta} 個多いため、在庫を増やす調整を記録しました。`;
+        }
+        await loadAll();
+      } catch (e) {
+        el.textContent = "記録に失敗しました: " + e.message;
       }
     });
     // Phase D⑤: 会計突合（在庫⇄疑似freee）をオンデマンドで実行する。
@@ -1314,14 +1354,14 @@ _INDEX_TEMPLATE = r"""
     if (closingPushBtn) closingPushBtn.addEventListener("click", async () => {
       const period = (document.getElementById("closingPeriod").value || "").trim();
       const as_of = (document.getElementById("closingAsOf").value || "").trim();
-      const physical_amount = (document.getElementById("closingPhysical").value || "").trim();
       const el = document.getElementById("closingResult");
       if (!period) { el.textContent = "対象期(YYYYMM)を入力してください（例 202603）。"; return; }
       try {
         const body = { period, as_of };
-        if (physical_amount !== "") body.physical_amount = physical_amount;
         const r = await api("/api/closing-inventory/push", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
-        el.textContent = `送信しました（${r.period}）: 帳簿評価額 ${yen.format(r.book_amount)} / 実地棚卸高 ${yen.format(r.physical_amount)}。疑似freee の決算（商品・売上原価・BS）に反映されます。`;
+        const diff = r.book_amount - r.physical_amount;
+        const shrinkText = diff > 0 ? ` 棚卸減耗 ${yen.format(diff)} を棚卸減耗損として計上。` : "";
+        el.textContent = `送信しました（${r.period}）: 帳簿棚卸高 ${yen.format(r.book_amount)} / 実地棚卸高 ${yen.format(r.physical_amount)}。${shrinkText}疑似freee の決算（商品・売上原価・BS）に反映されます。`;
       } catch (e) {
         el.textContent = "送信に失敗しました: " + e.message;
       }

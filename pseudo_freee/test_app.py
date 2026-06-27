@@ -974,6 +974,32 @@ class PseudoFreeeBookkeepingTest(unittest.TestCase):
         self.assertAlmostEqual(inventory_amount, 120000)
         self.assertTrue(sheet["balanced"])
 
+    def test_shrinkage_loss_when_book_exceeds_physical(self) -> None:
+        # 棚卸減耗: 帳簿>実地のとき、棚卸減耗損を計上し売上原価へ算入する（原価性）。
+        self._add_sample_deals()
+        with app.db_connection() as conn:
+            app.upsert_closing_inventory(conn, {"period": "209912", "book_amount": 200000, "physical_amount": 180000})
+        with app.db_connection() as conn:
+            beginning = app.opening_inventory_amount(conn)
+            purchases = app.current_period_purchases(conn)
+            journal = app.closing_journal(conn)
+            balances = app.account_balances(conn)
+            income = app.calculate_income_statement(conn)
+            sheet = app.calculate_balance_sheet(conn)
+        descs = [t["description"] for t in journal]
+        self.assertIn("棚卸減耗損の計上（帳簿−実地）", descs)
+        self.assertIn("棚卸減耗損を売上原価へ算入", descs)
+        # 棚卸減耗損は売上原価へ振り替えられ残高 0（独立PL行は出ない＝原価性）。
+        self.assertAlmostEqual(balances.get("棚卸減耗損", 0.0), 0.0)
+        # 売上原価は実地ベース、BS の商品は実地額、貸借一致。
+        self.assertAlmostEqual(income["cogs"], beginning + purchases - 180000)
+        merchandise = next(row["amount"] for row in sheet["assets"] if row["account"] == "商品")
+        self.assertAlmostEqual(merchandise, 180000)
+        self.assertTrue(sheet["balanced"])
+        # 決算ページに棚卸減耗損の行が出る。
+        html = app.render_statements().decode("utf-8")
+        self.assertIn("棚卸減耗損", html)
+
     def test_statements_page_renders(self) -> None:
         self._add_sample_deals()
         html = app.render_statements().decode("utf-8")

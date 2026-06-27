@@ -516,7 +516,8 @@ class InventoryAppTest(unittest.TestCase):
         self.assertEqual(after, 500.0)  # 5 × 100
 
     def test_push_closing_inventory_posts_book_and_physical(self):
-        # Phase D④: 帳簿評価額はサーバ側で再計算して送る。実地は上書き可（無ければ帳簿＝実地）。
+        # Phase D④: 帳簿額・実地額はサーバ側で台帳から再計算して送る。
+        # 棚卸減耗(record_shrinkage)があれば 実地<帳簿 となり、差額が会計側で棚卸減耗損になる。
         captured = {}
 
         def fake_urlopen(request, timeout):
@@ -526,18 +527,48 @@ class InventoryAppTest(unittest.TestCase):
             return FakeResponse({"ok": True, "period": body["period"], "book_amount": body["book_amount"], "physical_amount": body["physical_amount"]})
 
         with app.get_conn() as conn:
+            conn.execute("DELETE FROM inventory_movements WHERE organization_id = ?", (self.org_id,))
+            conn.execute("DELETE FROM sales WHERE organization_id = ?", (self.org_id,))
+            conn.execute("DELETE FROM purchases WHERE organization_id = ?", (self.org_id,))
             app.create_product(conn, self.org_id, {"sku": "PUSH-1", "product_name": "送信商品", "purchase_unit_price": 200})
             pid = conn.execute("SELECT id FROM products WHERE organization_id=? AND sku='PUSH-1'", (self.org_id,)).fetchone()["id"]
             app.create_purchase(conn, self.org_id, {"product_id": pid, "partner_name": "ps", "invoice_no": "PS-1", "transaction_date": "2026-06-10", "received_date": "2026-06-10", "quantity": 2, "unit_price": 200})
-            expected_book = app.closing_inventory_book_amount(conn, self.org_id, as_of="2026-06-30")
             with patch("app.urllib.request.urlopen", fake_urlopen):
                 r1 = app.push_closing_inventory(conn, self.org_id, {"period": "202606", "as_of": "2026-06-30"})
-                r2 = app.push_closing_inventory(conn, self.org_id, {"period": "202606", "as_of": "2026-06-30", "physical_amount": 9999})
+                # 減耗なし: 帳簿＝実地＝2×200
+                self.assertEqual(r1["book_amount"], 400.0)
+                self.assertEqual(r1["physical_amount"], 400.0)
+                # 棚卸減耗: 実地1個に評価減 → 実地200・帳簿400・減耗200
+                app.record_shrinkage(conn, self.org_id, {"product_id": pid, "physical_quantity": 1})
+                r2 = app.push_closing_inventory(conn, self.org_id, {"period": "202606", "as_of": "2026-06-30"})
         self.assertEqual(captured["url"], f"{app.PSEUDO_FREEE_API_URL}/api/closing-inventory")
         self.assertEqual(captured["body"]["period"], "202606")
-        self.assertEqual(r1["book_amount"], expected_book)
-        self.assertEqual(r1["physical_amount"], expected_book)  # 上書きなし＝帳簿額
-        self.assertEqual(r2["physical_amount"], 9999.0)         # 上書きあり
+        self.assertEqual(r2["book_amount"], 400.0)       # 帳簿＝評価減を戻した額
+        self.assertEqual(r2["physical_amount"], 200.0)   # 実地＝評価減後の現在庫
+        self.assertEqual(r2["book_amount"] - r2["physical_amount"], 200.0)  # 棚卸減耗
+
+    def test_record_shrinkage_writes_down_stock_to_physical(self):
+        # 棚卸減耗: 実地数量に合わせて在庫を評価減し、実地額・在庫一覧・帳簿/減耗が連動する。
+        with app.get_conn() as conn:
+            conn.execute("DELETE FROM inventory_movements WHERE organization_id = ?", (self.org_id,))
+            conn.execute("DELETE FROM sales WHERE organization_id = ?", (self.org_id,))
+            conn.execute("DELETE FROM purchases WHERE organization_id = ?", (self.org_id,))
+            app.create_product(conn, self.org_id, {"sku": "SHR-1", "product_name": "減耗商品", "purchase_unit_price": 1000})
+            pid = conn.execute("SELECT id FROM products WHERE organization_id=? AND sku='SHR-1'", (self.org_id,)).fetchone()["id"]
+            app.create_purchase(conn, self.org_id, {"product_id": pid, "partner_name": "s", "invoice_no": "SHR-P-1", "transaction_date": "2026-06-10", "received_date": "2026-06-10", "quantity": 10, "unit_price": 1000})
+            physical_before = app.closing_inventory_physical_amount(conn, self.org_id)
+            self.assertEqual(physical_before, 10000.0)  # 10 × 1000
+            # 実地8個に評価減（2個の減耗 = 2000）
+            r = app.record_shrinkage(conn, self.org_id, {"product_id": pid, "physical_quantity": 8})
+            self.assertEqual(r["delta"], -2)
+            physical_after = app.closing_inventory_physical_amount(conn, self.org_id)
+            book_after = app.closing_inventory_book_amount(conn, self.org_id)
+            shrink = app.shrinkage_value(conn, self.org_id)
+            stock = app.stock_by_product(conn, self.org_id).get(pid, 0)
+        self.assertEqual(physical_after, 8000.0)   # 実地＝評価減後
+        self.assertEqual(book_after, 10000.0)      # 帳簿＝評価減を戻した額
+        self.assertEqual(shrink, 2000.0)           # 棚卸減耗
+        self.assertEqual(stock, 8)                 # 在庫一覧の数量も実地
 
     def test_push_closing_inventory_rejects_bad_period(self):
         with app.get_conn() as conn:
