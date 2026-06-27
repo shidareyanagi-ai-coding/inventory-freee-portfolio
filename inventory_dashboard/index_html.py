@@ -324,6 +324,7 @@ _INDEX_TEMPLATE = r"""
         </label>
       </div>
       <div class="chart-wrap"><canvas id="forecastChart"></canvas></div>
+      <div id="forecastModelInfo" style="background:#f7faf9;border:1px solid var(--line);border-left:3px solid #256c64;border-radius:8px;padding:10px 14px;margin:4px 0 14px;font-size:13px;line-height:1.6;"></div>
       <div>
         <h3 class="sub">モデル比較と発注判定 <span id="forecastTargetName" style="font-weight:normal;color:var(--muted);font-size:13px;"></span></h3>
         <div id="forecastCandidates"></div>
@@ -560,6 +561,44 @@ _INDEX_TEMPLATE = r"""
     const MODEL_LABELS = { baseline: "ベースライン", sarima: "SARIMA", lightgbm: "LightGBM" };
     function modelLabel(name) { return MODEL_LABELS[name] || name || "—"; }
 
+    // 各モデルの特徴・計算ロジック・チャートの形の傾向（知識がなくても読める説明。チャート下に表示）。
+    const MODEL_INFO = {
+      baseline: {
+        label: "ベースライン（移動平均 × 季節）",
+        feature: "いちばん素直なモデル。直近の平均的な売れ方を、月ごとの季節のクセだけで微調整します。追加ライブラリが要らず必ず動く“土台”。",
+        logic: "直近28日の平均販売数 × その月の季節係数（その月の平均 ÷ 全期間の平均）。曜日は見ません。",
+        shape: "月内はほぼ水平な一定線になりやすい（曜日の波は出ない）。急なスパイクは平均に薄まるので追わず、外れ値に強く安定。",
+      },
+      sarima: {
+        label: "SARIMA（古典的な時系列モデル）",
+        feature: "統計学の王道。過去の自分自身の値（自己回帰）と1週間(7日)の周期を数式で捉えます。収束しない時は Holt-Winters（指数平滑）に自動で切り替え。",
+        logic: "直前の値の流れ ＋ 差分（トレンド）＋ 週次の季節性(7日)。直近の水準・傾きを引き継いで先へ伸ばします。",
+        shape: "なめらかな曲線で、平日が高く週末が低い“週の波”を描きやすい。",
+      },
+      lightgbm: {
+        label: "LightGBM（機械学習・勾配ブースティング）",
+        feature: "非線形や複数の要因を学習できる主役。中央値と80%区間を分位点回帰で直接予測します。",
+        logic: "カレンダー（曜日・月）＋ 過去の値（ラグ）＋ 外部要因 を、多数の決定木で非線形に学習し、1日ずつ再帰的に予測。",
+        shape: "学習した曜日・ラグのパターンを反映してギザギザ・不規則になりやすい。直近データに敏感で、直近が0続きだと中央値が0付近に沈むことがある（データ量と連続性が効く）。",
+      },
+    };
+    // チャートで実際に描画したモデルの説明をチャート下の欄に表示する。
+    function updateModelInfo(modelName) {
+      const box = document.getElementById("forecastModelInfo");
+      if (!box) return;
+      const info = MODEL_INFO[modelName];
+      if (!info) { box.innerHTML = ""; return; }
+      const autoNote = currentModel() ? "" :
+        ` <span style="background:#e6f3ec;color:#256c64;border-radius:4px;padding:1px 6px;font-size:11px;">自動(最良)で選択中</span>`;
+      box.innerHTML =
+        `<div style="margin-bottom:4px;"><strong>📈 ${info.label}</strong>${autoNote}</div>`
+        + `<div>・<b>特徴</b>：${info.feature}</div>`
+        + `<div>・<b>重視する計算</b>：${info.logic}</div>`
+        + `<div>・<b>チャートに出やすい形</b>：${info.shape}</div>`
+        + `<div style="color:var(--muted);font-size:12px;margin-top:6px;border-top:1px dashed var(--line);padding-top:6px;">`
+        + `共通：学習データは取り込んだ需要履歴の<b>全期間</b>（このデモは約1年）。「28日」は精度評価(MAE)に使う直近ホールドアウトだけで、学習自体は全期間を使います。予測は30日先まで。各商品は<b>MAEが最小のモデルを★最良として自動採用</b>します。</div>`;
+    }
+
     // 需要予測レベル2のモデル選択（""＝自動＝最良）。在庫一覧・適正在庫シミュレーション・発注判定を駆動する。
     function currentModel() {
       const el = document.getElementById("forecastModel");
@@ -626,6 +665,7 @@ _INDEX_TEMPLATE = r"""
     function renderForecastChart(data) {
       const actual = data.actual || [];
       const forecast = data.forecast || [];
+      updateModelInfo(data.model_name);   // チャート下に、描画したモデルの特徴・ロジック・形の傾向を表示
       const note = document.getElementById("forecastMlNote");
       if (typeof Chart === "undefined") {
         note.textContent = "グラフ描画ライブラリ(Chart.js)を読み込めませんでした（ネットワークをご確認ください）。";
