@@ -1664,9 +1664,12 @@ def forecast_series(conn: db.Connection, organization_id: int, product_id: int, 
         ).fetchall()
     ]
     if not model_name:
-        for preferred in ("lightgbm", "sarima", "baseline"):
-            if preferred in present:
-                model_name = preferred
+        # 「自動(最良)」＝バックテスト MAE 最小のモデル（モデル比較表の★・在庫一覧の推奨発注と同じ基準）。
+        # 以前は lightgbm 優先の固定順だったため、最良でないモデルを描画して予測線がチャート上で
+        # 食い違っていた。_ranked_models（MAE昇順）で選び直し、表・在庫一覧と一致させる。
+        for candidate in _ranked_models(conn, organization_id):
+            if candidate in present:
+                model_name = candidate
                 break
         if not model_name and present:
             model_name = present[0]
