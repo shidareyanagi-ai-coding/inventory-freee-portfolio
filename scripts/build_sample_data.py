@@ -7,7 +7,9 @@
 from __future__ import annotations
 
 import json
+import math
 import urllib.request
+from datetime import date, timedelta
 
 INV = "http://127.0.0.1:8056"
 
@@ -59,25 +61,48 @@ for sku, d, qty, sup, inv in PURCHASES:
     })
 print("purchases:", len(PURCHASES))
 
-# --- 3. 月中に売上（出庫）。期末在庫が残るよう合計＜仕入。 -------------------
+# --- 3. 月中に売上（出庫）。日次の小口で月合計を作る＝過去の日次需要と地続きにする。 ----
+# 各商品の6月“月合計”は固定（USB-C 165 など）。会計・突合・期末在庫は月合計が同じなので不変。
+# 一方チャートの実績は年間通して連続した日次になり、「6月だけ大口スパイク→7月急落」の不自然さを解消する。
+# 月合計は仕入＜売上にせず期末在庫を残す（USB-C: 仕入200・売上165→在庫35 など）。
 CUSTOMERS = ["オフィス相模", "スタートアップ田中商店", "個人ユーザーK"]
-# USB-C-1M / USB-HUB は月末に追加売上を入れ、在庫を必要水準より下げて「発注を促す」表示を作る。
-SALES = {
-    "USB-C-1M": [("2026-06-05", 40), ("2026-06-11", 30), ("2026-06-17", 50), ("2026-06-23", 30), ("2026-06-25", 15)],
-    "WL-MOUSE": [("2026-06-06", 15), ("2026-06-12", 20), ("2026-06-18", 10), ("2026-06-24", 15)],
-    "MON-24": [("2026-06-07", 5), ("2026-06-13", 4), ("2026-06-19", 6), ("2026-06-24", 5)],
-    "USB-HUB": [("2026-06-08", 20), ("2026-06-14", 15), ("2026-06-20", 20), ("2026-06-24", 15), ("2026-06-25", 15)],
-    "PC-STAND": [("2026-06-09", 12), ("2026-06-15", 10), ("2026-06-21", 13), ("2026-06-23", 10)],
-}
+SALE_END = date(2026, 6, 25)
+# (sku, 6月の月合計, 売上開始日=仕入の翌日, 波の位相)
+SALES_PLAN = [
+    ("USB-C-1M", 165, date(2026, 6, 3), 0.0),
+    ("WL-MOUSE", 60, date(2026, 6, 3), 1.1),
+    ("MON-24", 20, date(2026, 6, 4), 2.0),
+    ("USB-HUB", 85, date(2026, 6, 4), 3.2),
+    ("PC-STAND", 45, date(2026, 6, 5), 4.0),
+]
 # 棚卸減耗のデモ: 商品ごとに実地数量を入力して在庫を評価減（帳簿>実地→棚卸減耗損）。
 SHRINKAGE = [("MON-24", 9)]  # 24インチモニター: 帳簿10 → 実地9（1個・¥12,000 の減耗）
+
+
+def distribute_daily(total, start, end, phase):
+    """total個を [start,end] の日次に配分（平日多め・週末少なめ＋ゆるい波）。整数で合計=total。"""
+    days = [start + timedelta(days=i) for i in range((end - start).days + 1)]
+    weights = []
+    for i, d in enumerate(days):
+        wf = 1.0 if d.weekday() < 5 else 0.45            # 平日多め・週末少なめ（B2B）
+        wiggle = 1.0 + 0.18 * math.sin(i * 0.7 + phase)
+        weights.append(max(0.0, wf * wiggle))
+    s = sum(weights) or 1.0
+    raw = [total * w / s for w in weights]
+    floors = [int(x) for x in raw]
+    rem = total - sum(floors)                            # 端数を最大剰余法で配り、合計を total に一致させる
+    for idx in sorted(range(len(days)), key=lambda j: raw[j] - floors[j], reverse=True)[:rem]:
+        floors[idx] += 1
+    return [(days[i].isoformat(), floors[i]) for i in range(len(days)) if floors[i] > 0]
+
+
 n = 0
-for sku, rows in SALES.items():
+for sku, total, start, phase in SALES_PLAN:
     p = prods[sku]
-    for i, (d, qty) in enumerate(rows):
+    for d, qty in distribute_daily(total, start, SALE_END, phase):
         n += 1
         call("POST", "/api/sales", {
-            "product_id": p["id"], "partner_name": CUSTOMERS[(i) % len(CUSTOMERS)],
+            "product_id": p["id"], "partner_name": CUSTOMERS[n % len(CUSTOMERS)],
             "invoice_no": f"S-2026-06-{n:03d}", "transaction_date": d, "quantity": qty,
             "unit_price": p["sales_unit_price"], "tax_rate": 10, "due_date": "2026-07-31",
         })

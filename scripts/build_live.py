@@ -43,16 +43,36 @@ PURCHASES = [
     ("PC-STAND", "2026-06-04", 60, "テックサプライ", "P-2026-06-005"),
 ]
 CUSTOMERS = ["オフィス相模", "スタートアップ田中商店", "個人ユーザーK"]
-# USB-C-1M / USB-HUB は月末に追加売上を入れ、在庫を必要水準より下げて「発注を促す」表示を作る。
-SALES = {
-    "USB-C-1M": [("2026-06-05", 40), ("2026-06-11", 30), ("2026-06-17", 50), ("2026-06-23", 30), ("2026-06-25", 15)],
-    "WL-MOUSE": [("2026-06-06", 15), ("2026-06-12", 20), ("2026-06-18", 10), ("2026-06-24", 15)],
-    "MON-24": [("2026-06-07", 5), ("2026-06-13", 4), ("2026-06-19", 6), ("2026-06-24", 5)],
-    "USB-HUB": [("2026-06-08", 20), ("2026-06-14", 15), ("2026-06-20", 20), ("2026-06-24", 15), ("2026-06-25", 15)],
-    "PC-STAND": [("2026-06-09", 12), ("2026-06-15", 10), ("2026-06-21", 13), ("2026-06-23", 10)],
-}
+# 6月の売上は「日次の小口」で月合計を作る＝過去の日次需要と地続きにする（チャートの「6月だけ大口
+# スパイク→7月急落」を解消）。月合計は固定なので会計・突合・期末在庫は不変。
+SALE_END = date(2026, 6, 25)
+# (sku, 6月の月合計, 売上開始日=仕入の翌日, 波の位相)
+SALES_PLAN = [
+    ("USB-C-1M", 165, date(2026, 6, 3), 0.0),
+    ("WL-MOUSE", 60, date(2026, 6, 3), 1.1),
+    ("MON-24", 20, date(2026, 6, 4), 2.0),
+    ("USB-HUB", 85, date(2026, 6, 4), 3.2),
+    ("PC-STAND", 45, date(2026, 6, 5), 4.0),
+]
 # 棚卸減耗のデモ: 商品ごとに実地数量へ評価減（帳簿>実地→棚卸減耗損）。
 SHRINKAGE = [("MON-24", 9)]  # 24インチモニター: 帳簿10 → 実地9（1個・¥12,000 の減耗）
+
+
+def distribute_daily(total, start, end, phase):
+    """total個を [start,end] の日次に配分（平日多め・週末少なめ＋ゆるい波）。整数で合計=total。"""
+    days = [start + timedelta(days=i) for i in range((end - start).days + 1)]
+    weights = []
+    for i, d in enumerate(days):
+        wf = 1.0 if d.weekday() < 5 else 0.45
+        wiggle = 1.0 + 0.18 * math.sin(i * 0.7 + phase)
+        weights.append(max(0.0, wf * wiggle))
+    s = sum(weights) or 1.0
+    raw = [total * w / s for w in weights]
+    floors = [int(x) for x in raw]
+    rem = total - sum(floors)
+    for idx in sorted(range(len(days)), key=lambda j: raw[j] - floors[j], reverse=True)[:rem]:
+        floors[idx] += 1
+    return [(days[i].isoformat(), floors[i]) for i in range(len(days)) if floors[i] > 0]
 DEMAND_BASE = [
     ("USB-C-1M", "USB-Cケーブル 1m", 6.0, 0.0, 980),
     ("WL-MOUSE", "ワイヤレスマウス", 2.6, 1.1, 2480),
@@ -147,7 +167,7 @@ def main() -> None:
     print(f"  疑似freee 送信先     : {app.PSEUDO_FREEE_API_URL}")
     print(f"  疑似freee DB消去先   : {'postgres(Neon)' if PF_DB_URL.startswith('postgres') else 'ローカルSQLite'}")
     print(f"  対象組織             : id={org_id} ({org_name})  ※全{len(orgs)}組織")
-    print(f"  投入内容             : 商品{len(PRODUCTS)} / 仕入{len(PURCHASES)} / 売上{sum(len(v) for v in SALES.values())} / 需要履歴(約1年)")
+    print(f"  投入内容             : 商品{len(PRODUCTS)} / 仕入{len(PURCHASES)} / 売上(6月月合計){sum(t for _, t, _, _ in SALES_PLAN)}個を日次小口 / 需要履歴(約1年)")
     if not APPLY:
         print("\n[下見のみ] 実際に消して入れ直すには、末尾に --yes を付けて再実行してください。")
         return
@@ -176,12 +196,12 @@ def main() -> None:
                 "unit_price": p["purchase_unit_price"], "tax_rate": 10, "due_date": "2026-07-31",
             })
         n = 0
-        for sku, rows in SALES.items():
+        for sku, total, start, phase in SALES_PLAN:
             p = prods[sku]
-            for i, (d, qty) in enumerate(rows):
+            for d, qty in distribute_daily(total, start, SALE_END, phase):
                 n += 1
                 app.create_sale(conn, org_id, {
-                    "product_id": p["id"], "partner_name": CUSTOMERS[i % len(CUSTOMERS)],
+                    "product_id": p["id"], "partner_name": CUSTOMERS[n % len(CUSTOMERS)],
                     "invoice_no": f"S-2026-06-{n:03d}", "transaction_date": d, "quantity": qty,
                     "unit_price": p["sales_unit_price"], "tax_rate": 10, "due_date": "2026-07-31",
                 })
