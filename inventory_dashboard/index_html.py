@@ -43,6 +43,11 @@ _INDEX_TEMPLATE = r"""
     .metric strong { display: block; margin-top: 6px; font-size: 22px; }
     .metric.risk-alert span, .metric.risk-alert strong { color: var(--danger); }
     .top-grid { display: grid; grid-template-columns: minmax(430px, 1.45fr) minmax(260px, 1fr) minmax(260px, 1fr); gap: 14px; align-items: start; }
+    .inventory-panel { margin-bottom: 14px; }
+    .monthly-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; align-items: start; }
+    /* 在庫一覧は列が多い（帳簿/実地/減耗 ×数量・金額）。溢れて重ならないよう横スクロール＋折り返し無し。 */
+    #products { overflow-x: auto; }
+    #products table { white-space: nowrap; }
     .ledger-entry-grid { display: grid; grid-template-columns: minmax(0, 1fr) 360px; gap: 16px; align-items: start; }
     .ledger-column { display: grid; gap: 14px; align-content: start; min-width: 0; }
     .bottom-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(360px, .72fr); gap: 16px; align-items: start; }
@@ -127,7 +132,7 @@ _INDEX_TEMPLATE = r"""
     .badge.draft { background: #fdeee9; color: var(--accent-2); }
     .danger-link { background: none; border: 0; color: var(--danger); font-weight: 700; cursor: pointer; padding: 2px 4px; }
     @media (max-width: 900px) {
-      .metrics, .top-grid, .ledger-entry-grid, .bottom-grid, .forecast-grid, .voucher-grid { grid-template-columns: 1fr; }
+      .metrics, .top-grid, .monthly-grid, .ledger-entry-grid, .bottom-grid, .forecast-grid, .voucher-grid { grid-template-columns: 1fr; }
       .entry-panel { position: static; }
       main { padding: 12px; }
       table { display: block; overflow-x: auto; }
@@ -172,11 +177,11 @@ _INDEX_TEMPLATE = r"""
   <main>
     <section class="metrics" id="metrics"></section>
     <div id="modelWarning" style="display:none;margin:0 0 14px;padding:10px 14px;border:1px solid #f3beb7;background:#fff7f6;color:var(--danger);border-radius:8px;font-size:13px;font-weight:600;"></div>
-    <section class="top-grid">
-      <div class="panel">
-        <h2>在庫一覧</h2>
-        <div id="products"></div>
-      </div>
+    <section class="panel inventory-panel">
+      <h2>在庫一覧</h2>
+      <div id="products"></div>
+    </section>
+    <section class="monthly-grid">
       <div class="summary-box">
         <h3>今月仕入 商品別（税込）</h3>
         <div id="monthlyPurchases"></div>
