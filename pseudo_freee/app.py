@@ -2582,7 +2582,7 @@ def render_index(filters: dict[str, str] | None = None) -> bytes:
         income = calculate_income_statement(conn)
         sheet = calculate_balance_sheet(conn)
 
-    rows = ""
+    row_list = []
     for deal in deals:
         badge_class = "income" if deal["deal_type"] == "income" else "expense"
         # Phase C: 在庫側の取消で流れてくる「取消仕訳」はマイナス金額の deal。見分けが付くよう
@@ -2605,7 +2605,7 @@ def render_index(filters: dict[str, str] | None = None) -> bytes:
             )
         else:
             action_cell = '<span class="label">在庫側で管理</span>'
-        rows += f"""
+        row_list.append(f"""
         <tr>
           <td><a href="/deals/{deal["id"]}">#{deal["id"]}</a></td>
           <td>{html.escape(deal["issue_date"])}</td>
@@ -2618,7 +2618,7 @@ def render_index(filters: dict[str, str] | None = None) -> bytes:
           <td>{html.escape(source_label)}{queue_label}</td>
           <td>{html.escape(deal["created_at"])}</td>
           <td>{action_cell}</td>
-        </tr>"""
+        </tr>""")
 
     trend_rows = ""
     for trend in trends:
@@ -2678,9 +2678,10 @@ def render_index(filters: dict[str, str] | None = None) -> bytes:
     )
     tax_category_list = "".join(f"<li>{html.escape(value)}</li>" for value in masters["tax_categories"])
 
-    table = (
-        f"""
-        <table>
+    # 取引一覧は長くなりがち（在庫連携で毎日小口の売上が積まれる）。最新 VISIBLE_DEALS 件だけ
+    # 開いておき、残りは「畳む／表示」ボタンで開閉できるようにする。
+    VISIBLE_DEALS = 10
+    thead = """
           <thead>
             <tr>
               <th>取引ID</th>
@@ -2695,12 +2696,36 @@ def render_index(filters: dict[str, str] | None = None) -> bytes:
               <th>登録日時</th>
               <th>操作</th>
             </tr>
-          </thead>
-          <tbody>{rows}</tbody>
+          </thead>"""
+    if not row_list:
+        table = '<div class="empty">条件に一致する取引はありません。</div>'
+    elif len(row_list) <= VISIBLE_DEALS:
+        table = f"""
+        <table>{thead}
+          <tbody>{"".join(row_list)}</tbody>
         </table>"""
-        if rows
-        else '<div class="empty">条件に一致する取引はありません。</div>'
-    )
+    else:
+        hidden_count = len(row_list) - VISIBLE_DEALS
+        show_label = f"残り {hidden_count} 件を表示（全 {len(row_list)} 件）"
+        table = f"""
+        <table>{thead}
+          <tbody>{"".join(row_list[:VISIBLE_DEALS])}</tbody>
+          <tbody id="dealExtraRows" hidden>{"".join(row_list[VISIBLE_DEALS:])}</tbody>
+        </table>
+        <div style="margin-top:10px;text-align:center;">
+          <button type="button" id="dealToggleBtn" data-show="{show_label}" onclick="toggleDealRows()"
+            style="padding:6px 16px;border:1px solid #c7d2e0;border-radius:6px;background:#fff;cursor:pointer;font-size:13px;">
+            {show_label}
+          </button>
+        </div>
+        <script>
+          function toggleDealRows(){{
+            var x=document.getElementById('dealExtraRows'), b=document.getElementById('dealToggleBtn');
+            if(!x||!b) return;
+            if(x.hasAttribute('hidden')){{ x.removeAttribute('hidden'); b.textContent='取引一覧を畳む'; }}
+            else {{ x.setAttribute('hidden',''); b.textContent=b.dataset.show; b.scrollIntoView({{block:'nearest'}}); }}
+          }}
+        </script>"""
 
     body = f"""
       <section class="card" style="border-color:#c7d7ff;background:#f5f8ff;margin-bottom:20px;">
