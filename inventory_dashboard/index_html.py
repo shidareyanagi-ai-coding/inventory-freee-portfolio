@@ -45,9 +45,11 @@ _INDEX_TEMPLATE = r"""
     .top-grid { display: grid; grid-template-columns: minmax(430px, 1.45fr) minmax(260px, 1fr) minmax(260px, 1fr); gap: 14px; align-items: start; }
     .inventory-panel { margin-bottom: 14px; }
     .monthly-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; align-items: start; }
-    /* 在庫一覧は列が多い（帳簿/実地/減耗 ×数量・金額）。溢れて重ならないよう横スクロール＋折り返し無し。 */
-    #products { overflow-x: auto; }
-    #products table { white-space: nowrap; }
+    /* 在庫一覧は列が多い（帳簿/実地/減耗 ×数量・金額）。表だけ横スクロール＋折り返し無し。
+       合計・説明文は枠の外（全幅）に置き、表幅に引っ張られて見切れないようにする。 */
+    .table-scroll { overflow-x: auto; }
+    .table-scroll table { white-space: nowrap; margin-bottom: 0; }
+    #products .note { margin-top: 12px; }
     .ledger-entry-grid { display: grid; grid-template-columns: minmax(0, 1fr) 360px; gap: 16px; align-items: start; }
     .ledger-column { display: grid; gap: 14px; align-content: start; min-width: 0; }
     .bottom-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(360px, .72fr); gap: 16px; align-items: start; }
@@ -491,7 +493,7 @@ _INDEX_TEMPLATE = r"""
       const diffText = diff === 0 ? `<span class="match">在庫総額（実地）と一致</span>` : `<span class="mismatch">差額 ${yen.format(diff)}</span>`;
       const lossQ = (p) => Number(p.shrinkage_quantity || 0) > 0 ? `<span class="mismatch">-${p.shrinkage_quantity}</span>` : "0";
       const lossV = (p) => Number(p.shrinkage_value || 0) > 0 ? `<span class="mismatch">${yen.format(p.shrinkage_value)}</span>` : yen.format(0);
-      document.getElementById("products").innerHTML = table(
+      document.getElementById("products").innerHTML = `<div class="table-scroll">` + table(
         ["SKU", "商品", "仕入単価", "必要水準", "帳簿在庫", "実地在庫", "減耗数量", "状態", "帳簿在庫金額", "実地棚卸金額", "棚卸減耗損", "推奨発注量"],
         products.map(p => [
           p.sku,
@@ -506,7 +508,7 @@ _INDEX_TEMPLATE = r"""
           yen.format(p.stock_value),
           lossV(p),
           p.recommended_order_quantity,
-        ]))
+        ])) + `</div>`
         + `<div class="table-total"><span>合計</span><strong>帳簿 ${yen.format(bookTotal)} ／ 実地 ${yen.format(physTotal)} ／ 棚卸減耗損 ${yen.format(lossTotal)}</strong><span>${diffText}</span></div>`
         + `<p class="note">「仕入単価」＝<b>移動平均法</b>で算出した在庫評価単価（仕入のたびに加重平均で更新）。各金額＝数量×この単価。「帳簿在庫」＝仕入・売上から計算される理論在庫、「実地在庫」＝棚卸でカウントした実在庫、「減耗」＝その差（棚卸減耗損）。実地入力の後も差の経緯が残り、計上根拠を追えます。商品名クリックで在庫元帳（移動平均の推移）。</p>`;
     }
