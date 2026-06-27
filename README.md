@@ -43,21 +43,23 @@
 
 **Phase D（在庫⇄会計の連携・複式簿記）**
 
-| 🔗 会計突合（在庫⇄疑似freee が一致） | 📊 決算書（PL・BS／貸借一致） |
+| 🔗 会計突合（在庫⇄疑似freee が一致） | 📈 モデル比較と発注判定（3モデル・MAE順・★最良） |
 |---|---|
-| ![reconciliation](docs/screenshots/accounting-reconciliation.png) | ![financial-statements](docs/screenshots/financial-statements.png) |
+| ![reconciliation](docs/screenshots/accounting-reconciliation.png) | ![model-comparison](docs/screenshots/model-comparison-order.png) |
 
-| 📈 モデル比較と発注判定（3モデル・MAE順・★最良） | 📤 確実な送信（未送信バッジ＋一括送信・Outbox） |
+| 📤 確実な送信（未送信バッジ＋一括送信・Outbox） | 📦 期末棚卸の連携（在庫評価額 → freee 期末商品） |
 |---|---|
-| ![model-comparison](docs/screenshots/model-comparison-order.png) | ![freee-outbox](docs/screenshots/freee-outbox-unsent.png) |
+| ![freee-outbox](docs/screenshots/freee-outbox-unsent.png) | ![closing-inventory](docs/screenshots/closing-inventory.png) |
 
-| 📦 期末棚卸の連携（在庫評価額 → freee 期末商品） | 🧮 試算表（決算整理後・貸借一致） |
+**📊 決算書＋売上原価の計算過程（三分法・棚卸減耗損）— 実地棚卸で帳簿と差があれば棚卸減耗損（¥12,000）を計上し、三分法で実地ベースの売上原価（¥1,094,550）を導出。その売上原価がそのまま損益計算書(PL)に反映され、貸借対照表(BS)は貸借一致**
+
+![financial-statements](docs/screenshots/financial-statements.png)
+
+| 🧮 試算表（決算整理後・残高試算表／貸借一致） | 📒 在庫元帳に棚卸減耗を計上（帳簿10→実地9・¥12,000） |
 |---|---|
-| ![closing-inventory](docs/screenshots/closing-inventory.png) | ![trial-balance](docs/screenshots/trial-balance.png) |
+| ![trial-balance](docs/screenshots/trial-balance.png) | ![inventory-ledger](docs/screenshots/inventory-ledger.png) |
 
-**🧮 売上原価の計算過程（三分法・棚卸減耗損）— 実地棚卸で帳簿と差があれば棚卸減耗損を計上し、実地ベースの売上原価を導出**
-
-![cogs-calculation](docs/screenshots/cogs-calculation.png)
+> 📒 在庫元帳では実地棚卸の減耗を **区分「棚卸減耗」として1行**で計上し、数量・単価・在庫残高金額の変化として記録します（数字を後から追える監査証跡）。この在庫側の減耗が、決算では棚卸減耗損として売上原価に算入されます。
 
 > 全画面版は [`docs/screenshots/`](docs/screenshots/) にあります。発注点を下回ると在庫一覧に「必要水準割れ」と推奨発注量が表示されます（[dashboard-overview](docs/screenshots/dashboard-overview.png)）。
 
