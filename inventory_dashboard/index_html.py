@@ -365,6 +365,9 @@ _INDEX_TEMPLATE = r"""
         <button type="button" id="closingPushBtn" class="warning">freeeへ送信</button>
       </div>
       <p id="closingResult" style="color:var(--muted);font-size:12px;margin:10px 0 0;"></p>
+      <div class="section-head" style="margin-top:14px;"><h3 class="sub">freee 送信履歴（何を送ったかの記録）</h3></div>
+      <p style="color:var(--muted);font-size:12px;margin:0 0 8px;">「freeeへ送信」した期末棚卸の記録です。在庫一覧の帳簿・実地・棚卸減耗損と照らし合わせる確認表になります。</p>
+      <div id="closingSends"></div>
       <div class="section-head" style="margin-top:16px;"><h3 class="sub">棚卸減耗を記録（実地棚卸）</h3></div>
       <p style="color:var(--muted);font-size:12px;margin:0 0 8px;">実地カウントが帳簿在庫より少ないときに、<strong>商品ごとに実地数量を入力</strong>して在庫を評価減します（在庫一覧・期末在庫・突合にすぐ反映）。記録後、上の「freeeへ送信」で会計へ棚卸減耗損として連携します。</p>
       <div style="display:flex;gap:14px;flex-wrap:wrap;align-items:flex-end;">
@@ -446,6 +449,7 @@ _INDEX_TEMPLATE = r"""
       const queue = await api("/api/freee-sync-queue");
       renderQueue(queue);
       await loadVouchers();
+      await loadClosingSends();
     }
 
     function renderMetrics(data) {
@@ -460,14 +464,31 @@ _INDEX_TEMPLATE = r"""
     }
 
     function renderProducts(products) {
-      const listTotal = products.reduce((sum, p) => sum + Number(p.stock_value || 0), 0);
+      const physTotal = products.reduce((sum, p) => sum + Number(p.stock_value || 0), 0);   // 実地
+      const bookTotal = products.reduce((sum, p) => sum + Number(p.book_value || 0), 0);    // 帳簿
+      const lossTotal = products.reduce((sum, p) => sum + Number(p.shrinkage_value || 0), 0); // 棚卸減耗損
       const dashboardTotal = Number(window.dashboardStockTotal || 0);
-      const diff = listTotal - dashboardTotal;
-      const diffText = diff === 0 ? `<span class="match">在庫総額と一致</span>` : `<span class="mismatch">差額 ${yen.format(diff)}</span>`;
-      document.getElementById("products").innerHTML = table(["SKU", "商品", "必要水準", "現在在庫", "状態", "在庫金額", "推奨発注量"],
-        products.map(p => [p.sku, `<button class="link" onclick="loadLedger(${p.id})">${p.product_name}</button>`, p.required_stock_level, p.stock_quantity, status(p.status), yen.format(p.stock_value), p.recommended_order_quantity]))
-        + `<div class="table-total"><span>在庫一覧 合計</span><strong>${yen.format(listTotal)}</strong><span>${diffText}</span></div>`
-        + `<p class="note">在庫一覧の必要水準・推奨発注量は、適正在庫シミュレーション（AIモデル予測）と同じ基準です。必要水準 = リードタイム需要(予測) + 安全在庫。</p>`;
+      const diff = physTotal - dashboardTotal;
+      const diffText = diff === 0 ? `<span class="match">在庫総額（実地）と一致</span>` : `<span class="mismatch">差額 ${yen.format(diff)}</span>`;
+      const lossQ = (p) => Number(p.shrinkage_quantity || 0) > 0 ? `<span class="mismatch">-${p.shrinkage_quantity}</span>` : "0";
+      const lossV = (p) => Number(p.shrinkage_value || 0) > 0 ? `<span class="mismatch">${yen.format(p.shrinkage_value)}</span>` : yen.format(0);
+      document.getElementById("products").innerHTML = table(
+        ["SKU", "商品", "必要水準", "帳簿在庫", "実地在庫", "減耗数量", "状態", "帳簿在庫金額", "実地棚卸金額", "棚卸減耗損", "推奨発注量"],
+        products.map(p => [
+          p.sku,
+          `<button class="link" onclick="loadLedger(${p.id})">${p.product_name}</button>`,
+          p.required_stock_level,
+          p.book_quantity,
+          p.stock_quantity,
+          lossQ(p),
+          status(p.status),
+          yen.format(p.book_value),
+          yen.format(p.stock_value),
+          lossV(p),
+          p.recommended_order_quantity,
+        ]))
+        + `<div class="table-total"><span>合計</span><strong>帳簿 ${yen.format(bookTotal)} ／ 実地 ${yen.format(physTotal)} ／ 棚卸減耗損 ${yen.format(lossTotal)}</strong><span>${diffText}</span></div>`
+        + `<p class="note">「帳簿在庫」＝仕入・売上から計算される理論在庫、「実地在庫」＝棚卸でカウントした実在庫、「減耗」＝その差（棚卸減耗損）。実地入力の後も差の経緯が残り、計上根拠を追えます。必要水準・推奨発注量は適正在庫シミュレーション（AI予測）と同じ基準。</p>`;
     }
 
     function renderMonthlySummary(elementId, rows, total, totalLabel) {
@@ -1362,10 +1383,36 @@ _INDEX_TEMPLATE = r"""
         const diff = r.book_amount - r.physical_amount;
         const shrinkText = diff > 0 ? ` 棚卸減耗 ${yen.format(diff)} を棚卸減耗損として計上。` : "";
         el.textContent = `送信しました（${r.period}）: 帳簿棚卸高 ${yen.format(r.book_amount)} / 実地棚卸高 ${yen.format(r.physical_amount)}。${shrinkText}疑似freee の決算（商品・売上原価・BS）に反映されます。`;
+        await loadClosingSends();
       } catch (e) {
         el.textContent = "送信に失敗しました: " + e.message;
       }
     });
+
+    async function loadClosingSends() {
+      const el = document.getElementById("closingSends");
+      if (!el) return;
+      let data;
+      try {
+        data = await api("/api/closing-inventory/sends");
+      } catch (e) {
+        el.innerHTML = `<p class="note">送信履歴を取得できません: ${e.message}</p>`;
+        return;
+      }
+      const sends = (data && data.sends) || [];
+      if (!sends.length) {
+        el.innerHTML = `<p class="note">まだ送信履歴はありません。「freeeへ送信」すると、送信日時・対象期・帳簿/実地/棚卸減耗損がここに記録されます。</p>`;
+        return;
+      }
+      el.innerHTML = table(["送信日時", "対象期", "帳簿棚卸高", "実地棚卸高", "棚卸減耗損"],
+        sends.map(s => [
+          (s.sent_at || "").replace("T", " ").slice(0, 16),
+          s.period,
+          yen.format(s.book_amount),
+          yen.format(s.physical_amount),
+          Number(s.shrinkage_amount || 0) > 0 ? `<span class="mismatch">${yen.format(s.shrinkage_amount)}</span>` : yen.format(0),
+        ]));
+    }
 
     let currentVouchers = [];
     let vouchersExpanded = false;

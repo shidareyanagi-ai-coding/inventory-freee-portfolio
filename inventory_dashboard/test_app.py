@@ -570,6 +570,47 @@ class InventoryAppTest(unittest.TestCase):
         self.assertEqual(shrink, 2000.0)           # 棚卸減耗
         self.assertEqual(stock, 8)                 # 在庫一覧の数量も実地
 
+    def test_list_products_exposes_book_physical_shrinkage(self):
+        # 在庫一覧に 帳簿/実地/減耗 の数量・金額が出る（トレーサビリティ）。
+        with app.get_conn() as conn:
+            conn.execute("DELETE FROM inventory_movements WHERE organization_id = ?", (self.org_id,))
+            conn.execute("DELETE FROM sales WHERE organization_id = ?", (self.org_id,))
+            conn.execute("DELETE FROM purchases WHERE organization_id = ?", (self.org_id,))
+            app.create_product(conn, self.org_id, {"sku": "BPS-1", "product_name": "可視化商品", "purchase_unit_price": 1000})
+            pid = conn.execute("SELECT id FROM products WHERE organization_id=? AND sku='BPS-1'", (self.org_id,)).fetchone()["id"]
+            app.create_purchase(conn, self.org_id, {"product_id": pid, "partner_name": "s", "invoice_no": "BPS-P-1", "transaction_date": "2026-06-10", "received_date": "2026-06-10", "quantity": 10, "unit_price": 1000})
+            app.record_shrinkage(conn, self.org_id, {"product_id": pid, "physical_quantity": 8})
+            prod = next(p for p in app.list_products(conn, self.org_id) if p["id"] == pid)
+        self.assertEqual(prod["book_quantity"], 10)
+        self.assertEqual(prod["stock_quantity"], 8)       # 実地
+        self.assertEqual(prod["shrinkage_quantity"], 2)
+        self.assertEqual(prod["book_value"], 10000)
+        self.assertEqual(prod["stock_value"], 8000)        # 実地金額
+        self.assertEqual(prod["shrinkage_value"], 2000)    # 棚卸減耗損
+
+    def test_push_records_send_history(self):
+        # 期末在庫の送信が履歴として残る（何を送ったか後から追跡できる）。
+        def fake_urlopen(request, timeout):
+            body = json.loads(request.data.decode("utf-8"))
+            return FakeResponse({"ok": True, "period": body["period"], "book_amount": body["book_amount"], "physical_amount": body["physical_amount"]})
+
+        with app.get_conn() as conn:
+            conn.execute("DELETE FROM inventory_movements WHERE organization_id = ?", (self.org_id,))
+            conn.execute("DELETE FROM sales WHERE organization_id = ?", (self.org_id,))
+            conn.execute("DELETE FROM purchases WHERE organization_id = ?", (self.org_id,))
+            app.create_product(conn, self.org_id, {"sku": "SND-1", "product_name": "履歴商品", "purchase_unit_price": 1000})
+            pid = conn.execute("SELECT id FROM products WHERE organization_id=? AND sku='SND-1'", (self.org_id,)).fetchone()["id"]
+            app.create_purchase(conn, self.org_id, {"product_id": pid, "partner_name": "s", "invoice_no": "SND-P-1", "transaction_date": "2026-06-10", "received_date": "2026-06-10", "quantity": 10, "unit_price": 1000})
+            app.record_shrinkage(conn, self.org_id, {"product_id": pid, "physical_quantity": 8})
+            with patch("app.urllib.request.urlopen", fake_urlopen):
+                app.push_closing_inventory(conn, self.org_id, {"period": "202606"})
+            sends = app.list_closing_inventory_sends(conn, self.org_id)
+        self.assertEqual(len(sends), 1)
+        self.assertEqual(sends[0]["period"], "202606")
+        self.assertEqual(sends[0]["book_amount"], 10000)
+        self.assertEqual(sends[0]["physical_amount"], 8000)
+        self.assertEqual(sends[0]["shrinkage_amount"], 2000)
+
     def test_push_closing_inventory_rejects_bad_period(self):
         with app.get_conn() as conn:
             with self.assertRaises(ValueError):

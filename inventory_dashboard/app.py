@@ -550,15 +550,34 @@ def stock_by_product(conn: db.Connection, organization_id: int, as_of: str | Non
     return {row["product_id"]: int(row["stock_quantity"]) for row in rows}
 
 
+def shrinkage_qty_by_product(conn: db.Connection, organization_id: int) -> dict[int, int]:
+    """商品ごとの棚卸減耗の数量（負：評価減）。source_type='shrinkage' の移動の合計。"""
+    rows = conn.execute(
+        "SELECT product_id, COALESCE(SUM(quantity_delta), 0) AS d FROM inventory_movements "
+        "WHERE organization_id = ? AND source_type = 'shrinkage' GROUP BY product_id",
+        (organization_id,),
+    ).fetchall()
+    return {row["product_id"]: int(row["d"]) for row in rows}
+
+
 def list_products(conn: db.Connection, organization_id: int) -> list[dict[str, Any]]:
-    stocks = stock_by_product(conn, organization_id)
+    stocks = stock_by_product(conn, organization_id)            # 実地（減耗反映後）
+    shrink = shrinkage_qty_by_product(conn, organization_id)    # 減耗数量（負）
     products = conn.execute(
         "SELECT * FROM products WHERE organization_id = ? ORDER BY id", (organization_id,)
     ).fetchall()
     for product in products:
-        stock = stocks.get(product["id"], 0)
-        product["stock_quantity"] = stock
-        product["stock_value"] = stock * product["purchase_unit_price"]
+        stock = stocks.get(product["id"], 0)                    # 実地在庫数量
+        price = product["purchase_unit_price"]
+        shrink_delta = shrink.get(product["id"], 0)             # 減耗（負）
+        book_qty = stock - shrink_delta                         # 帳簿在庫数量 = 実地 − 減耗(負) = 実地 + |減耗|
+        loss_qty = -shrink_delta                                # 棚卸減耗の数量（正）
+        product["stock_quantity"] = stock                       # 実地在庫（従来の現在在庫＝実地）
+        product["stock_value"] = stock * price                  # 実地棚卸金額（従来の在庫金額＝実地）
+        product["book_quantity"] = book_qty                     # 帳簿在庫数量
+        product["book_value"] = book_qty * price                # 帳簿在庫金額
+        product["shrinkage_quantity"] = loss_qty                # 棚卸減耗 数量（正）
+        product["shrinkage_value"] = loss_qty * price           # 棚卸減耗損（金額）
         product["status"] = stock_status(product)
         product["required_stock_level"] = int(product["reorder_point"]) + int(product["safety_stock"])
         product["recommended_order_quantity"] = recommended_order_quantity(product, stock)
@@ -836,13 +855,38 @@ def push_closing_inventory(conn: db.Connection, organization_id: int, data: dict
         raise ValueError(f"疑似freeeに接続できません: {reason}") from exc
     if not response_data.get("ok"):
         raise ValueError(str(response_data.get("error") or "疑似freee の期末棚卸登録に失敗しました"))
+    # 送信履歴を残す（何を freee へ送ったかを後から追跡できるようにする＝監査証跡）。
+    conn.execute(
+        """
+        INSERT INTO closing_inventory_sends
+            (organization_id, period, book_amount, physical_amount, shrinkage_amount)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (organization_id, period, book_amount, physical_amount, book_amount - physical_amount),
+    )
     return {
         "ok": True,
         "period": period,
         "as_of": as_of or "",
         "book_amount": book_amount,
         "physical_amount": physical_amount,
+        "shrinkage_amount": book_amount - physical_amount,
     }
+
+
+def list_closing_inventory_sends(conn: db.Connection, organization_id: int, limit: int = 20) -> list[dict[str, Any]]:
+    """期末在庫の送信履歴（新しい順）。在庫一覧との照合チェック表に使う。"""
+    rows = conn.execute(
+        """
+        SELECT period, book_amount, physical_amount, shrinkage_amount, sent_at
+        FROM closing_inventory_sends
+        WHERE organization_id = ?
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (organization_id, limit),
+    ).fetchall()
+    return [dict(row) for row in rows]
 
 
 def _fetch_pseudo_freee_reconciliation() -> dict[str, Any] | None:
@@ -2741,6 +2785,13 @@ def api_push_closing_inventory(data: dict[str, Any] = Depends(parse_json_body), 
             {"book_amount": result["book_amount"], "physical_amount": result["physical_amount"]},
         )
         return result
+
+
+@app.get("/api/closing-inventory/sends")
+def api_closing_inventory_sends(identity: Identity = Depends(current_identity)) -> dict[str, Any]:
+    """期末在庫の送信履歴（帳簿・実地・棚卸減耗を何月何日に送ったか）。"""
+    with get_conn() as conn:
+        return {"ok": True, "sends": list_closing_inventory_sends(conn, identity.organization_id)}
 
 
 @app.get("/api/reconciliation")
