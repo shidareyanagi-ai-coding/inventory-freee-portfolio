@@ -561,23 +561,23 @@ def shrinkage_qty_by_product(conn: db.Connection, organization_id: int) -> dict[
 
 
 def list_products(conn: db.Connection, organization_id: int) -> list[dict[str, Any]]:
-    stocks = stock_by_product(conn, organization_id)            # 実地（減耗反映後）
-    shrink = shrinkage_qty_by_product(conn, organization_id)    # 減耗数量（負）
+    state = inventory_state(conn, organization_id)             # 移動平均法で 数量・平均単価・減耗 を再生
     products = conn.execute(
         "SELECT * FROM products WHERE organization_id = ? ORDER BY id", (organization_id,)
     ).fetchall()
     for product in products:
-        stock = stocks.get(product["id"], 0)                    # 実地在庫数量
-        price = product["purchase_unit_price"]
-        shrink_delta = shrink.get(product["id"], 0)             # 減耗（負）
-        book_qty = stock - shrink_delta                         # 帳簿在庫数量 = 実地 − 減耗(負) = 実地 + |減耗|
-        loss_qty = -shrink_delta                                # 棚卸減耗の数量（正）
-        product["stock_quantity"] = stock                       # 実地在庫（従来の現在在庫＝実地）
-        product["stock_value"] = stock * price                  # 実地棚卸金額（従来の在庫金額＝実地）
-        product["book_quantity"] = book_qty                     # 帳簿在庫数量
-        product["book_value"] = book_qty * price                # 帳簿在庫金額
-        product["shrinkage_quantity"] = loss_qty                # 棚卸減耗 数量（正）
-        product["shrinkage_value"] = loss_qty * price           # 棚卸減耗損（金額）
+        s = state.get(product["id"], {"qty": 0.0, "avg": 0.0, "shrink": 0.0})
+        stock = max(int(s["qty"]), 0)                          # 実地在庫数量
+        avg = s["avg"]                                          # 移動平均単価
+        loss_qty = int(s["shrink"])                            # 棚卸減耗の数量（正）
+        book_qty = stock + loss_qty                            # 帳簿在庫数量 = 実地 + 減耗
+        product["stock_quantity"] = stock                      # 実地在庫
+        product["unit_cost"] = round(avg, 2)                   # 移動平均単価（単価列）
+        product["stock_value"] = round(stock * avg)            # 実地棚卸金額
+        product["book_quantity"] = book_qty                    # 帳簿在庫数量
+        product["book_value"] = round(book_qty * avg)          # 帳簿在庫金額
+        product["shrinkage_quantity"] = loss_qty               # 棚卸減耗 数量（正）
+        product["shrinkage_value"] = round(loss_qty * avg)     # 棚卸減耗損（金額）
         product["status"] = stock_status(product)
         product["required_stock_level"] = int(product["reorder_point"]) + int(product["safety_stock"])
         product["recommended_order_quantity"] = recommended_order_quantity(product, stock)
@@ -732,51 +732,62 @@ def push_partner_rename(
     return {"ok": True, "updated_deals": int(data.get("updated_deals", 0))}
 
 
-def _purchase_prices(conn: db.Connection, organization_id: int) -> dict[int, float]:
-    return {
-        row["id"]: float(row["purchase_unit_price"])
-        for row in conn.execute(
-            "SELECT id, purchase_unit_price FROM products WHERE organization_id = ?", (organization_id,)
-        ).fetchall()
-    }
+def inventory_state(conn: db.Connection, organization_id: int, as_of: str | None = None) -> dict[int, dict[str, float]]:
+    """**移動平均法**で在庫を再生し、商品ごとに 実地数量・平均単価・棚卸減耗数量 を返す。
 
-
-def closing_inventory_physical_amount(conn: db.Connection, organization_id: int, as_of: str | None = None) -> float:
-    """実地棚卸高 = Σ(現在の実在庫数量 × 仕入単価)。棚卸減耗の評価減を反映した「実際の在庫額」。
-
-    stock_by_product は棚卸減耗(source_type='shrinkage')も含む全移動の合計なので、
-    この額は評価減後＝実地額になる。as_of 指定でその日時点（Phase D④＝Phase B）。
+    在庫移動を発生順（日付→id）に畳み込む。入庫（仕入・初期在庫）のたびに
+    平均単価 = (既存数量×既存平均 + 入庫数量×入庫単価) / 合計数量 で更新。出庫（売上・棚卸減耗）は
+    数量だけ減らし平均単価は変えない（移動平均法の定義どおり）。在庫評価額はすべてこの平均単価を使う。
     """
-    stocks = stock_by_product(conn, organization_id, as_of)
-    if not stocks:
-        return 0.0
-    prices = _purchase_prices(conn, organization_id)
-    return float(sum(max(int(qty), 0) * prices.get(pid, 0.0) for pid, qty in stocks.items()))
-
-
-def shrinkage_value(conn: db.Connection, organization_id: int, as_of: str | None = None) -> float:
-    """棚卸減耗の評価額（正の値）= Σ(|減耗数量| × 仕入単価)。source_type='shrinkage' の評価減移動。"""
     if as_of:
         rows = conn.execute(
-            "SELECT product_id, COALESCE(SUM(quantity_delta), 0) AS d FROM inventory_movements "
-            "WHERE organization_id = ? AND source_type = 'shrinkage' AND movement_date <= ? GROUP BY product_id",
+            "SELECT product_id, source_type, quantity_delta, unit_price FROM inventory_movements "
+            "WHERE organization_id = ? AND movement_date <= ? ORDER BY movement_date ASC, id ASC",
             (organization_id, as_of),
         ).fetchall()
     else:
         rows = conn.execute(
-            "SELECT product_id, COALESCE(SUM(quantity_delta), 0) AS d FROM inventory_movements "
-            "WHERE organization_id = ? AND source_type = 'shrinkage' GROUP BY product_id",
+            "SELECT product_id, source_type, quantity_delta, unit_price FROM inventory_movements "
+            "WHERE organization_id = ? ORDER BY movement_date ASC, id ASC",
             (organization_id,),
         ).fetchall()
-    prices = _purchase_prices(conn, organization_id)
-    return float(sum(-int(row["d"]) * prices.get(row["product_id"], 0.0) for row in rows))
+    state: dict[int, dict[str, float]] = {}
+    for row in rows:
+        pid = row["product_id"]
+        delta = int(row["quantity_delta"])
+        price = float(row["unit_price"] or 0.0)
+        s = state.setdefault(pid, {"qty": 0.0, "avg": 0.0, "shrink": 0.0})
+        if delta > 0:  # 入庫：加重平均で単価を更新
+            new_qty = s["qty"] + delta
+            s["avg"] = (s["qty"] * s["avg"] + delta * price) / new_qty if new_qty > 0 else 0.0
+            s["qty"] = new_qty
+        else:  # 出庫（売上・棚卸減耗）：数量だけ減らす（平均単価は不変）
+            s["qty"] += delta
+        if row["source_type"] == "shrinkage":
+            s["shrink"] += -delta  # 減耗数量（正）
+    return state
+
+
+def moving_average_cost_by_product(conn: db.Connection, organization_id: int, as_of: str | None = None) -> dict[int, float]:
+    """商品ごとの移動平均単価（在庫評価の単価）。"""
+    return {pid: s["avg"] for pid, s in inventory_state(conn, organization_id, as_of).items()}
+
+
+def closing_inventory_physical_amount(conn: db.Connection, organization_id: int, as_of: str | None = None) -> float:
+    """実地棚卸高 = Σ(実在庫数量 × 移動平均単価)。棚卸減耗の評価減を反映した「実際の在庫額」。"""
+    return float(sum(max(s["qty"], 0) * s["avg"] for s in inventory_state(conn, organization_id, as_of).values()))
+
+
+def shrinkage_value(conn: db.Connection, organization_id: int, as_of: str | None = None) -> float:
+    """棚卸減耗の評価額（正の値）= Σ(減耗数量 × 移動平均単価)。"""
+    return float(sum(s["shrink"] * s["avg"] for s in inventory_state(conn, organization_id, as_of).values()))
 
 
 def closing_inventory_book_amount(conn: db.Connection, organization_id: int, as_of: str | None = None) -> float:
     """帳簿棚卸高 = 実地額 + 棚卸減耗額（＝評価減を戻した「帳簿上あるべき在庫額」）。
 
     疑似freee へはこの帳簿額と実地額の両方を送り、差額（棚卸減耗損）を会計側で計上する。
-    減耗が無ければ 帳簿＝実地（従来どおり）。
+    減耗が無ければ 帳簿＝実地。すべて移動平均単価で評価する。
     """
     return closing_inventory_physical_amount(conn, organization_id, as_of) + shrinkage_value(conn, organization_id, as_of)
 
@@ -1584,18 +1595,24 @@ def product_ledger(conn: db.Connection, organization_id: int, product_id: int) -
     ).fetchall()
 
     balance = 0
-    valuation_unit_price = float(product["purchase_unit_price"])
+    avg = 0.0  # 移動平均単価（入庫のたびに更新）
     for row in rows:
         quantity_delta = int(row["quantity_delta"])
-        balance += quantity_delta
+        unit_price = float(row["unit_price"] or 0.0)
+        if quantity_delta > 0:  # 入庫：加重平均で単価を更新
+            new_balance = balance + quantity_delta
+            avg = (balance * avg + quantity_delta * unit_price) / new_balance if new_balance > 0 else 0.0
+            balance = new_balance
+        else:  # 出庫：数量だけ減らす（平均単価は不変）
+            balance += quantity_delta
         row["in_quantity"] = max(quantity_delta, 0)
         row["out_quantity"] = abs(min(quantity_delta, 0))
         row["balance"] = balance
-        row["amount"] = abs(quantity_delta) * float(row["unit_price"])
-        row["inventory_balance_amount"] = balance * valuation_unit_price
+        row["amount"] = abs(quantity_delta) * unit_price
+        row["inventory_balance_amount"] = round(balance * avg)
     product["stock_quantity"] = balance
-    product["inventory_balance_amount"] = balance * valuation_unit_price
-    product["valuation_unit_price"] = valuation_unit_price
+    product["inventory_balance_amount"] = round(balance * avg)
+    product["valuation_unit_price"] = round(avg, 2)  # 移動平均単価
     rows.reverse()
     return {"product": product, "ledger": rows, "count": len(rows)}
 

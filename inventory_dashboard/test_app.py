@@ -611,6 +611,26 @@ class InventoryAppTest(unittest.TestCase):
         self.assertEqual(sends[0]["physical_amount"], 8000)
         self.assertEqual(sends[0]["shrinkage_amount"], 2000)
 
+    def test_moving_average_valuation(self):
+        # 移動平均法: 異なる単価で複数回仕入れると、評価単価は加重平均になる。
+        with app.get_conn() as conn:
+            conn.execute("DELETE FROM inventory_movements WHERE organization_id = ?", (self.org_id,))
+            conn.execute("DELETE FROM sales WHERE organization_id = ?", (self.org_id,))
+            conn.execute("DELETE FROM purchases WHERE organization_id = ?", (self.org_id,))
+            app.create_product(conn, self.org_id, {"sku": "MA-1", "product_name": "移動平均商品", "purchase_unit_price": 1000})
+            pid = conn.execute("SELECT id FROM products WHERE organization_id=? AND sku='MA-1'", (self.org_id,)).fetchone()["id"]
+            # 10個@1000、その後 10個@1400 → 平均 (10000+14000)/20 = 1200
+            app.create_purchase(conn, self.org_id, {"product_id": pid, "partner_name": "s", "invoice_no": "MA-P-1", "transaction_date": "2026-06-01", "received_date": "2026-06-01", "quantity": 10, "unit_price": 1000})
+            app.create_purchase(conn, self.org_id, {"product_id": pid, "partner_name": "s", "invoice_no": "MA-P-2", "transaction_date": "2026-06-05", "received_date": "2026-06-05", "quantity": 10, "unit_price": 1400})
+            # 5個売る → 平均単価は不変、在庫15個
+            app.create_sale(conn, self.org_id, {"product_id": pid, "partner_name": "c", "invoice_no": "MA-S-1", "transaction_date": "2026-06-10", "quantity": 5, "unit_price": 2000})
+            prod = next(p for p in app.list_products(conn, self.org_id) if p["id"] == pid)
+            phys = app.closing_inventory_physical_amount(conn, self.org_id)
+        self.assertEqual(prod["unit_cost"], 1200)        # 加重平均単価
+        self.assertEqual(prod["stock_quantity"], 15)
+        self.assertEqual(prod["stock_value"], 18000)     # 15 × 1200
+        self.assertEqual(phys, 18000.0)
+
     def test_push_closing_inventory_rejects_bad_period(self):
         with app.get_conn() as conn:
             with self.assertRaises(ValueError):

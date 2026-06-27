@@ -361,26 +361,40 @@ _INDEX_TEMPLATE = r"""
       </div>
     </section>
     <section class="panel" id="closingInventorySection">
-      <h2>📦 決算: 期末在庫を freee へ送る</h2>
-      <p style="color:var(--muted);font-size:13px;margin:0 0 12px;">期末時点の在庫評価額を計算し、疑似freee の決算（期末商品・売上原価・BS の「商品」）へ送ります。実地棚卸で帳簿と差（棚卸減耗）があれば、その差額は会計側で<strong>「棚卸減耗損」</strong>として計上され、売上原価に算入されます。基準日を空にすると現在時点で計算します。</p>
-      <div style="display:flex;gap:14px;flex-wrap:wrap;align-items:flex-end;">
-        <label style="font-size:13px;">対象期(YYYYMM)<br><input type="text" id="closingPeriod" placeholder="202603" inputmode="numeric" style="margin-top:4px;"></label>
-        <label style="font-size:13px;">基準日(任意)<br><input type="date" id="closingAsOf" style="margin-top:4px;"></label>
-        <button type="button" id="closingCalcBtn" class="secondary">帳簿・実地・減耗を計算</button>
-        <button type="button" id="closingPushBtn" class="warning">freeeへ送信</button>
+      <h2>📦 決算: 期末棚卸と freee 送信</h2>
+      <div style="background:#f4f7fb;border:1px solid var(--line);border-radius:8px;padding:12px 14px;margin:0 0 16px;font-size:13px;line-height:1.7;">
+        <strong>使い方（この順番で操作します）</strong>
+        <br><b>① 棚卸減耗を記録</b>：棚卸でカウントした実地数量を商品ごとに入力 →「評価減を記録」（在庫が実地数量に下がります）。減耗が無ければ省略可。
+        <br><b>② 期末在庫を計算して送信</b>：対象期・基準日を入れて「帳簿・実地・減耗を計算」で確認 →「freeeへ送信」（会計に反映。差額は棚卸減耗損として売上原価へ）。
+        <br><b>③ 送信履歴で確認</b>：何を送ったかを在庫一覧と突き合わせてチェック。
       </div>
-      <p id="closingResult" style="color:var(--muted);font-size:12px;margin:10px 0 0;"></p>
-      <div class="section-head" style="margin-top:14px;"><h3 class="sub">freee 送信履歴（何を送ったかの記録）</h3></div>
-      <p style="color:var(--muted);font-size:12px;margin:0 0 8px;">「freeeへ送信」した期末棚卸の記録です。在庫一覧の帳簿・実地・棚卸減耗損と照らし合わせる確認表になります。</p>
-      <div id="closingSends"></div>
-      <div class="section-head" style="margin-top:16px;"><h3 class="sub">棚卸減耗を記録（実地棚卸）</h3></div>
-      <p style="color:var(--muted);font-size:12px;margin:0 0 8px;">実地カウントが帳簿在庫より少ないときに、<strong>商品ごとに実地数量を入力</strong>して在庫を評価減します（在庫一覧・期末在庫・突合にすぐ反映）。記録後、上の「freeeへ送信」で会計へ棚卸減耗損として連携します。</p>
+
+      <div class="section-head"><h3 class="sub">① 棚卸減耗を記録（実地棚卸）</h3></div>
+      <p style="color:var(--muted);font-size:12px;margin:0 0 8px;">実地カウントが帳簿在庫より少ないときに、<strong>商品ごとに実地数量を入力</strong>して在庫を評価減します（在庫一覧・期末在庫・突合にすぐ反映）。記録後、②で会計へ棚卸減耗損として連携します。</p>
       <div style="display:flex;gap:14px;flex-wrap:wrap;align-items:flex-end;">
         <label style="font-size:13px;">商品<br><select id="shrinkProduct" style="margin-top:4px;"></select></label>
         <label style="font-size:13px;">実地数量<br><input type="number" id="shrinkPhysicalQty" min="0" style="margin-top:4px;"></label>
         <button type="button" id="shrinkBtn" class="secondary">評価減を記録</button>
       </div>
       <p id="shrinkResult" style="color:var(--muted);font-size:12px;margin:10px 0 0;"></p>
+
+      <div class="section-head" style="margin-top:18px;"><h3 class="sub">② 期末在庫を計算して freee へ送る</h3></div>
+      <p style="color:var(--muted);font-size:13px;margin:0 0 12px;">期末時点の在庫評価額（移動平均単価ベース）を計算し、疑似freee の決算（期末商品・売上原価・BS の「商品」）へ送ります。実地棚卸で帳簿と差があれば、その差額は会計側で<strong>「棚卸減耗損」</strong>として計上され、売上原価に算入されます。</p>
+      <div style="display:flex;gap:14px;flex-wrap:wrap;align-items:flex-end;">
+        <label style="font-size:13px;">対象期(YYYYMM)<br><input type="text" id="closingPeriod" placeholder="202703" inputmode="numeric" style="margin-top:4px;"></label>
+        <label style="font-size:13px;">基準日(任意)<br><input type="date" id="closingAsOf" style="margin-top:4px;"></label>
+        <button type="button" id="closingCalcBtn" class="secondary">帳簿・実地・減耗を計算</button>
+        <button type="button" id="closingPushBtn" class="warning">freeeへ送信</button>
+      </div>
+      <p style="color:var(--muted);font-size:12px;margin:8px 0 0;line-height:1.7;">
+        <b>対象期</b>＝決算の対象となる年月（＝<b>期末の締め月</b>を YYYYMM で）。例：会計期間が <b>2026年4月〜2027年3月</b> なら <b>202703</b>。<br>
+        <b>基準日</b>＝在庫を評価する時点（通常は<b>期末日</b>）。空欄なら<b>現在時点</b>の在庫で計算。例：期末が 2027年3月31日 なら <b>2027-03-31</b>。
+      </p>
+      <p id="closingResult" style="color:var(--muted);font-size:12px;margin:10px 0 0;"></p>
+
+      <div class="section-head" style="margin-top:18px;"><h3 class="sub">③ freee 送信履歴（何を送ったかの記録）</h3></div>
+      <p style="color:var(--muted);font-size:12px;margin:0 0 8px;">「freeeへ送信」した期末棚卸の記録です。在庫一覧の帳簿・実地・棚卸減耗損と照らし合わせる確認表になります。</p>
+      <div id="closingSends"></div>
     </section>
     <section class="panel" id="reconciliationSection">
       <h2>🔗 会計突合（在庫 ⇄ 疑似freee） <span id="reconBadge" class="status" style="display:none;"></span></h2>
@@ -478,10 +492,11 @@ _INDEX_TEMPLATE = r"""
       const lossQ = (p) => Number(p.shrinkage_quantity || 0) > 0 ? `<span class="mismatch">-${p.shrinkage_quantity}</span>` : "0";
       const lossV = (p) => Number(p.shrinkage_value || 0) > 0 ? `<span class="mismatch">${yen.format(p.shrinkage_value)}</span>` : yen.format(0);
       document.getElementById("products").innerHTML = table(
-        ["SKU", "商品", "必要水準", "帳簿在庫", "実地在庫", "減耗数量", "状態", "帳簿在庫金額", "実地棚卸金額", "棚卸減耗損", "推奨発注量"],
+        ["SKU", "商品", "仕入単価", "必要水準", "帳簿在庫", "実地在庫", "減耗数量", "状態", "帳簿在庫金額", "実地棚卸金額", "棚卸減耗損", "推奨発注量"],
         products.map(p => [
           p.sku,
           `<button class="link" onclick="loadLedger(${p.id})">${p.product_name}</button>`,
+          yen.format(p.unit_cost),
           p.required_stock_level,
           p.book_quantity,
           p.stock_quantity,
@@ -493,7 +508,7 @@ _INDEX_TEMPLATE = r"""
           p.recommended_order_quantity,
         ]))
         + `<div class="table-total"><span>合計</span><strong>帳簿 ${yen.format(bookTotal)} ／ 実地 ${yen.format(physTotal)} ／ 棚卸減耗損 ${yen.format(lossTotal)}</strong><span>${diffText}</span></div>`
-        + `<p class="note">「帳簿在庫」＝仕入・売上から計算される理論在庫、「実地在庫」＝棚卸でカウントした実在庫、「減耗」＝その差（棚卸減耗損）。実地入力の後も差の経緯が残り、計上根拠を追えます。必要水準・推奨発注量は適正在庫シミュレーション（AI予測）と同じ基準。</p>`;
+        + `<p class="note">「仕入単価」＝<b>移動平均法</b>で算出した在庫評価単価（仕入のたびに加重平均で更新）。各金額＝数量×この単価。「帳簿在庫」＝仕入・売上から計算される理論在庫、「実地在庫」＝棚卸でカウントした実在庫、「減耗」＝その差（棚卸減耗損）。実地入力の後も差の経緯が残り、計上根拠を追えます。商品名クリックで在庫元帳（移動平均の推移）。</p>`;
     }
 
     function renderMonthlySummary(elementId, rows, total, totalLabel) {
