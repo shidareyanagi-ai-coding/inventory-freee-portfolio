@@ -29,39 +29,39 @@
 
 ## 📸 スクリーンショット
 
-| 入口ページ（統一ログイン後のアプリ選択） | 疑似freee 会計（レシートAI入力・BYO-key・KPI） |
+実際の画面（全画面・本番データ）です。在庫アプリ ⇄（疑似）freee会計 を、入力から決算・突合まで一通り収めています。
+
+| 入口（統一ログイン後のアプリ選択） | 疑似freee 会計トップ（レシートAI入力・BYO-key・KPI） |
 |---|---|
-| ![launcher](docs/screenshots/launcher.png) | ![pseudo-freee](docs/screenshots/pseudo-freee.png) |
+| ![launcher](docs/screenshots/launcher.png) | ![pseudo-freee dashboard](docs/screenshots/pseudo-freee-dashboard.png) |
 
-| 在庫ダッシュボード | 適正在庫シミュレーション（AI予測） |
+**🟦 在庫管理ダッシュボード**（在庫一覧／移動平均単価／必要水準割れ・推奨発注量／今月仕入・売上＝税込。帳簿・実地・棚卸減耗の監査証跡つき）
+
+![inventory dashboard](docs/screenshots/inventory-dashboard.png)
+
+**📈 需要予測**（実データCSV取込・クリーンスタート／適正在庫シミュレーション／3モデル比較＋チャート。チャート下に各モデルの“噛み砕き”解説。実績の日次の波を予測線が地続きに延長）
+
+![demand forecast](docs/screenshots/demand-forecast.png)
+
+**🗂 在庫元帳・取引入力・AI証憑**（仕入/売上の入力、請求書をAIで下書き〔BYO-key〕、取引先マスタ。元帳は最新10件＋「すべて表示」で開閉）
+
+![inventory ledger & entry](docs/screenshots/inventory-ledger-entry.png)
+
+**🔗 在庫 ⇄ 会計の連携**（未送信バッジ＋Outbox 一括送信／期末棚卸の freee 連携／送信履歴／会計突合で 売上・仕入・期末在庫が一致）
+
+![inventory-accounting sync](docs/screenshots/inventory-accounting-sync.png)
+
+**📊 決算書**（決算整理仕訳 → 売上原価の計算〔三分法・棚卸減耗損 ¥12,000〕→ 損益計算書(PL) ¥1,094,550 → 貸借対照表(BS)／貸借一致）
+
+![financial statements](docs/screenshots/financial-statements-full.png)
+
+| 📒 仕訳帳（開始記入＋期中取引＋決算整理を時系列で） | 📚 総勘定元帳（勘定別・相手勘定つき・残高推移） |
 |---|---|
-| ![dashboard](docs/screenshots/dashboard-overview.png) | ![forecast](docs/screenshots/forecast-simulation.png) |
+| ![journal](docs/screenshots/journal.png) | ![general ledger](docs/screenshots/general-ledger.png) |
 
-**実データ運用（過去売上CSVの一括取込・デモ全消去でクリーンスタート → 実データで需要予測）**
+**🧾 疑似freee 取引一覧**（在庫から送られた仕訳の記帳。最新10件＋畳み／月次推移／勘定科目・取引先マスタ）
 
-![real-data-operations](docs/screenshots/real-data-operations.png)
-
-**Phase D（在庫⇄会計の連携・複式簿記）**
-
-| 🔗 会計突合（在庫⇄疑似freee が一致） | 📈 モデル比較と発注判定（3モデル・MAE順・★最良） |
-|---|---|
-| ![reconciliation](docs/screenshots/accounting-reconciliation.png) | ![model-comparison](docs/screenshots/model-comparison-order.png) |
-
-| 📤 確実な送信（未送信バッジ＋一括送信・Outbox） | 📦 期末棚卸の連携（在庫評価額 → freee 期末商品） |
-|---|---|
-| ![freee-outbox](docs/screenshots/freee-outbox-unsent.png) | ![closing-inventory](docs/screenshots/closing-inventory.png) |
-
-**📊 決算書＋売上原価の計算過程（三分法・棚卸減耗損）— 実地棚卸で帳簿と差があれば棚卸減耗損（¥12,000）を計上し、三分法で実地ベースの売上原価（¥1,094,550）を導出。その売上原価がそのまま損益計算書(PL)に反映され、貸借対照表(BS)は貸借一致**
-
-![financial-statements](docs/screenshots/financial-statements.png)
-
-| 🧮 試算表（決算整理後・残高試算表／貸借一致） | 📒 在庫元帳に棚卸減耗を計上（帳簿10→実地9・¥12,000） |
-|---|---|
-| ![trial-balance](docs/screenshots/trial-balance.png) | ![inventory-ledger](docs/screenshots/inventory-ledger.png) |
-
-> 📒 在庫元帳では実地棚卸の減耗を **区分「棚卸減耗」として1行**で計上し、数量・単価・在庫残高金額の変化として記録します（数字を後から追える監査証跡）。この在庫側の減耗が、決算では棚卸減耗損として売上原価に算入されます。
-
-> 全画面版は [`docs/screenshots/`](docs/screenshots/) にあります。発注点を下回ると在庫一覧に「必要水準割れ」と推奨発注量が表示されます（[dashboard-overview](docs/screenshots/dashboard-overview.png)）。
+![pseudo-freee deals](docs/screenshots/pseudo-freee-deals.png)
 
 ## ✨ 主な機能
 
