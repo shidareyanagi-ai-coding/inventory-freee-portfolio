@@ -983,7 +983,8 @@ _INDEX_TEMPLATE = r"""
         purchase_receipt: "仕入入庫",
         sale_shipment: "売上出庫",
         purchase_cancel: "仕入取消",
-        sale_cancel: "売上取消"
+        sale_cancel: "売上取消",
+        shrinkage_adjustment: "棚卸減耗"
       }[value] || value;
     }
 
