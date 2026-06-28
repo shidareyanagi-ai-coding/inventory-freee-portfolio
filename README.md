@@ -43,7 +43,7 @@
 
 ![demand forecast](docs/screenshots/demand-forecast.png)
 
-**🗂 在庫元帳・取引入力・AI証憑**（仕入/売上の入力、請求書をAIで下書き〔BYO-key〕、取引先マスタ。元帳は最新10件＋「すべて表示」で開閉）
+**🗂 在庫元帳・取引入力・AI証憑**（仕入/売上の入力、請求書をAIで下書き〔BYO-key〕、取引先マスタ。元帳は最新10件＋「すべて表示」で開閉。実地棚卸の減耗は区分「棚卸減耗」として1行で記録＝監査証跡）
 
 ![inventory ledger & entry](docs/screenshots/inventory-ledger-entry.png)
 
